@@ -29,6 +29,7 @@ static BOOL     gAggressive = YES;
 static BOOL     gBlackBtn = YES;
 static int      gFillCount = 0;
 static UIColor *gAccent = nil;
+static UIColor *gAccentLight = nil; // nền nhạt (pill, chip) = màu nhấn trong suốt 20%
 
 #pragma mark - Màu
 
@@ -72,22 +73,39 @@ static void AddTarget(CGFloat r, CGFloat g, CGFloat b) {
     gTargets[gTargetCount++] = (RGB){ r, g, b };
 }
 
-// Xanh "link" kiểu iOS/X/Instagram: hue ~200-225 độ, đủ đậm và đủ sáng.
-static inline BOOL IsLinkBlue(CGFloat r, CGFloat g, CGFloat b) {
+// Phân loại xanh dương theo hue (iOS, X, Instagram, Facebook...):
+// 1 = xanh đậm (link, nút, viền), 2 = nền xanh nhạt (pill, chip), 0 = không phải.
+static inline int BlueClass(CGFloat r, CGFloat g, CGFloat b) {
     CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
-    if (b < mx || mx < 0.75 || mx - mn < 0.55 * mx) return NO;
-    CGFloat h = 60.0 * (4.0 + (r - g) / (mx - mn)); // b là kênh lớn nhất
-    return h >= 195.0 && h <= 230.0;
+    if (b < mx || mx - mn < 0.001) return 0;
+    CGFloat h = 60.0 * (4.0 + (r - g) / (mx - mn));
+    if (h < 195.0 || h > 230.0) return 0;
+    CGFloat sat = (mx - mn) / mx;
+    if (mx >= 0.75 && sat >= 0.55) return 1;
+    if (mx >= 0.90 && sat >= 0.05 && sat <= 0.30) return 2;
+    return 0;
 }
 
-static inline BOOL Matches(CGFloat r, CGFloat g, CGFloat b) {
-    if (gBypass || !gAccent) return NO;
+static UIColor *ReplacementFor(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
+    if (gBypass || !gAccent) return nil;
     for (int i = 0; i < gTargetCount; i++) {
         if (fabs(r - gTargets[i].r) < 0.012 &&
             fabs(g - gTargets[i].g) < 0.012 &&
-            fabs(b - gTargets[i].b) < 0.012) return YES;
+            fabs(b - gTargets[i].b) < 0.012)
+            return a >= 0.999 ? gAccent : [gAccent colorWithAlphaComponent:a];
     }
-    return gAggressive && IsLinkBlue(r, g, b);
+    if (!gAggressive) return nil;
+    int cls = BlueClass(r, g, b);
+    if (cls == 1) return a >= 0.999 ? gAccent : [gAccent colorWithAlphaComponent:a];
+    if (cls == 2) return gAccentLight;
+    return nil;
+}
+
+static UIColor *ReplacementForColor(UIColor *c) {
+    if (!c || gBypass || !gAccent) return nil;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![c getRed:&r green:&g blue:&b alpha:&a]) return nil;
+    return ReplacementFor(r, g, b, a);
 }
 
 // Tính lại màu nhấn + danh sách màu cần thay. Gọi sau mỗi lần đổi cài đặt.
@@ -97,7 +115,7 @@ static void RefreshCache(void) {
     gBlackBtn = [d boolForKey:kBlackKey];
     gTargetCount = 0;
 
-    if (![d boolForKey:kEnabledKey]) { gAccent = nil; return; }
+    if (![d boolForKey:kEnabledKey]) { gAccent = nil; gAccentLight = nil; return; }
 
     NSString *hex = [d stringForKey:kHexKey] ?: kDefaultHex;
     UIColor *light = ColorFromHex(hex) ?: ColorFromHex(kDefaultHex);
@@ -107,6 +125,8 @@ static void RefreshCache(void) {
     gAccent = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
         return t.userInterfaceStyle == UIUserInterfaceStyleDark ? dark : light;
     }];
+
+    gAccentLight = [gAccent colorWithAlphaComponent:0.2];
 
     // Màu gốc do người dùng nhập
     UIColor *src = ColorFromHex([d stringForKey:kSrcHexKey]);
@@ -259,6 +279,35 @@ static UIViewController *TopVC(UIWindow *w) {
 
 #pragma mark - Hook
 
+static void MarkFill(CALayer *l) {
+    CGRect b = l.bounds;
+    if (b.size.height > 120) return; // chỉ nút/chip, không phải nền lớn
+    if (!objc_getAssociatedObject(l, kFill)) {
+        objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        gFillCount++;
+    }
+}
+
+// Trả về CGColor thay thế nếu c là xanh dương (ở mức layer), ngược lại NULL.
+static CGColorRef LayerRemap(CGColorRef c, int *clsOut) {
+    if (!c || gBypass || !gAccent || !gAggressive) return NULL;
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    if (!cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return NULL;
+    if (CGColorGetNumberOfComponents(c) < 4) return NULL;
+    const CGFloat *k = CGColorGetComponents(c);
+    if (!k) return NULL;
+    int cls = BlueClass(k[0], k[1], k[2]);
+    if (cls == 0) return NULL;
+    if (clsOut) *clsOut = cls;
+    UIColor *base = (cls == 1) ? gAccent : gAccentLight;
+    UITraitCollection *tc = UITraitCollection.currentTraitCollection;
+    UIColor *res = [base resolvedColorWithTraitCollection:tc];
+    CGFloat alpha = CGColorGetAlpha(c);
+    if (alpha < 0.999 && cls == 1) res = [res colorWithAlphaComponent:alpha];
+    CGColorRef cg = CGColorCreateCopy(res.CGColor); // giữ sống tới hết autorelease pool
+    return (CGColorRef)CFAutorelease(cg);
+}
+
 // Nút/huy hiệu nền đen bo tròn (vd "Theo dõi", dấu + trên avatar) -> nền màu nhấn.
 // Icon/chữ nằm trong view đó sẽ trả về màu trắng (xem hook tintColor).
 static void FixBlack(UIView *v) {
@@ -321,6 +370,11 @@ static void Setup(UIWindow *w) {
     %orig;
     if (gAccent && gAggressive && gBlackBtn) FixBlack(self);
 }
+- (void)setBackgroundColor:(UIColor *)c {
+    UIColor *n = gAggressive ? ReplacementForColor(c) : nil;
+    %orig(n ?: c);
+    if (n && n != gAccentLight) MarkFill(self.layer); // nền xanh đậm -> chữ/icon bên trong thành trắng
+}
 %end
 
 %hook UIColor
@@ -333,14 +387,74 @@ static void Setup(UIWindow *w) {
     if (gAccent && gAggressive) return gAccent;
     return %orig;
 }
-// Thay màu cứng theo RGB
+// Thay màu theo RGB / hue
 + (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
-    if (Matches(r, g, b)) return a >= 0.999 ? gAccent : [gAccent colorWithAlphaComponent:a];
-    return %orig;
+    UIColor *n = ReplacementFor(r, g, b, a);
+    return n ?: %orig;
 }
 - (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
-    if (Matches(r, g, b)) return a >= 0.999 ? gAccent : [gAccent colorWithAlphaComponent:a];
-    return %orig;
+    UIColor *n = ReplacementFor(r, g, b, a);
+    return n ?: %orig;
+}
++ (UIColor *)colorWithDisplayP3Red:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    UIColor *n = ReplacementFor(r, g, b, a);
+    return n ?: %orig;
+}
+- (UIColor *)initWithDisplayP3Red:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    UIColor *n = ReplacementFor(r, g, b, a);
+    return n ?: %orig;
+}
+// Màu lấy từ asset catalog
++ (UIColor *)colorNamed:(NSString *)name {
+    UIColor *c = %orig;
+    return ReplacementForColor(c) ?: c;
+}
++ (UIColor *)colorNamed:(NSString *)name inBundle:(NSBundle *)bundle compatibleWithTraitCollection:(UITraitCollection *)tc {
+    UIColor *c = %orig;
+    return ReplacementForColor(c) ?: c;
+}
+%end
+
+// Chữ: label / nút
+%hook UILabel
+- (void)setTextColor:(UIColor *)c {
+    UIColor *n = gAggressive ? ReplacementForColor(c) : nil;
+    %orig(n ?: c);
+}
+%end
+
+%hook UIButton
+- (void)setTitleColor:(UIColor *)c forState:(UIControlState)st {
+    UIColor *n = gAggressive ? ReplacementForColor(c) : nil;
+    %orig(n ?: c, st);
+}
+%end
+
+// Nền / viền / hình vẽ ở mức CALayer (nhiều app, kể cả Facebook, đặt màu trực tiếp ở đây)
+%hook CALayer
+- (void)setBackgroundColor:(CGColorRef)c {
+    int cls = 0;
+    CGColorRef n = LayerRemap(c, &cls);
+    if (n) { %orig(n); if (cls == 1) MarkFill(self); return; }
+    %orig;
+}
+- (void)setBorderColor:(CGColorRef)c {
+    CGColorRef n = LayerRemap(c, NULL);
+    if (n) { %orig(n); return; }
+    %orig;
+}
+%end
+
+%hook CAShapeLayer
+- (void)setFillColor:(CGColorRef)c {
+    CGColorRef n = LayerRemap(c, NULL);
+    if (n) { %orig(n); return; }
+    %orig;
+}
+- (void)setStrokeColor:(CGColorRef)c {
+    CGColorRef n = LayerRemap(c, NULL);
+    if (n) { %orig(n); return; }
+    %orig;
 }
 %end
 
