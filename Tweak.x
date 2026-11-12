@@ -474,7 +474,7 @@ static UIViewController *TopVC(UIWindow *w) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"AccentColorAll";
+    self.title = @"Màu nhấn";
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
     self.tableView.rowHeight = UITableViewAutomaticDimension;
