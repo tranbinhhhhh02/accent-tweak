@@ -399,6 +399,24 @@ static void TryBlack(CALayer *l) {
     MarkFill(l);
 }
 
+// Thumb dạng pill vẽ bằng CAShapeLayer màu đen (vd thanh chọn 1x / 1.25x) -> màu "Nút & nền".
+static void TryBlackShape(CAShapeLayer *sh) {
+    if (!gOn[AACFill]) return;
+    CGColorRef f = sh.fillColor;
+    if (!f || CGColorGetAlpha(f) < 0.99) return;
+    const CGFloat *c = CGColorGetComponents(f);
+    if (!c) return;
+    size_t n = CGColorGetNumberOfComponents(f);
+    BOOL black = (n == 2) ? (c[0] < 0.03) : (n >= 4 && c[0] < 0.03 && c[1] < 0.03 && c[2] < 0.03);
+    if (!black) return;
+    CGPathRef path = sh.path;
+    if (!path) return;
+    CGRect b = CGPathGetBoundingBox(path);
+    if (b.size.height < 20 || b.size.height > 64 || b.size.width < b.size.height * 1.6) return;
+    if (![NSThread isMainThread]) return;
+    sh.fillColor = CGFor(AACFill, NO);
+}
+
 static BOOL IsBlackColor(UIColor *c) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
     if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
@@ -489,11 +507,31 @@ static void Setup(UIWindow *w) {
     CGColorRef n = gMaster ? LayerRemap(c, AACIcon, NULL) : NULL;
     if (n) { %orig(n); return; }
     %orig;
+    if (gMaster) TryBlackShape(self);
+}
+- (void)setPath:(CGPathRef)p {
+    %orig;
+    if (gMaster) TryBlackShape(self);
 }
 - (void)setStrokeColor:(CGColorRef)c {
     CGColorRef n = gMaster ? LayerRemap(c, AACIcon, NULL) : NULL;
     if (n) { %orig(n); return; }
     %orig;
+}
+%end
+
+// Thanh chọn (segmented): thumb đen -> màu "Nút & nền"
+%hook UISegmentedControl
+- (void)setSelectedSegmentTintColor:(UIColor *)c {
+    UIColor *n = (gMaster && gOn[AACFill] && c && IsBlackColor(c)) ? gColor[AACFill] : nil;
+    %orig(n ?: c);
+}
+- (void)didMoveToWindow {
+    %orig;
+    if (gMaster && gOn[AACFill]) {
+        UIColor *cur = self.selectedSegmentTintColor;
+        if (cur && IsBlackColor(cur)) self.selectedSegmentTintColor = gColor[AACFill];
+    }
 }
 %end
 
