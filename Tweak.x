@@ -1,8 +1,3 @@
-// AccentColorAll v4 - đổi màu nhấn cho mọi app khi inject dylib.
-// Mở bảng cài đặt: nhấn giữ 3 ngón tay ~1 giây.
-// MỘT màu nhấn duy nhất cho: nút, nền chip/pill, viền, switch, slider, chữ link, icon, nét vẽ vector.
-// Cài đặt lưu riêng từng app (sandbox iOS).
-
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
@@ -12,14 +7,17 @@
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
 
 static NSString *const kMasterKey  = @"AccentColorAll_Enabled";
+static NSString *const kHexKey     = @"AccentColorAll_Hex";
+static NSString *const kBGKey      = @"AccentColorAll_BGKeepAlive";   // Background Keep-Alive, mặc định tắt
 static NSString *const kDefaultHex = @"B8A8FF";
-static const void *kFill           = &kFill;
-static const void *kGestureFlag    = &kGestureFlag;
-static const void *kIconShape      = &kIconShape;   // bit1 = fill, bit2 = stroke đã đổi
-static const void *kMonoBlack      = &kMonoBlack;   // cache: UIImage là icon đen đơn sắc?
 
-static NSString *const kHexKey = @"AccentColorAll_Hex";
-static NSString *const kBGKey  = @"AccentColorAll_BGKeepAlive";   // chạy nền, mặc định tắt
+static const void *kFill        = &kFill;
+static const void *kGestureFlag = &kGestureFlag;
+static const void *kTintVer     = &kTintVer;
+static const void *kIconShape   = &kIconShape;   // bit1 = fill, bit2 = stroke đã đổi
+static const void *kMonoBlack   = &kMonoBlack;   // cache: UIImage là icon đen đơn sắc?
+static const void *kAccentSrc   = &kAccentSrc;   // ảnh tab bar đã tô accent -> ảnh gốc
+static const void *kAccentStamp = &kAccentStamp; // phiên bản màu đã dùng để tô
 
 // Cache (ghi ở main thread, đọc ở mọi thread). Không bao giờ giải phóng giá trị cũ để tránh use-after-free.
 static BOOL        gMaster = YES;
@@ -28,8 +26,15 @@ static UIColor    *gColor[AACCount];
 static CGColorRef  gCGLight[AACCount], gCGDark[AACCount], gCGSoftLight[AACCount], gCGSoftDark[AACCount];
 static BOOL        gDark = NO;
 static int         gFillCount = 0;
+static int         gVersion = 0;
 static NSMutableArray *gKeep;
-static BOOL        gInTry;           // chặn đệ quy khi tự set màu layer
+static BOOL        gInTry;            // chặn đệ quy khi tự set màu layer
+static BOOL        gInTabFix;
+static volatile int32_t gPending;     // số kiểm tra layer đang chờ ở main queue (giới hạn để không bị ngập)
+
+static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
+
+static void TabBarFix(UITabBar *bar);
 
 #pragma mark - Màu
 
@@ -102,12 +107,13 @@ static void RefreshCache(void) {
         return t.userInterfaceStyle == UIUserInterfaceStyleDark ? dark : light;
     }];
     [gKeep addObject:dyn];
-    gColor[0] = dyn;
     gCGLight[0] = CGColorCreateCopy(light.CGColor);
     gCGDark[0] = CGColorCreateCopy(dark.CGColor);
     gCGSoftLight[0] = CGColorCreateCopyWithAlpha(light.CGColor, 0.2);
     gCGSoftDark[0] = CGColorCreateCopyWithAlpha(dark.CGColor, 0.2);
+    gColor[0] = dyn;
     gOn[0] = gMaster;
+    gVersion++;
 }
 
 // Vẽ lại các CAShapeLayer icon đã đổi màu (để đổi màu nhấn có hiệu lực ngay).
@@ -121,7 +127,7 @@ static void RefreshLayerTree(CALayer *l, int depth) {
             if (m.intValue & 2) sh.strokeColor = CGFor(AACIcon, NO);
         }
     }
-    for (CALayer *sub in l.sublayers) RefreshLayerTree(sub, depth + 1);
+    for (CALayer *sub in [l.sublayers copy]) RefreshLayerTree(sub, depth + 1);
 }
 
 static void RefreshViewTree(UIView *v, int depth) {
@@ -130,9 +136,10 @@ static void RefreshViewTree(UIView *v, int depth) {
         if ([v isKindOfClass:UISwitch.class]) ((UISwitch *)v).onTintColor = gColor[AACFill];
         else if ([v isKindOfClass:UISlider.class]) ((UISlider *)v).minimumTrackTintColor = gColor[AACFill];
     }
+    if ([v isKindOfClass:UITabBar.class]) TabBarFix((UITabBar *)v);
     [v tintColorDidChange];
     [v setNeedsDisplay];
-    for (UIView *s in v.subviews) RefreshViewTree(s, depth + 1);
+    for (UIView *s in [v.subviews copy]) RefreshViewTree(s, depth + 1);
 }
 
 static void ApplyAll(void) {
@@ -146,15 +153,16 @@ static void ApplyAll(void) {
         for (UIWindow *w in ((UIWindowScene *)s).windows) {
             gDark = (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
             w.tintColor = gOn[AACIcon] ? gColor[AACIcon] : nil;
+            objc_setAssociatedObject(w, kTintVer, @(gVersion), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             RefreshViewTree(w, 0);
             RefreshLayerTree(w.layer, 0);
         }
     }
 }
 
-#pragma mark - Chạy nền (phát âm thanh im lặng để app không bị treo khi thoát / tắt màn hình)
+#pragma mark - Background Keep-Alive
 
-// 1 giây WAV mono 8-bit 22050 Hz toàn mẫu 0x80 (im lặng) — cùng định dạng với Background Keep-Alive của IPATweaksPlus.
+// 1 giây WAV mono 8-bit 22050 Hz toàn mẫu 0x80 (im lặng), tạo trong bộ nhớ.
 static NSData *SilentWav(void) {
     static NSData *wav; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -183,30 +191,54 @@ static BOOL HostDeclaresAudioBackground(void) {
     return [modes isKindOfClass:NSArray.class] && [modes containsObject:@"audio"];
 }
 
-@interface AACKeepAlive : NSObject
+@interface AACBackgroundKeepAliveService : NSObject
 + (instancetype)shared;
++ (void)bootstrap;
+@property (nonatomic, readonly) BOOL isRunning;
 - (void)setEnabled:(BOOL)on;
+- (void)startPlayingSilentAudio;
+- (void)stopPlayingSilentAudio;
 @end
 
-@implementation AACKeepAlive {
+@implementation AACBackgroundKeepAliveService {
+    dispatch_queue_t _q;               // mọi thao tác AVAudioSession / AVAudioPlayer chạy ở đây (không chặn main)
+    dispatch_source_t _timer;
     AVAudioPlayer *_player;
-    NSTimer *_timer;
-    UIBackgroundTaskIdentifier _bgTask;
-    BOOL _enabled;
+    volatile BOOL _enabled;
+    volatile BOOL _inBackground;
     BOOL _observing;
+    UIBackgroundTaskIdentifier _bgTask;
 }
 
 + (instancetype)shared {
-    static AACKeepAlive *k; static dispatch_once_t once;
-    dispatch_once(&once, ^{ k = [AACKeepAlive new]; k->_bgTask = UIBackgroundTaskInvalid; });
+    static AACBackgroundKeepAliveService *k; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        k = [AACBackgroundKeepAliveService new];
+        k->_q = dispatch_queue_create("acc.keepalive", DISPATCH_QUEUE_SERIAL);
+        k->_bgTask = UIBackgroundTaskInvalid;
+    });
     return k;
 }
 
++ (void)bootstrap {
+    if ([NSUserDefaults.standardUserDefaults boolForKey:kBGKey]) [[self shared] setEnabled:YES];
+}
+
+- (BOOL)isRunning { return _enabled && _player.isPlaying; }
+
 - (void)setEnabled:(BOOL)on {
-    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ [self setEnabled:on]; }); return; }
+    if (!OnMain()) { dispatch_async(dispatch_get_main_queue(), ^{ [self setEnabled:on]; }); return; }
     _enabled = on;
-    if (on) { [self observe]; [self start]; }
-    else    { [self stop]; }
+    if (on) {
+        [self observe];
+        [self armTimer];
+        // Phải khởi động khi app đang ở foreground. Lúc app mới mở thì đợi DidBecomeActive để không chen vào quá trình khởi tạo.
+        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) [self startPlayingSilentAudio];
+    } else {
+        [self disarmTimer];
+        [self stopPlayingSilentAudio];
+        [self endBG];
+    }
 }
 
 - (void)observe {
@@ -216,44 +248,72 @@ static BOOL HostDeclaresAudioBackground(void) {
     [nc addObserver:self selector:@selector(onInterruption:) name:AVAudioSessionInterruptionNotification object:nil];
     [nc addObserver:self selector:@selector(onRoute:)        name:AVAudioSessionRouteChangeNotification object:nil];
     [nc addObserver:self selector:@selector(onReset:)        name:AVAudioSessionMediaServicesWereResetNotification object:nil];
+    [nc addObserver:self selector:@selector(onResign:)       name:UIApplicationWillResignActiveNotification object:nil];
     [nc addObserver:self selector:@selector(onBackground:)   name:UIApplicationDidEnterBackgroundNotification object:nil];
     [nc addObserver:self selector:@selector(onActive:)       name:UIApplicationDidBecomeActiveNotification object:nil];
 }
 
-// Phải khởi động khi app đang ở foreground; vào nền rồi mới bật thì iOS không cho.
-- (void)start {
+- (void)startPlayingSilentAudio {
+    dispatch_async(_q, ^{ [self q_start]; });
+}
+
+- (void)stopPlayingSilentAudio {
+    // Chỉ dừng player của mình; KHÔNG deactivate session vì sẽ cắt âm thanh của app gốc.
+    dispatch_async(_q, ^{ [self->_player stop]; self->_player = nil; });
+}
+
+// --- chạy trên _q ---
+
+// Chỉ can thiệp khi app đang dùng category không chạy được ở nền (mặc định / Ambient).
+- (void)q_ensureCategory:(AVAudioSession *)s {
+    NSString *cat = s.category;
+    if ([cat isEqualToString:AVAudioSessionCategorySoloAmbient] || [cat isEqualToString:AVAudioSessionCategoryAmbient]) {
+        NSError *e = nil;
+        [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault
+               options:AVAudioSessionCategoryOptionMixWithOthers error:&e];
+    }
+}
+
+- (void)q_start {
     if (!_enabled) return;
     NSError *e = nil;
     AVAudioSession *s = AVAudioSession.sharedInstance;
-    NSString *cat = s.category;
-    // Chỉ can thiệp khi app đang dùng category không chạy được ở nền (mặc định / Ambient); giữ nguyên PlayAndRecord, Playback...
-    if ([cat isEqualToString:AVAudioSessionCategorySoloAmbient] || [cat isEqualToString:AVAudioSessionCategoryAmbient]) {
-        [s setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&e];
-    }
-    [s setActive:YES error:&e];
+    [self q_ensureCategory:s];
     if (!_player) {
-        _player = [[AVAudioPlayer alloc] initWithData:SilentWav() error:&e];
+        _player = [[AVAudioPlayer alloc] initWithData:SilentWav() fileTypeHint:AVFileTypeWAVE error:&e];
         _player.numberOfLoops = -1;
         _player.volume = 0.01;
         [_player prepareToPlay];
     }
-    if (_player && !_player.isPlaying) [_player play];
-    if (!_timer) {
-        _timer = [NSTimer timerWithTimeInterval:5.0 target:self selector:@selector(tick) userInfo:nil repeats:YES];
-        [NSRunLoop.mainRunLoop addTimer:_timer forMode:NSRunLoopCommonModes];
+    if (_player && !_player.isPlaying) {
+        [s setActive:YES error:&e];
+        [_player play];
     }
 }
 
-- (void)stop {
-    [_timer invalidate]; _timer = nil;
-    [_player stop]; _player = nil;
-    [self endBG];
+- (void)q_tick {
+    if (!_enabled) return;
+    if (!_player || !_player.isPlaying) { [self q_start]; return; }
+    if (_inBackground) [self q_ensureCategory:AVAudioSession.sharedInstance];
 }
 
-- (void)tick {
-    if (!_enabled) return;
-    if (!_player || !_player.isPlaying) [self start];
+// --- timer (trên _q) ---
+
+- (void)armTimer {
+    if (_timer) return;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _q);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), 4 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+    __weak typeof(self) ws = self;
+    dispatch_source_set_event_handler(t, ^{ [ws q_tick]; });
+    dispatch_resume(t);
+    _timer = t;
 }
+
+- (void)disarmTimer {
+    if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
+}
+
+// --- background task (main) ---
 
 - (void)beginBG {
     if (_bgTask != UIBackgroundTaskInvalid) return;
@@ -268,118 +328,41 @@ static BOOL HostDeclaresAudioBackground(void) {
     _bgTask = UIBackgroundTaskInvalid;
 }
 
+// --- notification ---
+
 - (void)onInterruption:(NSNotification *)n {
     NSUInteger t = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
-    if (t == AVAudioSessionInterruptionTypeEnded) dispatch_async(dispatch_get_main_queue(), ^{ [self start]; });
+    if (t == AVAudioSessionInterruptionTypeEnded) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), _q, ^{ [self q_start]; });
+    }
 }
-- (void)onRoute:(NSNotification *)n { dispatch_async(dispatch_get_main_queue(), ^{ [self start]; }); }
-- (void)onReset:(NSNotification *)n { dispatch_async(dispatch_get_main_queue(), ^{ self->_player = nil; [self start]; }); }
-- (void)onBackground:(NSNotification *)n { if (_enabled) { [self beginBG]; [self start]; } }
-- (void)onActive:(NSNotification *)n { [self endBG]; [self start]; }
-@end
-
-#pragma mark - Bảng cài đặt
-
-static UIViewController *TopVC(UIWindow *w) {
-    UIViewController *v = w.rootViewController;
-    while (v.presentedViewController) v = v.presentedViewController;
-    return v;
+// Không đổi category khi route thay đổi (tránh "đánh nhau" với app gốc); chỉ bật lại player nếu nó đã dừng.
+- (void)onRoute:(NSNotification *)n {
+    dispatch_async(_q, ^{ if (self->_enabled && !self->_player.isPlaying) [self q_start]; });
 }
-
-@interface AACHelper : NSObject <UIGestureRecognizerDelegate, UIColorPickerViewControllerDelegate>
-+ (instancetype)shared;
-@end
-
-@implementation AACHelper
-+ (instancetype)shared {
-    static AACHelper *h; static dispatch_once_t once;
-    dispatch_once(&once, ^{ h = [AACHelper new]; });
-    return h;
+- (void)onReset:(NSNotification *)n {
+    dispatch_async(_q, ^{ self->_player = nil; [self q_start]; });
 }
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
-    return YES;
+- (void)onResign:(NSNotification *)n {
+    if (_enabled) [self startPlayingSilentAudio];
 }
-
-- (void)onLongPress:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    UIWindow *win = (UIWindow *)g.view;
-    [self showMainFrom:win];
+- (void)onBackground:(NSNotification *)n {
+    if (!_enabled) return;
+    _inBackground = YES;
+    [self beginBG];
+    [self startPlayingSilentAudio];
 }
-
-- (void)later:(void (^)(void))blk {
-    dispatch_async(dispatch_get_main_queue(), blk);
+- (void)onActive:(NSNotification *)n {
+    _inBackground = NO;
+    [self endBG];
+    if (_enabled) [self startPlayingSilentAudio];
 }
-
-- (void)present:(UIAlertController *)ac from:(UIWindow *)win {
-    UIViewController *top = TopVC(win);
-    if (top) [top presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)showMainFrom:(UIWindow *)win {
-    UIViewController *top = TopVC(win);
-    if (!top || [top isKindOfClass:UIAlertController.class]) return;
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    BOOL on = [d boolForKey:kMasterKey];
-    NSString *cur = CurHex();
-
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Màu nhấn"
-        message:[NSString stringWithFormat:@"%@%@",
-            on ? [NSString stringWithFormat:@"Đang bật • #%@", cur] : @"Đang tắt",
-            ([d boolForKey:kBGKey] && !HostDeclaresAudioBackground()) ? @"\nApp chưa khai báo UIBackgroundModes=audio: chạy nền chỉ được ~30 giây" : @""]
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = [@"#" stringByAppendingString:cur];
-        tf.placeholder = @"#RRGGBB";
-        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
-        tf.autocorrectionType = UITextAutocorrectionTypeNo;
-    }];
-    __weak UIAlertController *weakAc = ac;
-    [ac addAction:[UIAlertAction actionWithTitle:@"Lưu màu" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIColor *col = ColorFromHex(weakAc.textFields.firstObject.text);
-        if (!col) return;
-        [d setObject:HexFromColor(col) forKey:kHexKey];
-        [d setBool:YES forKey:kMasterKey];
-        ApplyAll();
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Chọn màu…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [self later:^{
-            UIColorPickerViewController *p = [UIColorPickerViewController new];
-            p.delegate = self;
-            p.supportsAlpha = NO;
-            p.selectedColor = ColorFromHex(cur) ?: ColorFromHex(kDefaultHex);
-            [TopVC(win) presentViewController:p animated:YES completion:nil];
-        }];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:on ? @"Tắt màu nhấn" : @"Bật màu nhấn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [d setBool:!on forKey:kMasterKey];
-        ApplyAll();
-    }]];
-    BOOL bg = [d boolForKey:kBGKey];
-    [ac addAction:[UIAlertAction actionWithTitle:bg ? @"Chạy nền: bật (nhấn để tắt)" : @"Chạy nền: tắt (nhấn để bật)"
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [d setBool:!bg forKey:kBGKey];
-        [[AACKeepAlive shared] setEnabled:!bg];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-    [top presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)saveColor:(UIColor *)col {
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    [d setObject:HexFromColor(col) forKey:kHexKey];
-    [d setBool:YES forKey:kMasterKey];
-    ApplyAll();
-}
-
-- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc { [self saveColor:vc.selectedColor]; }
-- (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc { [self saveColor:vc.selectedColor]; }
 @end
 
 #pragma mark - Hỗ trợ hook
 
 static void MarkFill(CALayer *l) {
-    if (![NSThread isMainThread]) return;   // Facebook/Texture dựng layer ở thread nền
+    if (!OnMain()) return;                  // Facebook/Texture dựng layer ở thread nền
     if (l.bounds.size.height > 120) return; // chỉ nút/chip, không phải nền lớn
     if (!objc_getAssociatedObject(l, kFill)) {
         objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -395,7 +378,25 @@ static BOOL UnderFill(UIView *v) {
     return NO;
 }
 
+static BOOL IsBlackColor(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
+    return a >= 0.99 && r < 0.03 && g < 0.03 && b < 0.03;
+}
+
+static BOOL IsBlackCG(CGColorRef c) {
+    if (!c || CGColorGetAlpha(c) < 0.99) return NO;
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *k = CGColorGetComponents(c);
+    if (!k) return NO;
+    if (n == 2) return k[0] < 0.03;
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    if (n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return NO;
+    return k[0] < 0.03 && k[1] < 0.03 && k[2] < 0.03;
+}
+
 // CGColor xanh dương -> CGColor của nhóm cat (đã lưu sẵn, không giải phóng). NULL nếu không áp dụng.
+// Hàm thuần (chỉ tính màu) nên an toàn ở mọi thread.
 static CGColorRef LayerRemap(CGColorRef c, int cat, int *clsOut) {
     if (!c || !gOn[cat]) return NULL;
     CGColorSpaceRef cs = CGColorGetColorSpace(c);
@@ -409,7 +410,7 @@ static CGColorRef LayerRemap(CGColorRef c, int cat, int *clsOut) {
     return CGFor(cat, cls == 2);
 }
 
-// UIColor xanh dương -> màu của nhóm cat. nil nếu không áp dụng.
+// UIColor xanh dương -> màu của nhóm cat. nil nếu không áp dụng. Chỉ gọi ở main thread.
 static UIColor *ColorRemap(UIColor *c, int cat, int *clsOut) {
     if (!c || !gOn[cat]) return nil;
     CGFloat r = 0, g = 0, b = 0, a = 0;
@@ -420,65 +421,36 @@ static UIColor *ColorRemap(UIColor *c, int cat, int *clsOut) {
     return cls == 2 ? [gColor[cat] colorWithAlphaComponent:0.2] : gColor[cat];
 }
 
-// Nền đen bo tròn cỡ nút/chip (vd "Theo dõi", nút ✓, thumb segmented, dấu + avatar) -> màu "Nút & nền".
+// Nền đen bo tròn cỡ nút/chip (vd nút ✓, thumb segmented, dấu + avatar) -> màu accent. Main thread.
 static void TryBlack(CALayer *l) {
-    if (!gOn[AACFill]) return;
+    if (!gOn[AACFill] || !OnMain()) return;
     CGColorRef bg = l.backgroundColor;
-    if (!bg || CGColorGetAlpha(bg) < 0.99) return;
-    const CGFloat *c = CGColorGetComponents(bg);
-    if (!c) return;
-    size_t n = CGColorGetNumberOfComponents(bg);
-    BOOL black = (n == 2) ? (c[0] < 0.03) : (n >= 4 && c[0] < 0.03 && c[1] < 0.03 && c[2] < 0.03);
-    if (!black) return;
+    if (!IsBlackCG(bg)) return;
     CGSize sz = l.bounds.size;
     if (sz.height < 14 || sz.height > 64 || sz.width < 14 || l.cornerRadius < 6) return;
-    if (![NSThread isMainThread]) return;
     l.backgroundColor = CGFor(AACFill, NO);
     MarkFill(l);
 }
 
-// Thumb dạng pill vẽ bằng CAShapeLayer màu đen (vd thanh chọn 1x / 1.25x) -> màu "Nút & nền".
+// Thumb dạng pill vẽ bằng CAShapeLayer màu đen -> accent. Main thread.
 static void TryBlackShape(CAShapeLayer *sh) {
-    if (!gOn[AACFill]) return;
-    CGColorRef f = sh.fillColor;
-    if (!f || CGColorGetAlpha(f) < 0.99) return;
-    const CGFloat *c = CGColorGetComponents(f);
-    if (!c) return;
-    size_t n = CGColorGetNumberOfComponents(f);
-    BOOL black = (n == 2) ? (c[0] < 0.03) : (n >= 4 && c[0] < 0.03 && c[1] < 0.03 && c[2] < 0.03);
-    if (!black) return;
+    if (!gOn[AACFill] || !OnMain()) return;
+    if (!IsBlackCG(sh.fillColor)) return;
     CGPathRef path = sh.path;
-    if (!path) return;
+    if (!path || CGPathIsEmpty(path)) return;
     CGRect b = CGPathGetBoundingBox(path);
+    if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
     if (b.size.height < 20 || b.size.height > 64 || b.size.width < b.size.height * 1.6) return;
-    if (![NSThread isMainThread]) return;
     sh.fillColor = CGFor(AACFill, NO);
 }
 
-static BOOL IsBlackColor(UIColor *c) {
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
-    return a >= 0.99 && r < 0.03 && g < 0.03 && b < 0.03;
-}
-
-static BOOL IsBlackCG(CGColorRef c) {
-    if (!c || CGColorGetAlpha(c) < 0.99) return NO;
-    const CGFloat *k = CGColorGetComponents(c);
-    if (!k) return NO;
-    size_t n = CGColorGetNumberOfComponents(c);
-    if (n == 2) return k[0] < 0.03;
-    CGColorSpaceRef cs = CGColorGetColorSpace(c);
-    if (n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return NO;
-    return k[0] < 0.03 && k[1] < 0.03 && k[2] < 0.03;
-}
-
-// Icon vector (CAShapeLayer) đen cỡ nhỏ (tab bar, nút…) -> màu nhóm "Icon".
+// Icon vector (CAShapeLayer) đen cỡ nhỏ -> accent. Main thread.
 static void TryBlackIconShape(CAShapeLayer *sh) {
-    if (!gOn[AACIcon] || gInTry || ![NSThread isMainThread]) return;
+    if (!gOn[AACIcon] || gInTry || !OnMain()) return;
     BOOL fill = IsBlackCG(sh.fillColor), stroke = IsBlackCG(sh.strokeColor);
     if (!fill && !stroke) return;
     CGPathRef path = sh.path;
-    if (!path) return;
+    if (!path || CGPathIsEmpty(path)) return;
     CGRect b = CGPathGetBoundingBox(path);
     if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
     CGFloat mx = fmax(b.size.width, b.size.height);
@@ -492,7 +464,25 @@ static void TryBlackIconShape(CAShapeLayer *sh) {
     objc_setAssociatedObject(sh, kIconShape, @(bits | old.intValue), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-// UIImage nhỏ, nền trong suốt, toàn pixel đen (icon đã "nướng" màu đen, không phải template).
+// Thay cho hook setBounds/setCornerRadius/setPath (chạy mỗi frame, dễ gây crash):
+// khi thấy layer đặt màu đen thì hẹn kiểm tra ở main queue (ngay + sau 0.2s khi layout xong).
+static void ScheduleCheck(CALayer *l, BOOL shape) {
+    if (!l || gPending > 96) return;
+    void (^run)(void) = ^{
+        if (shape && [l isKindOfClass:CAShapeLayer.class]) {
+            TryBlackShape((CAShapeLayer *)l);
+            TryBlackIconShape((CAShapeLayer *)l);
+        } else {
+            TryBlack(l);
+        }
+        __sync_fetch_and_sub(&gPending, 1);
+    };
+    __sync_fetch_and_add(&gPending, 2);
+    dispatch_async(dispatch_get_main_queue(), run);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), run);
+}
+
+// UIImage nhỏ, nền trong suốt, toàn pixel đen (icon đã "nướng" màu đen, không phải template). Main thread.
 static BOOL ImageIsBlackMono(UIImage *img) {
     NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
     if (cached) return cached.boolValue;
@@ -520,7 +510,7 @@ static BOOL ImageIsBlackMono(UIImage *img) {
                 if (px[3] < 40) { clear++; continue; }
                 solid++;
                 int mxc = MAX(px[0], MAX(px[1], px[2]));   // premultiplied
-                if (mxc * 255 > 40 * px[3]) { bad++; break; }   // kênh lớn nhất (un-premult) > ~0.16
+                if (mxc * 255 > 40 * px[3]) { bad++; break; }
             }
             res = (solid >= 6 && clear >= 1 && bad == 0);
         }
@@ -529,9 +519,9 @@ static BOOL ImageIsBlackMono(UIImage *img) {
     return res;
 }
 
-// Icon đen đơn sắc -> template để ăn tint (màu nhóm "Icon").
+// Icon đen đơn sắc -> template để ăn tint.
 static UIImage *IconRemapImage(UIImage *img) {
-    if (!img || !gMaster || !gOn[AACIcon] || ![NSThread isMainThread]) return img;
+    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
     CGSize sz = img.size;
     if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return img;
@@ -539,24 +529,278 @@ static UIImage *IconRemapImage(UIImage *img) {
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
-// App tự tô icon bằng màu đen (imageWithTintColor:) -> đổi sang màu nhóm "Icon".
+// App tự tô icon bằng màu đen (imageWithTintColor:) -> accent.
 static UIColor *IconTintFix(UIColor *c) {
-    if (gMaster && gOn[AACIcon] && c && IsBlackColor(c)) return gColor[AACIcon];
+    if (gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) return gColor[AACIcon];
     return c;
 }
 
-static int TintCat(UIView *v) {
-    if ([v isKindOfClass:UIImageView.class]) return AACIcon;
-    if ([v isKindOfClass:UILabel.class] || [v isKindOfClass:UIButton.class] ||
-        [v isKindOfClass:UITextField.class] || [v isKindOfClass:UITextView.class]) return AACText;
-    if ([v isKindOfClass:UISwitch.class] || [v isKindOfClass:UISlider.class] ||
-        [v isKindOfClass:UIProgressView.class] || [v isKindOfClass:UIActivityIndicatorView.class] ||
-        [v isKindOfClass:UIStepper.class] || [v isKindOfClass:UISegmentedControl.class] ||
-        [v isKindOfClass:UIPageControl.class]) return AACFill;
-    return AACIcon;
+#pragma mark - Tab bar
+
+static BOOL InTabBar(UIView *v) {
+    for (int i = 0; i < 10 && v; i++, v = v.superview)
+        if ([v isKindOfClass:UITabBar.class]) return YES;
+    return NO;
 }
 
+// Tô icon tab bar bằng accent (ảnh template / symbol / đen đơn sắc). Idempotent: ảnh đã tô được gắn nhãn.
+static UIImage *TabColorize(UIImage *im) {
+    if (!im || !gMaster || !gOn[AACIcon] || !OnMain()) return im;
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    UIImage *src = objc_getAssociatedObject(im, kAccentSrc);
+    NSNumber *stamp = objc_getAssociatedObject(im, kAccentStamp);
+    if (src && stamp.intValue == want) return im;
+    UIImage *base = src ?: im;
+    CGSize sz = base.size;
+    if (sz.width > 80 || sz.height > 80) return im;
+    BOOL ok = base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || ImageIsBlackMono(base);
+    if (!ok) return im;
+    UIColor *c = [UIColor colorWithCGColor:CGFor(AACIcon, NO)];
+    UIImage *out = [base imageWithTintColor:c renderingMode:UIImageRenderingModeAlwaysOriginal];
+    if (!out) return im;
+    objc_setAssociatedObject(out, kAccentSrc, base, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(out, kAccentStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
+static void TabFixView(UIView *v, int depth) {
+    if (depth > 10) return;
+    if ([v isKindOfClass:UIImageView.class]) {
+        UIImageView *iv = (UIImageView *)v;
+        UIImage *im = iv.image;
+        if (im) {
+            UIImage *n = TabColorize(IconRemapImage(im));
+            if (n != im) iv.image = n;
+        }
+    }
+    for (UIView *s in [v.subviews copy]) TabFixView(s, depth + 1);
+}
+
+static void TabBarFix(UITabBar *bar) {
+    if (!bar || !gMaster || !gOn[AACIcon] || gInTabFix || !OnMain()) return;
+    gInTabFix = YES;
+    TabFixView(bar, 0);
+    gInTabFix = NO;
+}
+
+static void TabBarFixLater(UITabBar *bar) {
+    dispatch_async(dispatch_get_main_queue(), ^{ TabBarFix(bar); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ TabBarFix(bar); });
+}
+
+#pragma mark - Bảng cài đặt
+
+static UIViewController *TopVC(UIWindow *w) {
+    UIViewController *v = w.rootViewController;
+    while (v.presentedViewController) v = v.presentedViewController;
+    return v;
+}
+
+@interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
+@end
+
+@implementation AACSettingsVC
+
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"AccentColorAll";
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 56;
+}
+
+- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return s == 0 ? 3 : 1; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return s == 0 ? @"Màu nhấn" : @"Continuity & Access";
+}
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s == 1 && !HostDeclaresAudioBackground())
+        return @"App này chưa khai báo UIBackgroundModes = audio nên chạy nền chỉ được khoảng 30 giây.";
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if (ip.section == 1) return [self keepAliveCell];
+
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    if (ip.row == 0) {
+        cell.textLabel.text = @"Bật màu nhấn";
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UISwitch *sw = [UISwitch new];
+        sw.on = [d boolForKey:kMasterKey];
+        [sw addTarget:self action:@selector(masterChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+    } else if (ip.row == 1) {
+        cell.textLabel.text = @"Mã màu";
+        cell.detailTextLabel.text = [@"#" stringByAppendingString:CurHex()];
+        UIView *sw = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 24, 24)];
+        sw.layer.cornerRadius = 12;
+        sw.backgroundColor = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
+        sw.layer.borderWidth = 1;
+        sw.layer.borderColor = UIColor.separatorColor.CGColor;
+        cell.accessoryView = sw;
+    } else {
+        cell.textLabel.text = @"Chọn màu…";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    }
+    return cell;
+}
+
+- (UITableViewCell *)keepAliveCell {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    UIColor *acc = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    UIView *cv = cell.contentView;
+
+    UIView *box = [UIView new];
+    box.translatesAutoresizingMaskIntoConstraints = NO;
+    box.backgroundColor = [acc colorWithAlphaComponent:0.15];
+    box.layer.cornerRadius = 10;
+
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"hourglass" withConfiguration:cfg]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = acc;
+    icon.contentMode = UIViewContentModeCenter;
+    [box addSubview:icon];
+
+    UILabel *title = [UILabel new];
+    title.text = @"Background Keep-Alive";
+    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    title.numberOfLines = 0;
+
+    UILabel *desc = [UILabel new];
+    desc.text = @"Keeps the audio session active while enabled; effectiveness depends on the host app's background audio support.";
+    desc.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    desc.textColor = UIColor.secondaryLabelColor;
+    desc.numberOfLines = 0;
+
+    UIStackView *texts = [[UIStackView alloc] initWithArrangedSubviews:@[title, desc]];
+    texts.axis = UILayoutConstraintAxisVertical;
+    texts.spacing = 2;
+    texts.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UISwitch *sw = [UISwitch new];
+    sw.translatesAutoresizingMaskIntoConstraints = NO;
+    sw.on = [d boolForKey:kBGKey];
+    [sw addTarget:self action:@selector(keepAliveChanged:) forControlEvents:UIControlEventValueChanged];
+    [sw setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [sw setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+    [cv addSubview:box]; [cv addSubview:texts]; [cv addSubview:sw];
+    UILayoutGuide *m = cv.layoutMarginsGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [box.leadingAnchor constraintEqualToAnchor:m.leadingAnchor],
+        [box.centerYAnchor constraintEqualToAnchor:cv.centerYAnchor],
+        [box.widthAnchor constraintEqualToConstant:40],
+        [box.heightAnchor constraintEqualToConstant:40],
+        [icon.centerXAnchor constraintEqualToAnchor:box.centerXAnchor],
+        [icon.centerYAnchor constraintEqualToAnchor:box.centerYAnchor],
+        [texts.leadingAnchor constraintEqualToAnchor:box.trailingAnchor constant:14],
+        [texts.topAnchor constraintEqualToAnchor:cv.topAnchor constant:12],
+        [texts.bottomAnchor constraintEqualToAnchor:cv.bottomAnchor constant:-12],
+        [texts.trailingAnchor constraintEqualToAnchor:sw.leadingAnchor constant:-12],
+        [sw.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+        [sw.centerYAnchor constraintEqualToAnchor:cv.centerYAnchor],
+    ]];
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section != 0) return;
+    if (ip.row == 1) [self editHex];
+    else if (ip.row == 2) [self pickColor];
+}
+
+- (void)masterChanged:(UISwitch *)sw {
+    [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kMasterKey];
+    ApplyAll();
+}
+
+- (void)keepAliveChanged:(UISwitch *)sw {
+    [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kBGKey];
+    [[AACBackgroundKeepAliveService shared] setEnabled:sw.isOn];
+}
+
+- (void)editHex {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Mã màu" message:@"Nhập #RRGGBB"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = [@"#" stringByAppendingString:CurHex()];
+        tf.placeholder = @"#RRGGBB";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    __weak UIAlertController *wac = ac;
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Lưu" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIColor *col = ColorFromHex(wac.textFields.firstObject.text);
+        if (col) [ws saveColor:col];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)pickColor {
+    UIColorPickerViewController *p = [UIColorPickerViewController new];
+    p.delegate = self;
+    p.supportsAlpha = NO;
+    p.selectedColor = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
+    [self presentViewController:p animated:YES completion:nil];
+}
+
+- (void)saveColor:(UIColor *)col {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setObject:HexFromColor(col) forKey:kHexKey];
+    [d setBool:YES forKey:kMasterKey];
+    ApplyAll();
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+- (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)vc { [self saveColor:vc.selectedColor]; }
+- (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc { [self saveColor:vc.selectedColor]; }
+@end
+
+@interface AACHelper : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
+@end
+
+@implementation AACHelper
++ (instancetype)shared {
+    static AACHelper *h; static dispatch_once_t once;
+    dispatch_once(&once, ^{ h = [AACHelper new]; });
+    return h;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
+    return YES;
+}
+
+- (void)onLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    UIWindow *win = (UIWindow *)g.view;
+    UIViewController *top = TopVC(win);
+    if (!top) return;
+    if ([top isKindOfClass:UINavigationController.class] &&
+        [((UINavigationController *)top).viewControllers.firstObject isKindOfClass:AACSettingsVC.class]) return;
+    if ([top isKindOfClass:UIAlertController.class] || [top isKindOfClass:UIColorPickerViewController.class]) return;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [top presentViewController:nav animated:YES completion:nil];
+}
+@end
+
 static void Setup(UIWindow *w) {
+    if (!OnMain()) return;
     if (!objc_getAssociatedObject(w, kGestureFlag)) {
         NSString *cn = NSStringFromClass(w.class);
         BOOL skip = w.windowLevel > UIWindowLevelNormal ||
@@ -575,7 +819,12 @@ static void Setup(UIWindow *w) {
         }
     }
     gDark = (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
-    w.tintColor = gOn[AACIcon] ? gColor[AACIcon] : nil;
+    // Chỉ set tint của window khi màu đã đổi (tránh kích hoạt tintColorDidChange lan khắp cây view nhiều lần).
+    NSNumber *tv = objc_getAssociatedObject(w, kTintVer);
+    if (!tv || tv.intValue != gVersion) {
+        objc_setAssociatedObject(w, kTintVer, @(gVersion), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        w.tintColor = gOn[AACIcon] ? gColor[AACIcon] : nil;
+    }
 }
 
 #pragma mark - Hook
@@ -592,44 +841,33 @@ static void Setup(UIWindow *w) {
 
 %hook UIView
 - (UIColor *)tintColor {
-    if (!gMaster) return %orig;
-    if (gFillCount > 0 && gOn[AACFill] && [NSThread isMainThread] && UnderFill(self)) return UIColor.whiteColor;
-    int cat = TintCat(self);
-    if (gOn[cat]) return gColor[cat];
-    return %orig;
+    if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon]) return %orig;
+    if (gFillCount > 0 && gOn[AACFill] && OnMain() && UnderFill(self)) return UIColor.whiteColor;
+    return gColor[AACIcon];
 }
 - (void)setTintColor:(UIColor *)c {
-    if (gMaster && c && IsBlackColor(c)) {
-        int cat = TintCat(self);
-        if (gOn[cat]) { %orig(gColor[cat]); return; }
-    }
+    if (gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) { %orig(gColor[AACIcon]); return; }
     %orig;
 }
 - (void)setBackgroundColor:(UIColor *)c {
+    if (!gMaster || !c || !OnMain()) { %orig; return; }
     int cls = 0;
-    UIColor *n = gMaster ? ColorRemap(c, AACFill, &cls) : nil;
+    UIColor *n = ColorRemap(c, AACFill, &cls);
     %orig(n ?: c);
-    if (!gMaster) return;
     if (n && cls == 1) MarkFill(self.layer);
-    else if (!n && gOn[AACFill] && IsBlackColor(c)) TryBlack(self.layer);
+    else if (!n && gOn[AACFill] && IsBlackColor(c)) ScheduleCheck(self.layer, NO);
 }
 %end
 
+// Chỉ xử lý màu (hàm thuần) ngay trong setter; mọi thứ đọc/ghi trạng thái layer dời sang main queue.
 %hook CALayer
 - (void)setBackgroundColor:(CGColorRef)c {
+    if (!gMaster || !c) { %orig; return; }
     int cls = 0;
-    CGColorRef n = gMaster ? LayerRemap(c, AACFill, &cls) : NULL;
-    if (n) { %orig(n); if (cls == 1) MarkFill(self); return; }
+    CGColorRef n = LayerRemap(c, AACFill, &cls);
+    if (n) { %orig(n); if (cls == 1 && OnMain()) MarkFill(self); return; }
     %orig;
-    if (gMaster) TryBlack(self);
-}
-- (void)setBounds:(CGRect)b {
-    %orig;
-    if (gMaster && gOn[AACFill]) TryBlack(self);
-}
-- (void)setCornerRadius:(CGFloat)r {
-    %orig;
-    if (gMaster && gOn[AACFill]) TryBlack(self);
+    if (gOn[AACFill] && IsBlackCG(c)) ScheduleCheck(self, NO);
 }
 - (void)setBorderColor:(CGColorRef)c {
     CGColorRef n = gMaster ? LayerRemap(c, AACFill, NULL) : NULL;
@@ -640,32 +878,30 @@ static void Setup(UIWindow *w) {
 
 %hook CAShapeLayer
 - (void)setFillColor:(CGColorRef)c {
-    CGColorRef n = gMaster ? LayerRemap(c, AACIcon, NULL) : NULL;
+    if (!gMaster || !c) { %orig; return; }
+    CGColorRef n = LayerRemap(c, AACIcon, NULL);
     if (n) { %orig(n); return; }
     %orig;
-    if (gMaster) { TryBlackShape(self); TryBlackIconShape(self); }
-}
-- (void)setPath:(CGPathRef)p {
-    %orig;
-    if (gMaster) { TryBlackShape(self); TryBlackIconShape(self); }
+    if (!gInTry && (gOn[AACFill] || gOn[AACIcon]) && IsBlackCG(c)) ScheduleCheck(self, YES);
 }
 - (void)setStrokeColor:(CGColorRef)c {
-    CGColorRef n = gMaster ? LayerRemap(c, AACIcon, NULL) : NULL;
+    if (!gMaster || !c) { %orig; return; }
+    CGColorRef n = LayerRemap(c, AACIcon, NULL);
     if (n) { %orig(n); return; }
     %orig;
-    if (gMaster) TryBlackIconShape(self);
+    if (!gInTry && gOn[AACIcon] && IsBlackCG(c)) ScheduleCheck(self, YES);
 }
 %end
 
-// Thanh chọn (segmented): thumb đen -> màu "Nút & nền"
+// Thanh chọn (segmented): thumb đen -> accent
 %hook UISegmentedControl
 - (void)setSelectedSegmentTintColor:(UIColor *)c {
-    UIColor *n = (gMaster && gOn[AACFill] && c && IsBlackColor(c)) ? gColor[AACFill] : nil;
+    UIColor *n = (gMaster && gOn[AACFill] && c && OnMain() && IsBlackColor(c)) ? gColor[AACFill] : nil;
     %orig(n ?: c);
 }
 - (void)didMoveToWindow {
     %orig;
-    if (gMaster && gOn[AACFill]) {
+    if (gMaster && gOn[AACFill] && OnMain()) {
         UIColor *cur = self.selectedSegmentTintColor;
         if (cur && IsBlackColor(cur)) self.selectedSegmentTintColor = gColor[AACFill];
     }
@@ -674,14 +910,14 @@ static void Setup(UIWindow *w) {
 
 %hook UILabel
 - (void)setTextColor:(UIColor *)c {
-    UIColor *n = gMaster ? ColorRemap(c, AACText, NULL) : nil;
+    UIColor *n = (gMaster && OnMain()) ? ColorRemap(c, AACText, NULL) : nil;
     %orig(n ?: c);
 }
 %end
 
 %hook UIButton
 - (void)setTitleColor:(UIColor *)c forState:(UIControlState)st {
-    UIColor *n = gMaster ? ColorRemap(c, AACText, NULL) : nil;
+    UIColor *n = (gMaster && OnMain()) ? ColorRemap(c, AACText, NULL) : nil;
     %orig(n ?: c, st);
 }
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
@@ -689,10 +925,15 @@ static void Setup(UIWindow *w) {
 }
 %end
 
-// Icon ảnh: đen đơn sắc -> template
+// Icon ảnh: đen đơn sắc -> template; icon trong tab bar -> tô accent
 %hook UIImageView
 - (void)setImage:(UIImage *)img {
-    %orig(IconRemapImage(img));
+    UIImage *n = IconRemapImage(img);
+    if (n && gMaster && gOn[AACIcon] && OnMain()) {
+        CGSize s = n.size;
+        if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
+    }
+    %orig(n);
 }
 %end
 
@@ -706,7 +947,24 @@ static void Setup(UIWindow *w) {
 }
 %end
 
-// Switch (nút gạt): luôn dùng màu "Nút & nền", kể cả khi app (SwiftUI) tự set màu xanh lá
+// Tab bar (iOS 26 Liquid Glass): đổi icon sang accent
+%hook UITabBar
+- (void)layoutSubviews { %orig; TabBarFix(self); }
+- (void)didMoveToWindow { %orig; if (self.window) TabBarFixLater(self); }
+- (void)setSelectedItem:(UITabBarItem *)item { %orig; TabBarFixLater(self); }
+- (void)traitCollectionDidChange:(UITraitCollection *)prev { %orig; TabBarFixLater(self); }
+- (void)setUnselectedItemTintColor:(UIColor *)c {
+    %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) ? gColor[AACIcon] : c);
+}
+%end
+
+%hook UITabBarItemStateAppearance
+- (void)setIconColor:(UIColor *)c {
+    %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) ? gColor[AACIcon] : c);
+}
+%end
+
+// Switch (nút gạt): luôn dùng accent, kể cả khi app (SwiftUI) tự set màu xanh lá
 %hook UISwitch
 - (void)setOnTintColor:(UIColor *)c {
     %orig((gMaster && gOn[AACFill]) ? gColor[AACFill] : c);
@@ -717,25 +975,26 @@ static void Setup(UIWindow *w) {
 }
 - (void)didMoveToWindow {
     %orig;
-    if (gMaster && gOn[AACFill]) self.onTintColor = gColor[AACFill];
+    if (gMaster && gOn[AACFill] && OnMain()) self.onTintColor = gColor[AACFill];
 }
 %end
 
 %hook UIColor
 + (UIColor *)systemBlueColor {
-    if (gMaster && gOn[AACIcon]) return gColor[AACIcon];
+    if (gMaster && gOn[AACIcon] && gColor[AACIcon]) return gColor[AACIcon];
     return %orig;
 }
 + (UIColor *)linkColor {
-    if (gMaster && gOn[AACText]) return gColor[AACText];
+    if (gMaster && gOn[AACText] && gColor[AACText]) return gColor[AACText];
     return %orig;
 }
 %end
 
 %ctor {
-    [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kBGKey: @NO }];
-    RefreshCache();
-    if ([NSUserDefaults.standardUserDefaults boolForKey:kBGKey]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [[AACKeepAlive shared] setEnabled:YES]; });
+    @autoreleasepool {
+        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kBGKey: @NO }];
+        RefreshCache();          // phải có màu trước khi hook hoạt động
+        %init;
+        [AACBackgroundKeepAliveService bootstrap];
     }
 }
