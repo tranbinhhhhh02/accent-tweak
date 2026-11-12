@@ -230,9 +230,23 @@ static UIColor *RemapRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
     return al >= 0.99 ? gColor[AACFill] : [gColor[AACFill] colorWithAlphaComponent:al];
 }
 
+static BOOL IsAccentCG(CGColorRef c) {
+    if (!c || !gColor[0]) return NO;
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *k = CGColorGetComponents(c);
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    if (!k || n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB || CGColorGetAlpha(c) < 0.99) return NO;
+    for (int d = 0; d < 2; d++) {
+        CGColorRef a = d ? gCGDark[0] : gCGLight[0];
+        const CGFloat *q = CGColorGetComponents(a);
+        if (q && fabs(k[0] - q[0]) < 0.02 && fabs(k[1] - q[1]) < 0.02 && fabs(k[2] - q[2]) < 0.02) return YES;
+    }
+    return NO;
+}
+
 static BOOL LayerUnderFill(CALayer *l) {
     for (int i = 0; i < 4 && l; i++, l = l.superlayer)
-        if (objc_getAssociatedObject(l, kFill)) return YES;
+        if (objc_getAssociatedObject(l, kFill) || IsAccentCG(l.backgroundColor)) return YES;
     return NO;
 }
 
@@ -279,21 +293,68 @@ static void TryBlackIconShape(CAShapeLayer *sh) {
     objc_setAssociatedObject(sh, kIconShape, @(bits | old.intValue), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static void ScheduleCheck(CALayer *l, BOOL shape) {
-    if (!l || gPending > 96) return;
-    void (^run)(void) = ^{
-        if (shape && [l isKindOfClass:CAShapeLayer.class]) {
-            TryBlackShape((CAShapeLayer *)l);
-            TryBlackIconShape((CAShapeLayer *)l);
-        } else {
-            TryBlack(l);
+static NSHashTable *gPend;
+static volatile int32_t gHasPend;
+static const void *kAttempts  = &kAttempts;
+static const void *kPendShape = &kPendShape;
+#define PEND_LOCK @"AACPend"
+
+static void RunCheck(CALayer *l, BOOL shape) {
+    if (shape && [l isKindOfClass:CAShapeLayer.class]) {
+        TryBlackShape((CAShapeLayer *)l);
+        TryBlackIconShape((CAShapeLayer *)l);
+    } else {
+        TryBlack(l);
+    }
+}
+
+static BOOL CheckDone(CALayer *l, BOOL shape) {
+    if (shape && [l isKindOfClass:CAShapeLayer.class]) {
+        CAShapeLayer *sh = (CAShapeLayer *)l;
+        return !IsBlackCG(sh.fillColor) && !IsBlackCG(sh.strokeColor);
+    }
+    return !IsBlackCG(l.backgroundColor) && !(l.borderWidth > 0 && IsBlackCG(l.borderColor));
+}
+
+static void AddPending(CALayer *l, BOOL shape) {
+    @synchronized (PEND_LOCK) {
+        if (!gPend) gPend = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
+        if (gPend.count > 400) return;
+        [gPend addObject:l];
+        gHasPend = 1;
+    }
+    objc_setAssociatedObject(l, kPendShape, @(shape), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void PendingRun(CALayer *l) {
+    BOOL has;
+    @synchronized (PEND_LOCK) { has = [gPend containsObject:l]; }
+    if (!has) return;
+    BOOL shape = [objc_getAssociatedObject(l, kPendShape) boolValue];
+    RunCheck(l, shape);
+    int n = [objc_getAssociatedObject(l, kAttempts) intValue] + 1;
+    objc_setAssociatedObject(l, kAttempts, @(n), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (n >= 8 || CheckDone(l, shape)) {
+        @synchronized (PEND_LOCK) {
+            [gPend removeObject:l];
+            if (!gPend.count) gHasPend = 0;
         }
+    }
+}
+
+static void ScheduleCheck(CALayer *l, BOOL shape) {
+    if (!l) return;
+    if (OnMain()) {
+        RunCheck(l, shape);
+        if (CheckDone(l, shape)) return;
+    }
+    AddPending(l, shape);
+    if (gPending > 96) return;
+    __sync_fetch_and_add(&gPending, 1);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        RunCheck(l, shape);
         __sync_fetch_and_sub(&gPending, 1);
-    };
-    __sync_fetch_and_add(&gPending, 3);
-    dispatch_async(dispatch_get_main_queue(), run);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), run);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), run);
+    });
 }
 
 static BOOL ImageIsBlackMono(UIImage *img) {
@@ -302,7 +363,7 @@ static BOOL ImageIsBlackMono(UIImage *img) {
     static CFAbsoluteTime winStart; static int winCount;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-    if (++winCount > 30) return NO;
+    if (++winCount > 120) return NO;
     BOOL res = NO;
     CGImageRef cg = img.CGImage;
     if (cg && img.images.count <= 1) {
@@ -394,7 +455,6 @@ static void TabBarFix(UITabBar *bar) {
 
 static void TabBarFixLater(UITabBar *bar) {
     dispatch_async(dispatch_get_main_queue(), ^{ TabBarFix(bar); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ TabBarFix(bar); });
 }
 
 #pragma mark - Bảng cài đặt
@@ -592,6 +652,10 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook CALayer
+- (void)layoutSublayers {
+    %orig;
+    if (gHasPend && OnMain()) PendingRun(self);
+}
 - (void)setBackgroundColor:(CGColorRef)c {
     if (!gMaster || !c) { %orig; return; }
     int cls = 0;
