@@ -15,8 +15,10 @@ static NSString *const kEnabledKey    = @"AccentColorAll_Enabled";
 static NSString *const kHexKey        = @"AccentColorAll_Hex";
 static NSString *const kSrcHexKey     = @"AccentColorAll_SrcHex";
 static NSString *const kAggressiveKey = @"AccentColorAll_Aggressive";
+static NSString *const kBlackKey      = @"AccentColorAll_BlackBtn";
 static NSString *const kDefaultHex    = @"B8A8FF";
 static const void *kGestureFlag       = &kGestureFlag;
+static const void *kFill              = &kFill;
 
 typedef struct { CGFloat r, g, b; } RGB;
 
@@ -24,6 +26,8 @@ static RGB      gTargets[16];
 static int      gTargetCount = 0;
 static BOOL     gBypass = NO;
 static BOOL     gAggressive = YES;
+static BOOL     gBlackBtn = YES;
+static int      gFillCount = 0;
 static UIColor *gAccent = nil;
 
 #pragma mark - Màu
@@ -68,20 +72,29 @@ static void AddTarget(CGFloat r, CGFloat g, CGFloat b) {
     gTargets[gTargetCount++] = (RGB){ r, g, b };
 }
 
+// Xanh "link" kiểu iOS/X/Instagram: hue ~200-225 độ, đủ đậm và đủ sáng.
+static inline BOOL IsLinkBlue(CGFloat r, CGFloat g, CGFloat b) {
+    CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+    if (b < mx || mx < 0.75 || mx - mn < 0.55 * mx) return NO;
+    CGFloat h = 60.0 * (4.0 + (r - g) / (mx - mn)); // b là kênh lớn nhất
+    return h >= 195.0 && h <= 230.0;
+}
+
 static inline BOOL Matches(CGFloat r, CGFloat g, CGFloat b) {
-    if (gBypass || !gAccent || gTargetCount == 0) return NO;
+    if (gBypass || !gAccent) return NO;
     for (int i = 0; i < gTargetCount; i++) {
         if (fabs(r - gTargets[i].r) < 0.012 &&
             fabs(g - gTargets[i].g) < 0.012 &&
             fabs(b - gTargets[i].b) < 0.012) return YES;
     }
-    return NO;
+    return gAggressive && IsLinkBlue(r, g, b);
 }
 
 // Tính lại màu nhấn + danh sách màu cần thay. Gọi sau mỗi lần đổi cài đặt.
 static void RefreshCache(void) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     gAggressive = [d boolForKey:kAggressiveKey];
+    gBlackBtn = [d boolForKey:kBlackKey];
     gTargetCount = 0;
 
     if (![d boolForKey:kEnabledKey]) { gAccent = nil; return; }
@@ -110,6 +123,10 @@ static void RefreshCache(void) {
         AddTarget(0.0 / 255, 149.0 / 255, 246.0 / 255);   // Instagram/Threads #0095F6
         AddTarget(55.0 / 255, 151.0 / 255, 239.0 / 255);  // Instagram #3797EF
         AddTarget(254.0 / 255, 44.0 / 255, 85.0 / 255);   // TikTok #FE2C55
+        AddTarget(24.0 / 255, 119.0 / 255, 242.0 / 255);  // Facebook #1877F2
+        AddTarget(8.0 / 255, 102.0 / 255, 255.0 / 255);   // Facebook/Messenger mới #0866FF
+        AddTarget(66.0 / 255, 103.0 / 255, 178.0 / 255);  // Facebook cũ #4267B2
+        AddTarget(45.0 / 255, 136.0 / 255, 255.0 / 255);  // Facebook xanh sáng #2D88FF
     }
 }
 
@@ -170,6 +187,7 @@ static UIViewController *TopVC(UIWindow *w) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     BOOL on = [d boolForKey:kEnabledKey];
     BOOL strong = [d boolForKey:kAggressiveKey];
+    BOOL blk = [d boolForKey:kBlackKey];
     NSString *cur = [d stringForKey:kHexKey] ?: kDefaultHex;
     NSString *src = [d stringForKey:kSrcHexKey] ?: @"";
 
@@ -220,6 +238,11 @@ static UIViewController *TopVC(UIWindow *w) {
         [d setBool:!strong forKey:kAggressiveKey];
         ApplyAll();
     }]];
+    [ac addAction:[UIAlertAction actionWithTitle:blk ? @"Tắt nút đen → màu nhấn" : @"Bật nút đen → màu nhấn"
+                                           style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [d setBool:!blk forKey:kBlackKey];
+        ApplyAll(); // tắt xong cần mở lại app để nút đen trở về như cũ
+    }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
     [top presentViewController:ac animated:YES completion:nil];
 }
@@ -235,6 +258,35 @@ static UIViewController *TopVC(UIWindow *w) {
 @end
 
 #pragma mark - Hook
+
+// Nút/huy hiệu nền đen bo tròn (vd "Theo dõi", dấu + trên avatar) -> nền màu nhấn.
+// Icon/chữ nằm trong view đó sẽ trả về màu trắng (xem hook tintColor).
+static void FixBlack(UIView *v) {
+    CALayer *l = v.layer;
+    CGColorRef bg = l.backgroundColor;
+    if (!bg || CGColorGetAlpha(bg) < 0.99) return;
+    if (objc_getAssociatedObject(l, kFill)) return;
+    size_t n = CGColorGetNumberOfComponents(bg);
+    const CGFloat *c = CGColorGetComponents(bg);
+    if (!c) return;
+    BOOL black = (n == 2) ? (c[0] < 0.03)
+                          : (n >= 4 && c[0] < 0.03 && c[1] < 0.03 && c[2] < 0.03);
+    if (!black) return;
+    CGSize sz = v.bounds.size;
+    if (l.cornerRadius < 6 || sz.height < 14 || sz.height > 64 || sz.width < 14) return;
+    UIColor *fill = [gAccent resolvedColorWithTraitCollection:v.traitCollection];
+    l.backgroundColor = fill.CGColor;
+    objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gFillCount++;
+}
+
+static BOOL UnderFill(UIView *v) {
+    for (int i = 0; i < 4 && v; i++) {
+        if (objc_getAssociatedObject(v.layer, kFill)) return YES;
+        v = v.superview;
+    }
+    return NO;
+}
 
 static void Setup(UIWindow *w) {
     if (!objc_getAssociatedObject(w, kGestureFlag)) {
@@ -259,8 +311,15 @@ static void Setup(UIWindow *w) {
 // Chế độ mạnh: ép mọi view trả về màu nhấn, kể cả khi app tự đặt tintColor.
 %hook UIView
 - (UIColor *)tintColor {
-    if (gAccent && gAggressive) return gAccent;
+    if (gAccent && gAggressive) {
+        if (gFillCount > 0 && UnderFill(self)) return UIColor.whiteColor;
+        return gAccent;
+    }
     return %orig;
+}
+- (void)layoutSubviews {
+    %orig;
+    if (gAccent && gAggressive && gBlackBtn) FixBlack(self);
 }
 %end
 
@@ -287,6 +346,6 @@ static void Setup(UIWindow *w) {
 
 %ctor {
     [NSUserDefaults.standardUserDefaults registerDefaults:@{
-        kEnabledKey: @YES, kHexKey: kDefaultHex, kAggressiveKey: @YES }];
+        kEnabledKey: @YES, kHexKey: kDefaultHex, kAggressiveKey: @YES, kBlackKey: @YES }];
     RefreshCache();
 }
