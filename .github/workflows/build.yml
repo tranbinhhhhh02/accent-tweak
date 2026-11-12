@@ -1,0 +1,34 @@
+# Đặt file này tại .github/workflows/build.yml trong repo GitHub
+# (Tweak.x và Makefile để ở thư mục gốc của repo).
+name: Build dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cài Theos
+        run: |
+          brew install ldid make
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: make
+
+      - name: Kiểm tra
+        run: |
+          file .theos/obj/AccentColorAll.dylib
+          lipo -info .theos/obj/AccentColorAll.dylib || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AccentColorAll-dylib
+          path: .theos/obj/AccentColorAll.dylib
