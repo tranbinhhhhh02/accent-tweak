@@ -21,7 +21,7 @@ jobs:
           echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Build
-        run: make
+        run: make FINALPACKAGE=1
 
       - name: Kiểm tra
         run: |
@@ -31,4 +31,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AccentColorAll-dylib
-          path: .theos/obj/AccentColorAll.dylib
+          path: .theos/obj/**/*.dylib
+          if-no-files-found: error
