@@ -1,9 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
-
-// Biên dịch với ARC: TweakName_CFLAGS = -fobjc-p
-
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
 
 static NSString *const kMasterKey  = @"AccentColorAll_Enabled";
