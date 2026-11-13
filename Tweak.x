@@ -199,6 +199,44 @@ static BOOL IsBlackCG(CGColorRef c) {
     return k[0] < 0.03 && k[1] < 0.03 && k[2] < 0.03;
 }
 
+// ---- Nền trắng (nút "Theo dõi" ở dark mode) ----
+
+static BOOL IsWhiteColor(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
+    return a >= 0.99 && r > 0.97 && g > 0.97 && b > 0.97;
+}
+
+static BOOL IsWhiteCG(CGColorRef c) {
+    if (!c || CGColorGetAlpha(c) < 0.99) return NO;
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *k = CGColorGetComponents(c);
+    if (!k) return NO;
+    if (n == 2) return k[0] > 0.97;
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    if (n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return NO;
+    return k[0] > 0.97 && k[1] > 0.97 && k[2] > 0.97;
+}
+
+// Nền cần đổi sang accent: đen, hoặc trắng khi đang ở dark mode
+static BOOL IsFillCandidateCG(CGColorRef c) {
+    return IsBlackCG(c) || (gDark && IsWhiteCG(c));
+}
+
+static BOOL IsFillCandidateColor(UIColor *c) {
+    return IsBlackColor(c) || (gDark && IsWhiteColor(c));
+}
+
+// Tránh đổi nhầm núm trắng của UISwitch / UISlider
+static BOOL InControlKnob(CALayer *l) {
+    id d = l.delegate;
+    if (![d isKindOfClass:UIView.class]) return NO;
+    UIView *v = (UIView *)d;
+    for (int i = 0; i < 6 && v; i++, v = v.superview)
+        if ([v isKindOfClass:UISwitch.class] || [v isKindOfClass:UISlider.class]) return YES;
+    return NO;
+}
+
 static CGColorRef LayerRemap(CGColorRef c, int cat, int *clsOut) {
     if (!c || !gOn[cat] || IsOurs(c)) return NULL;
     CGColorSpaceRef cs = CGColorGetColorSpace(c);
@@ -254,12 +292,25 @@ static void TryBlack(CALayer *l) {
     if (!gOn[AACFill] || !OnMain()) return;
     CGSize sz = l.bounds.size;
     BOOL nested = LayerUnderFill(l.superlayer);
-    if (IsBlackCG(l.backgroundColor) && sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested)) {
+    CGColorRef bg = l.backgroundColor;
+    BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
+    if (cand && sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested)) {
         l.backgroundColor = CGFor(AACFill, NO);
         MarkFill(l);
     }
     if (l.borderWidth > 0 && IsBlackCG(l.borderColor) && (nested || LayerUnderFill(l))) {
         l.borderColor = CGFor(AACFill, NO);
+    }
+}
+
+// Label nằm trong nút đã đổi accent mà vẫn giữ nền đen/trắng -> làm trong suốt
+static void FixLabelBG(UILabel *lb) {
+    if (!gMaster || !gOn[AACFill] || !OnMain()) return;
+    UIColor *bg = lb.backgroundColor;
+    if (!bg || !IsFillCandidateColor(bg)) return;
+    if (lb.bounds.size.height > 64) return;
+    if (UnderFill(lb.superview) || LayerUnderFill(lb.layer.superlayer)) {
+        lb.backgroundColor = UIColor.clearColor;
     }
 }
 
@@ -313,7 +364,7 @@ static BOOL CheckDone(CALayer *l, BOOL shape) {
         CAShapeLayer *sh = (CAShapeLayer *)l;
         return !IsBlackCG(sh.fillColor) && !IsBlackCG(sh.strokeColor);
     }
-    return !IsBlackCG(l.backgroundColor) && !(l.borderWidth > 0 && IsBlackCG(l.borderColor));
+    return !IsFillCandidateCG(l.backgroundColor) && !(l.borderWidth > 0 && IsBlackCG(l.borderColor));
 }
 
 static void AddPending(CALayer *l, BOOL shape) {
@@ -647,7 +698,7 @@ static void Setup(UIWindow *w) {
     UIColor *n = ColorRemap(c, AACFill, &cls);
     %orig(n ?: c);
     if (n && cls == 1) MarkFill(self.layer);
-    else if (!n && gOn[AACFill] && IsBlackColor(c)) ScheduleCheck(self.layer, NO);
+    else if (!n && gOn[AACFill] && IsFillCandidateColor(c)) ScheduleCheck(self.layer, NO);
 }
 %end
 
@@ -662,7 +713,7 @@ static void Setup(UIWindow *w) {
     CGColorRef n = LayerRemap(c, AACFill, &cls);
     if (n) { %orig(n); if (cls == 1 && OnMain()) MarkFill(self); return; }
     %orig;
-    if (gOn[AACFill] && IsBlackCG(c)) ScheduleCheck(self, NO);
+    if (gOn[AACFill] && IsFillCandidateCG(c)) ScheduleCheck(self, NO);
 }
 - (void)setBorderColor:(CGColorRef)c {
     CGColorRef n = gMaster ? LayerRemap(c, AACFill, NULL) : NULL;
@@ -707,6 +758,14 @@ static void Setup(UIWindow *w) {
 - (void)setTextColor:(UIColor *)c {
     UIColor *n = gMaster ? ColorRemap(c, AACText, NULL) : nil;
     %orig(n ?: c);
+}
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window) FixLabelBG(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    FixLabelBG(self);
 }
 %end
 
