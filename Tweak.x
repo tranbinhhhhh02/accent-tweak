@@ -33,6 +33,10 @@ static BOOL        gInTry;
 static BOOL        gInTabFix;
 static volatile int32_t gPending;
 
+@interface CALayer (AACPrivate)
+- (void)setContentsMultiplyColor:(CGColorRef)c;
+@end
+
 static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
 
 static void TabBarFix(UITabBar *bar);
@@ -628,6 +632,39 @@ static UIViewController *TopVC(UIWindow *w) {
     return v;
 }
 
+static NSString *HexCG(CGColorRef c) {
+    if (!c) return @"nil";
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *k = CGColorGetComponents(c);
+    if (!k) return @"?";
+    CGFloat al = CGColorGetAlpha(c);
+    NSString *h = n >= 3 ? HexFromRGB(k[0], k[1], k[2]) : HexFromRGB(k[0], k[0], k[0]);
+    return al < 0.99 ? [NSString stringWithFormat:@"%@@%.2f", h, al] : h;
+}
+
+static void DumpLayer(CALayer *l, int depth, NSMutableString *out) {
+    if (depth > 30 || out.length > 60000) return;
+    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    NSMutableString *line = [NSMutableString stringWithFormat:@"%@%@", pad, NSStringFromClass(l.class)];
+    id d = l.delegate;
+    if ([d isKindOfClass:UIView.class]) [line appendFormat:@" view=%@", NSStringFromClass([d class])];
+    CGRect f = l.frame;
+    [line appendFormat:@" [%.0f,%.0f %.0fx%.0f]", f.origin.x, f.origin.y, f.size.width, f.size.height];
+    if (l.backgroundColor) [line appendFormat:@" bg=%@", HexCG(l.backgroundColor)];
+    if ([l isKindOfClass:CAShapeLayer.class]) {
+        CAShapeLayer *sh = (CAShapeLayer *)l;
+        if (sh.fillColor) [line appendFormat:@" fill=%@", HexCG(sh.fillColor)];
+        if (sh.strokeColor) [line appendFormat:@" stroke=%@", HexCG(sh.strokeColor)];
+    }
+    if (l.contents) [line appendFormat:@" contents=%@", NSStringFromClass([(id)l.contents class])];
+    @try {
+        id mc = [l valueForKey:@"contentsMultiplyColor"];
+        if (mc) [line appendFormat:@" multiply=%@", HexCG((__bridge CGColorRef)mc)];
+    } @catch (__unused id e) {}
+    [out appendFormat:@"%@\n", line];
+    for (CALayer *s in [l.sublayers copy]) DumpLayer(s, depth + 1, out);
+}
+
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
 
@@ -647,7 +684,7 @@ static UIViewController *TopVC(UIWindow *w) {
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 4; }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Màu nhấn"; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -668,8 +705,11 @@ static UIViewController *TopVC(UIWindow *w) {
         sw.layer.borderWidth = 1;
         sw.layer.borderColor = UIColor.separatorColor.CGColor;
         cell.accessoryView = sw;
-    } else {
+    } else if (ip.row == 2) {
         cell.textLabel.text = @"Chọn màu…";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else {
+        cell.textLabel.text = @"Sao chép thông tin debug";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return cell;
@@ -679,6 +719,18 @@ static UIViewController *TopVC(UIWindow *w) {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row == 1) [self editHex];
     else if (ip.row == 2) [self pickColor];
+    else if (ip.row == 3) [self dumpDebug];
+}
+
+- (void)dumpDebug {
+    UIViewController *root = self.view.window.rootViewController;
+    NSMutableString *out = [NSMutableString stringWithFormat:@"gDark=%d fillCount=%d hex=%@\n", gDark, gFillCount, CurHex()];
+    if (root.view) DumpLayer(root.view.layer, 0, out);
+    UIPasteboard.generalPasteboard.string = out;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Đã sao chép"
+        message:@"Dán nội dung vào cuộc trò chuyện để gửi lại." preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)masterChanged:(UISwitch *)sw {
@@ -833,7 +885,46 @@ static void Setup(UIWindow *w) {
     %orig;
     if (gMaster && gOn[AACFill] && IsBlackCG(c)) ScheduleCheck(self, NO);
 }
+// SwiftUI tô symbol/template image bằng contentsMultiplyColor
+- (void)setContentsMultiplyColor:(CGColorRef)c {
+    CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
+    %orig(n ?: c);
+}
 %end
+
+%hook CATextLayer
+- (void)setForegroundColor:(CGColorRef)c {
+    CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
+    %orig(n ?: c);
+}
+%end
+
+// Vẽ trực tiếp bằng CoreGraphics (SwiftUI / drawRect)
+%hookf(void, CGContextSetFillColorWithColor, CGContextRef ctx, CGColorRef color) {
+    CGColorRef n = (gMaster && color) ? LayerRemap(color, AACIcon, NULL) : NULL;
+    %orig(ctx, n ?: color);
+}
+
+%hookf(void, CGContextSetStrokeColorWithColor, CGContextRef ctx, CGColorRef color) {
+    CGColorRef n = (gMaster && color) ? LayerRemap(color, AACIcon, NULL) : NULL;
+    %orig(ctx, n ?: color);
+}
+
+%hookf(void, CGContextSetRGBFillColor, CGContextRef ctx, CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
+    if (gMaster && gOn[AACIcon] && !gRaw) {
+        int cls = BlueClass(r, g, b);
+        if (cls) { CGContextSetFillColorWithColor(ctx, CGFor(AACIcon, cls == 2)); return; }
+    }
+    %orig(ctx, r, g, b, a);
+}
+
+%hookf(void, CGContextSetRGBStrokeColor, CGContextRef ctx, CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
+    if (gMaster && gOn[AACIcon] && !gRaw) {
+        int cls = BlueClass(r, g, b);
+        if (cls) { CGContextSetStrokeColorWithColor(ctx, CGFor(AACIcon, cls == 2)); return; }
+    }
+    %orig(ctx, r, g, b, a);
+}
 
 %hook CAShapeLayer
 - (void)setFillColor:(CGColorRef)c {
