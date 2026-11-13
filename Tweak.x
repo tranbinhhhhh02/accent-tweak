@@ -11,7 +11,6 @@ static NSString *const kDefaultHex = @"B8A8FF";
 static const void *kFill        = &kFill;
 static const void *kGestureFlag = &kGestureFlag;
 static const void *kTintVer     = &kTintVer;
-static const void *kIconShape   = &kIconShape;
 static const void *kMonoBlack   = &kMonoBlack;
 static const void *kAccentSrc   = &kAccentSrc;
 static const void *kAccentStamp = &kAccentStamp;
@@ -19,17 +18,16 @@ static const void *kBlueState   = &kBlueState;
 static const void *kBlueOut     = &kBlueOut;
 static const void *kBlueStamp   = &kBlueStamp;
 static const void *kBlueSrc     = &kBlueSrc;
-static const void *kCtxOut      = &kCtxOut;
+// layer.contents (CGImage) đã được tô lại
 static const void *kCtxSrc      = &kCtxSrc;
+static const void *kCtxOut      = &kCtxOut;
 static const void *kCtxStamp    = &kCtxStamp;
-static const void *kCtxSkip     = &kCtxSkip;
-static const void *kWhitenN     = &kWhitenN;
+static const void *kCtxNo       = &kCtxNo;
 
 static BOOL        gMaster = YES;
 static BOOL        gOn[AACCount];
 static UIColor    *gColor[AACCount];
 static CGColorRef  gCGLight[AACCount], gCGDark[AACCount], gCGSoftLight[AACCount], gCGSoftDark[AACCount];
-static CGColorRef  gCGWhite;
 static BOOL        gDark = NO;
 static int         gFillCount = 0;
 static int         gVersion = 0;
@@ -37,20 +35,15 @@ static NSMutableArray *gKeep;
 static __thread BOOL gRaw;
 static BOOL        gInTry;
 static BOOL        gInTabFix;
-static BOOL        gInContents;
-static BOOL        gApplying;
 static volatile int32_t gPending;
 
 @interface CALayer (AACPrivate)
 - (void)setContentsMultiplyColor:(CGColorRef)c;
-- (CGColorRef)contentsMultiplyColor;
 @end
 
 static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
 
 static void TabBarFix(UITabBar *bar);
-static void WhitenOnFill(CALayer *fill);
-static void ContentsCheck(CALayer *l);
 
 #pragma mark - Màu
 
@@ -61,13 +54,12 @@ static UIColor *ColorFromHex(NSString *s) {
     unsigned v = 0;
     NSScanner *sc = [NSScanner scannerWithString:s];
     if (![sc scanHexInt:&v] || !sc.isAtEnd) return nil;
-    BOOL old = gRaw;
     gRaw = YES;
     UIColor *c = [UIColor colorWithRed:((v >> 16) & 255) / 255.0
                                  green:((v >> 8) & 255) / 255.0
                                   blue:(v & 255) / 255.0
                                  alpha:1.0];
-    gRaw = old;
+    gRaw = NO;
     return c;
 }
 
@@ -90,10 +82,9 @@ static UIColor *DarkVariant(UIColor *c) {
     const CGFloat target = 0.6;
     if (lum >= target) return c;
     CGFloat f = (target - lum) / (1.0 - lum);
-    BOOL old = gRaw;
     gRaw = YES;
     UIColor *o = [UIColor colorWithRed:r + (1 - r) * f green:g + (1 - g) * f blue:b + (1 - b) * f alpha:1.0];
-    gRaw = old;
+    gRaw = NO;
     return o;
 }
 
@@ -109,7 +100,7 @@ static inline int BlueClass(CGFloat r, CGFloat g, CGFloat b) {
 }
 
 static inline BOOL IsOurs(CGColorRef c) {
-    return c && (c == gCGLight[0] || c == gCGDark[0] || c == gCGSoftLight[0] || c == gCGSoftDark[0] || c == gCGWhite);
+    return c == gCGLight[0] || c == gCGDark[0] || c == gCGSoftLight[0] || c == gCGSoftDark[0];
 }
 
 static inline CGColorRef CGFor(int cat, BOOL soft) {
@@ -132,40 +123,99 @@ static void RefreshCache(void) {
         return t.userInterfaceStyle == UIUserInterfaceStyleDark ? dark : light;
     }];
     [gKeep addObject:dyn];
-    // Các CGColor cũ cố ý không release: layer có thể còn đang giữ con trỏ này
     gCGLight[0] = CGColorCreateCopy(light.CGColor);
     gCGDark[0] = CGColorCreateCopy(dark.CGColor);
     gCGSoftLight[0] = CGColorCreateCopyWithAlpha(light.CGColor, 0.2);
     gCGSoftDark[0] = CGColorCreateCopyWithAlpha(dark.CGColor, 0.2);
-    if (!gCGWhite) {
-        BOOL old = gRaw;
-        gRaw = YES;
-        gCGWhite = CGColorCreateCopy([UIColor colorWithRed:1 green:1 blue:1 alpha:1].CGColor);
-        gRaw = old;
-    }
     gColor[0] = dyn;
     gOn[0] = gMaster;
     gVersion++;
 }
 
-#pragma mark - Phân loại màu
-
-static BOOL IsBlackColor(UIColor *c) {
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
-    return a >= 0.99 && r < 0.03 && g < 0.03 && b < 0.03;
+static void RefreshLayerTree(CALayer *l, int depth) {
+    if (depth > 40) return;
+    // Layer có contents đã được tô lại -> gán lại để tô theo màu mới
+    if (gOn[AACIcon]) {
+        id src = objc_getAssociatedObject(l, kCtxSrc);
+        id out = objc_getAssociatedObject(l, kCtxOut);
+        if (src && out && l.contents == out) l.contents = src;
+    }
+    for (CALayer *sub in [l.sublayers copy]) RefreshLayerTree(sub, depth + 1);
 }
 
-static BOOL IsBlackCG(CGColorRef c) {
+static void RefreshViewTree(UIView *v, int depth) {
+    if (depth > 40) return;
+    if (gOn[AACFill]) {
+        if ([v isKindOfClass:UISwitch.class]) ((UISwitch *)v).onTintColor = gColor[AACFill];
+        else if ([v isKindOfClass:UISlider.class]) ((UISlider *)v).minimumTrackTintColor = gColor[AACFill];
+    }
+    if ([v isKindOfClass:UITabBar.class]) TabBarFix((UITabBar *)v);
+    [v tintColorDidChange];
+    [v setNeedsDisplay];
+    for (UIView *s in [v.subviews copy]) RefreshViewTree(s, depth + 1);
+}
+
+static void ApplyAll(void) {
+    RefreshCache();
+    if (gOn[AACFill]) {
+        [UISwitch appearance].onTintColor = gColor[AACFill];
+        [UISlider appearance].minimumTrackTintColor = gColor[AACFill];
+    }
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+            gDark = (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+            w.tintColor = gOn[AACIcon] ? gColor[AACIcon] : nil;
+            objc_setAssociatedObject(w, kTintVer, @(gVersion), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            RefreshViewTree(w, 0);
+            RefreshLayerTree(w.layer, 0);
+        }
+    }
+}
+
+#pragma mark - Hỗ trợ hook
+
+static void MarkFill(CALayer *l) {
+    if (!OnMain()) return;
+    if (l.bounds.size.height > 120) return;
+    if (!objc_getAssociatedObject(l, kFill)) {
+        objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        gFillCount++;
+    }
+}
+
+static BOOL UnderFill(UIView *v) {
+    for (int i = 0; i < 4 && v; i++) {
+        if (objc_getAssociatedObject(v.layer, kFill)) return YES;
+        v = v.superview;
+    }
+    return NO;
+}
+
+// ngưỡng: 0.03 = đen thật (nền), 0.16 = đen/xám rất đậm (icon, vd #050505, #1C1E21)
+static BOOL IsDarkColorT(UIColor *c, CGFloat th) {
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
+    return a >= 0.99 && r < th && g < th && b < th;
+}
+
+static BOOL IsDarkCGT(CGColorRef c, CGFloat th) {
     if (!c || CGColorGetAlpha(c) < 0.99) return NO;
     size_t n = CGColorGetNumberOfComponents(c);
     const CGFloat *k = CGColorGetComponents(c);
     if (!k) return NO;
-    if (n == 2) return k[0] < 0.03;
+    if (n == 2) return k[0] < th;
     CGColorSpaceRef cs = CGColorGetColorSpace(c);
     if (n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return NO;
-    return k[0] < 0.03 && k[1] < 0.03 && k[2] < 0.03;
+    return k[0] < th && k[1] < th && k[2] < th;
 }
+
+static BOOL IsBlackColor(UIColor *c)     { return IsDarkColorT(c, 0.03); }
+static BOOL IsNearBlackColor(UIColor *c) { return IsDarkColorT(c, 0.16); }
+static BOOL IsBlackCG(CGColorRef c)      { return IsDarkCGT(c, 0.03); }
+static BOOL IsNearBlackCG(CGColorRef c)  { return IsDarkCGT(c, 0.16); }
+
+// ---- Nền trắng (nút "Theo dõi" ở dark mode) ----
 
 static BOOL IsWhiteColor(UIColor *c) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
@@ -193,53 +243,14 @@ static BOOL IsFillCandidateColor(UIColor *c) {
     return IsBlackColor(c) || (gDark && IsWhiteColor(c));
 }
 
-// Độ sáng của màu trung tính (xám/đen/trắng). -1 nếu không phải màu trung tính đục
-static CGFloat NeutralLumCG(CGColorRef c) {
-    if (!c || CGColorGetAlpha(c) < 0.99) return -1;
-    size_t n = CGColorGetNumberOfComponents(c);
-    const CGFloat *k = CGColorGetComponents(c);
-    if (!k) return -1;
-    if (n == 2) return k[0];
-    CGColorSpaceRef cs = CGColorGetColorSpace(c);
-    if (n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return -1;
-    CGFloat mx = fmax(k[0], fmax(k[1], k[2])), mn = fmin(k[0], fmin(k[1], k[2]));
-    if (mx - mn > 0.08) return -1;
-    return (k[0] + k[1] + k[2]) / 3.0;
-}
-
-// Màu "chữ/icon" thông thường: đen/xám đậm ở light mode, trắng/xám nhạt ở dark mode
-static BOOL IsFgLum(CGFloat l) {
-    if (l < 0) return NO;
-    if (l < 0.12) return YES;
-    return gDark ? (l > 0.55) : (l < 0.5);
-}
-
-static BOOL IsIconFgCG(CGColorRef c) {
-    return IsFgLum(NeutralLumCG(c));
-}
-
-static BOOL IsAccentCG(CGColorRef c) {
-    if (!c || !gColor[0] || !gCGLight[0] || !gCGDark[0]) return NO;
-    size_t n = CGColorGetNumberOfComponents(c);
-    const CGFloat *k = CGColorGetComponents(c);
-    CGColorSpaceRef cs = CGColorGetColorSpace(c);
-    if (!k || n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB || CGColorGetAlpha(c) < 0.99) return NO;
-    for (int d = 0; d < 2; d++) {
-        CGColorRef a = d ? gCGDark[0] : gCGLight[0];
-        const CGFloat *q = CGColorGetComponents(a);
-        if (q && fabs(k[0] - q[0]) < 0.02 && fabs(k[1] - q[1]) < 0.02 && fabs(k[2] - q[2]) < 0.02) return YES;
-    }
+// Tránh đổi nhầm núm trắng của UISwitch / UISlider
+static BOOL InControlKnob(CALayer *l) {
+    id d = l.delegate;
+    if (![d isKindOfClass:UIView.class]) return NO;
+    UIView *v = (UIView *)d;
+    for (int i = 0; i < 6 && v; i++, v = v.superview)
+        if ([v isKindOfClass:UISwitch.class] || [v isKindOfClass:UISlider.class]) return YES;
     return NO;
-}
-
-static BOOL IsAccentColor(UIColor *c) {
-    if (!c) return NO;
-    if (c == gColor[0]) return YES;
-    return IsAccentCG(c.CGColor);
-}
-
-static BOOL IsAccentOrBlackCG(CGColorRef c) {
-    return c && (IsOurs(c) || IsAccentCG(c) || IsBlackCG(c));
 }
 
 static CGColorRef LayerRemap(CGColorRef c, int cat, int *clsOut) {
@@ -262,14 +273,7 @@ static UIColor *ColorRemap(UIColor *c, int cat, int *clsOut) {
     int cls = BlueClass(r, g, b);
     if (cls == 0) return nil;
     if (clsOut) *clsOut = cls;
-    if (cls == 2) {
-        BOOL old = gRaw;
-        gRaw = YES;
-        UIColor *s = [gColor[cat] colorWithAlphaComponent:0.2];
-        gRaw = old;
-        return s;
-    }
-    return gColor[cat];
+    return cls == 2 ? [gColor[cat] colorWithAlphaComponent:0.2] : gColor[cat];
 }
 
 static UIColor *RemapRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
@@ -278,83 +282,29 @@ static UIColor *RemapRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
     if (!cls) return nil;
     CGFloat al = (cls == 2 ? 0.2 : 1.0) * a;
     if (al >= 0.99) return gColor[AACFill];
-    BOOL old = gRaw;
     gRaw = YES;
     UIColor *res = [gColor[AACFill] colorWithAlphaComponent:al];
-    gRaw = old;
+    gRaw = NO;
     return res;
 }
 
-#pragma mark - Nền accent (fill)
-
-static void MarkFill(CALayer *l) {
-    if (!OnMain()) return;
-    if (l.bounds.size.height > 120) return;
-    if (!objc_getAssociatedObject(l, kFill)) {
-        objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        gFillCount++;
-        __weak CALayer *w = l;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CALayer *s = w;
-            if (s) WhitenOnFill(s);
-        });
+static BOOL IsAccentCG(CGColorRef c) {
+    if (!c || !gColor[0]) return NO;
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *k = CGColorGetComponents(c);
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    if (!k || n < 4 || !cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB || CGColorGetAlpha(c) < 0.99) return NO;
+    for (int d = 0; d < 2; d++) {
+        CGColorRef a = d ? gCGDark[0] : gCGLight[0];
+        const CGFloat *q = a ? CGColorGetComponents(a) : NULL;
+        if (q && fabs(k[0] - q[0]) < 0.02 && fabs(k[1] - q[1]) < 0.02 && fabs(k[2] - q[2]) < 0.02) return YES;
     }
+    return NO;
 }
 
-static BOOL IsFillLayer(CALayer *l) {
-    return l && (objc_getAssociatedObject(l, kFill) || IsAccentCG(l.backgroundColor));
-}
-
-// Layer nằm trên một nền accent: là con cháu của nền, hoặc là "anh em" nằm đè lên nền đó
 static BOOL LayerUnderFill(CALayer *l) {
-    CALayer *child = nil;
-    for (int i = 0; i < 6 && l; i++) {
-        if (i > 0 && l.bounds.size.height > 120) return NO;
-        if (IsFillLayer(l)) return YES;
-        if (child) {
-            CGRect cf = child.frame;
-            CGPoint cp = CGPointMake(CGRectGetMidX(cf), CGRectGetMidY(cf));
-            int n = 0;
-            for (CALayer *s in [l.sublayers copy]) {
-                if (s == child) continue;
-                if (++n > 12) break;
-                if (IsFillLayer(s) && CGRectContainsPoint(s.frame, cp)) return YES;
-            }
-        }
-        child = l;
-        l = l.superlayer;
-    }
-    return NO;
-}
-
-static BOOL UnderFill(UIView *v) {
-    UIView *child = nil;
-    for (int i = 0; i < 6 && v; i++) {
-        if (i > 0 && v.bounds.size.height > 120) return NO;
-        if (IsFillLayer(v.layer)) return YES;
-        if (child) {
-            CGRect cf = child.frame;
-            CGPoint cp = CGPointMake(CGRectGetMidX(cf), CGRectGetMidY(cf));
-            int n = 0;
-            for (UIView *s in v.subviews) {
-                if (s == child) continue;
-                if (++n > 12) break;
-                if (IsFillLayer(s.layer) && CGRectContainsPoint(s.frame, cp)) return YES;
-            }
-        }
-        child = v;
-        v = v.superview;
-    }
-    return NO;
-}
-
-// Tránh đổi nhầm núm trắng của UISwitch / UISlider
-static BOOL InControlKnob(CALayer *l) {
-    id d = l.delegate;
-    if (![d isKindOfClass:UIView.class]) return NO;
-    UIView *v = (UIView *)d;
-    for (int i = 0; i < 6 && v; i++, v = v.superview)
-        if ([v isKindOfClass:UISwitch.class] || [v isKindOfClass:UISlider.class]) return YES;
+    for (int i = 0; i < 4 && l; i++, l = l.superlayer)
+        if (objc_getAssociatedObject(l, kFill) || IsAccentCG(l.backgroundColor)) return YES;
     return NO;
 }
 
@@ -368,69 +318,151 @@ static BOOL LooksLikeAvatarView(UIView *v) {
     return l.cornerRadius >= fmin(s.width, s.height) * 0.25;
 }
 
-#pragma mark - Ảnh / icon
+static void TryBlack(CALayer *l) {
+    if (!gOn[AACFill] || !OnMain()) return;
+    CGSize sz = l.bounds.size;
+    // Không đổi nền của UIImageView / layer đang hiển thị ảnh / hình tròn (avatar)
+    id dv = l.delegate;
+    if ([dv isKindOfClass:UIImageView.class] || l.contents) return;
+    if (sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45) return;
+    BOOL nested = LayerUnderFill(l.superlayer);
+    CGColorRef bg = l.backgroundColor;
+    BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
+    if (cand && sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested)) {
+        l.backgroundColor = CGFor(AACFill, NO);
+        MarkFill(l);
+    }
+    if (l.borderWidth > 0 && IsBlackCG(l.borderColor) && (nested || LayerUnderFill(l))) {
+        l.borderColor = CGFor(AACFill, NO);
+    }
+}
 
-// Phân tích ảnh nhỏ: trả về độ sáng trung bình nếu là icon 1 màu trung tính (đen/xám/trắng) có nền trong suốt.
-// -1: không phải icon 1 màu, -2: bị giới hạn tốc độ (chưa phân tích)
-static CGFloat CGIconLum(CGImageRef cg) {
+// Label nằm trong nút đã đổi accent mà vẫn giữ nền đen/trắng -> làm trong suốt
+static void FixLabelBG(UILabel *lb) {
+    if (!gMaster || !gOn[AACFill] || !OnMain() || gFillCount <= 0) return;
+    UIColor *bg = lb.backgroundColor;
+    if (!bg || !IsFillCandidateColor(bg)) return;
+    if (lb.bounds.size.height > 64) return;
+    if (UnderFill(lb.superview) || LayerUnderFill(lb.layer.superlayer)) {
+        lb.backgroundColor = UIColor.clearColor;
+    }
+}
+
+static void TryBlackShape(CAShapeLayer *sh) {
+    if (!gOn[AACFill] || !OnMain()) return;
+    if (!IsBlackCG(sh.fillColor)) return;
+    CGPathRef path = sh.path;
+    if (!path || CGPathIsEmpty(path)) return;
+    CGRect b = CGPathGetBoundingBox(path);
+    if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
+    if (b.size.height < 20 || b.size.height > 64 || b.size.width < b.size.height * 1.6) return;
+    sh.fillColor = CGFor(AACFill, NO);
+}
+
+static void TryBlackIconShape(CAShapeLayer *sh) {
+    if (!gOn[AACIcon] || gInTry || !OnMain()) return;
+    BOOL fill = IsNearBlackCG(sh.fillColor), stroke = IsNearBlackCG(sh.strokeColor);
+    if (!fill && !stroke) return;
+    CGPathRef path = sh.path;
+    if (!path || CGPathIsEmpty(path)) return;
+    CGRect b = CGPathGetBoundingBox(path);
+    if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
+    CGFloat mx = fmax(b.size.width, b.size.height);
+    if (mx < 6 || mx > 48) return;
+    gInTry = YES;
+    if (fill)   sh.fillColor   = CGFor(AACIcon, NO);
+    if (stroke) sh.strokeColor = CGFor(AACIcon, NO);
+    gInTry = NO;
+}
+
+// ---- Kiểm tra lại layer: chạy ngay + thử lại vài lần (không giữ layer, không hook layoutSublayers) ----
+
+static void RunCheck(CALayer *l, BOOL shape) {
+    if (shape && [l isKindOfClass:CAShapeLayer.class]) {
+        TryBlackShape((CAShapeLayer *)l);
+        TryBlackIconShape((CAShapeLayer *)l);
+    } else {
+        TryBlack(l);
+    }
+}
+
+static BOOL CheckDone(CALayer *l, BOOL shape) {
+    if (shape && [l isKindOfClass:CAShapeLayer.class]) {
+        CAShapeLayer *sh = (CAShapeLayer *)l;
+        return !IsNearBlackCG(sh.fillColor) && !IsNearBlackCG(sh.strokeColor);
+    }
+    return !IsFillCandidateCG(l.backgroundColor) && !(l.borderWidth > 0 && IsBlackCG(l.borderColor));
+}
+
+static void RetryCheck(__weak CALayer *wl, BOOL shape, int attempt) {
+    static const double delays[3] = { 0.05, 0.25, 0.8 };
+    if (attempt >= 3) { __sync_fetch_and_sub(&gPending, 1); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CALayer *s = wl;
+        if (!s) { __sync_fetch_and_sub(&gPending, 1); return; }
+        RunCheck(s, shape);
+        if (CheckDone(s, shape)) { __sync_fetch_and_sub(&gPending, 1); return; }
+        RetryCheck(wl, shape, attempt + 1);
+    });
+}
+
+static void ScheduleCheck(CALayer *l, BOOL shape) {
+    if (!l) return;
+    if (OnMain()) {
+        RunCheck(l, shape);
+        if (CheckDone(l, shape)) return;
+    }
+    if (gPending > 64) return;
+    __sync_fetch_and_add(&gPending, 1);
+    __weak CALayer *wl = l;
+    RetryCheck(wl, shape, 0);
+}
+
+#pragma mark - Ảnh
+
+static BOOL ImageIsBlackMono(UIImage *img) {
+    NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
+    if (cached) return cached.boolValue;
     static CFAbsoluteTime winStart; static int winCount;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-    if (++winCount > 150) return -2;
-    if (!cg) return -1;
-    enum { N = 24 };
-    uint8_t buf[N * N * 4];
-    memset(buf, 0, sizeof buf);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
-        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) return -1;
-    CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), cg);
-    CGContextRelease(ctx);
-    int solid = 0, clear = 0;
-    double sum = 0, lo = 2, hi = -1;
-    for (int i = 0; i < N * N; i++) {
-        const uint8_t *px = buf + i * 4;
-        if (px[3] < 40) { clear++; continue; }
-        solid++;
-        double a = px[3];
-        double r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
-        double mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
-        if (mx - mn > 0.16) return -1;
-        double lum = (r + g + b) / 3.0;
-        sum += lum;
-        if (px[3] >= 200) { lo = fmin(lo, lum); hi = fmax(hi, lum); }
-    }
-    if (solid < 6 || clear * 100 < N * N * 8 || solid * 100 > N * N * 82) return -1;
-    if (hi >= 0 && hi - lo > 0.3) return -1;
-    return (CGFloat)(sum / solid);
-}
-
-static CGFloat ImageIconLum(UIImage *img) {
-    NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
-    if (cached) return cached.doubleValue;
-    CGFloat r = -1;
+    if (++winCount > 120) return NO;
+    BOOL res = NO;
     CGImageRef cg = img.CGImage;
     if (cg && img.images.count <= 1) {
-        r = CGIconLum(cg);
-        if (r == -2) return -1;
+        enum { N = 24 };
+        uint8_t buf[N * N * 4];
+        memset(buf, 0, sizeof buf);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(cs);
+        if (ctx) {
+            CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), cg);
+            CGContextRelease(ctx);
+            int solid = 0, clear = 0, bad = 0;
+            for (int i = 0; i < N * N; i++) {
+                const uint8_t *px = buf + i * 4;
+                if (px[3] < 40) { clear++; continue; }
+                solid++;
+                int mxc = MAX(px[0], MAX(px[1], px[2]));
+                if (mxc * 255 > 40 * px[3]) { bad++; break; }
+            }
+            // Icon đen thường là nét mảnh (<= ~62% diện tích). Ảnh đen đặc/avatar thì bỏ qua.
+            res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62);
+        }
     }
-    objc_setAssociatedObject(img, kMonoBlack, @(r), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return r;
-}
-
-static BOOL ImageIsMonoIcon(UIImage *img) {
-    return IsFgLum(ImageIconLum(img));
+    objc_setAssociatedObject(img, kMonoBlack, @(res), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return res;
 }
 
 static UIImage *IconRemapImage(UIImage *img) {
     if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
-    if (objc_getAssociatedObject(img, kAccentSrc) || objc_getAssociatedObject(img, kBlueSrc)) return img;
     CGSize sz = img.size;
     if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return img;
-    if (!ImageIsMonoIcon(img)) return img;
+    if (!ImageIsBlackMono(img)) return img;
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
@@ -500,11 +532,6 @@ static UIImage *BlueImageRemap(UIImage *img) {
     }
 
     const CGFloat *k = CGColorGetComponents(CGFor(AACIcon, NO));
-    if (!k) {
-        CGContextRelease(ctx);
-        free(buf);
-        return img;
-    }
     CGFloat ar = k[0], ag = k[1], ab = k[2];
     for (size_t i = 0; i < w * h; i++) {
         uint8_t *px = buf + i * 4;
@@ -532,322 +559,106 @@ static UIImage *BlueImageRemap(UIImage *img) {
     return out;
 }
 
+// ---- layer.contents (CGImage) — icon Texture/ASImageNode như Messenger không đi qua UIImageView ----
+
+// Tô lại icon đen/xám đậm + xanh dương trong CGImage nhỏ. Trả về ảnh mới (+1) hoặc NULL nếu không phải icon.
+static CGImageRef RecolorCGImage(CGImageRef src) {
+    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
+    if (w < 8 || h < 8 || w > 256 || h > 256) return NULL;
+    CGColorRef acc = CGFor(AACIcon, NO);
+    if (!acc || CGColorGetNumberOfComponents(acc) < 3) return NULL;
+    const CGFloat *ak = CGColorGetComponents(acc);
+    CGFloat ar = ak[0], ag = ak[1], ab = ak[2];
+
+    uint8_t *buf = calloc(w * h, 4);
+    if (!buf) return NULL;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return NULL; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), src);
+
+    size_t total = w * h;
+    size_t solid = 0, clear = 0, black = 0, blue = 0, other = 0;
+    for (size_t i = 0; i < total; i++) {
+        const uint8_t *px = buf + i * 4;
+        int a = px[3];
+        if (a < 24) { clear++; continue; }
+        solid++;
+        int mxc = MAX(px[0], MAX(px[1], px[2]));
+        if (mxc * 255 <= 40 * a) { black++; continue; }
+        CGFloat fa = a;
+        if (BlueClass(fmin(1, px[0] / fa), fmin(1, px[1] / fa), fmin(1, px[2] / fa))) blue++;
+        else other++;
+    }
+    BOOL ok = solid >= 6 && clear >= 1 && (black + blue) > 0 && other * 40 <= solid
+              && (blue > 0 || solid * 100 <= total * 62);
+    if (!ok) { CGContextRelease(ctx); free(buf); return NULL; }
+
+    for (size_t i = 0; i < total; i++) {
+        uint8_t *px = buf + i * 4;
+        int a = px[3];
+        if (a < 24) continue;
+        int mxc = MAX(px[0], MAX(px[1], px[2]));
+        CGFloat al;
+        if (mxc * 255 <= 40 * a) {
+            al = a / 255.0;
+        } else {
+            CGFloat fa = a;
+            int cls = BlueClass(fmin(1, px[0] / fa), fmin(1, px[1] / fa), fmin(1, px[2] / fa));
+            if (!cls) continue;
+            al = (a / 255.0) * (cls == 2 ? 0.2 : 1.0);
+        }
+        px[0] = (uint8_t)lround(fmax(0, fmin(1, ar)) * al * 255);
+        px[1] = (uint8_t)lround(fmax(0, fmin(1, ag)) * al * 255);
+        px[2] = (uint8_t)lround(fmax(0, fmin(1, ab)) * al * 255);
+        px[3] = (uint8_t)lround(al * 255);
+    }
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    free(buf);
+    return out;
+}
+
+static id ContentsRemap(CALayer *l, id c) {
+    if (objc_getAssociatedObject(l, kCtxOut) == c) return nil;            // đã là ảnh của mình
+    id dv = l.delegate;
+    if ([dv isKindOfClass:UIImageView.class]) return nil;                 // UIImageView đã xử lý ở setImage
+    CGSize sz = l.bounds.size;
+    if (sz.width > 64 || sz.height > 64) return nil;
+    if (sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45) return nil;
+
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    if (objc_getAssociatedObject(l, kCtxSrc) == c) {
+        if ([objc_getAssociatedObject(l, kCtxNo) boolValue]) return nil;
+        if ([objc_getAssociatedObject(l, kCtxStamp) intValue] == want) return objc_getAssociatedObject(l, kCtxOut);
+    }
+    static CFAbsoluteTime winStart; static int winCount;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - winStart > 1.0) { winStart = now; winCount = 0; }
+    if (++winCount > 80) return nil;
+
+    CGImageRef out = RecolorCGImage((__bridge CGImageRef)c);
+    objc_setAssociatedObject(l, kCtxSrc, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!out) {
+        objc_setAssociatedObject(l, kCtxNo, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return nil;
+    }
+    id o = (__bridge_transfer id)out;
+    objc_setAssociatedObject(l, kCtxNo, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(l, kCtxOut, o, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(l, kCtxStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return o;
+}
+
 static UIColor *IconTintFix(UIColor *c) {
     if (gMaster && gOn[AACIcon] && c && OnMain()) {
-        if (IsBlackColor(c)) return gColor[AACIcon];
+        if (IsNearBlackColor(c)) return gColor[AACIcon];
         UIColor *n = ColorRemap(c, AACIcon, NULL);
         if (n) return n;
     }
     return c;
-}
-
-#pragma mark - Icon vẽ thẳng vào layer.contents (Texture / AsyncDisplayKit - icon Messenger của Facebook)
-
-static CGImageRef CreateTintedCG(CGImageRef src, CGColorRef color) {
-    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
-    if (!w || !h || w > 384 || h > 384 || !color) return NULL;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs,
-        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) return NULL;
-    CGRect r = CGRectMake(0, 0, w, h);
-    CGContextDrawImage(ctx, r, src);
-    CGContextSetBlendMode(ctx, kCGBlendModeSourceIn);
-    CGContextSetFillColorWithColor(ctx, color);
-    CGContextFillRect(ctx, r);
-    CGImageRef out = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    return out;
-}
-
-static void ContentsCheck(CALayer *l) {
-    if (gInContents || !gMaster || !gOn[AACIcon] || !gCGWhite || !OnMain()) return;
-    id c = l.contents;
-    if (!c) return;
-    if (CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
-    CGSize sz = l.bounds.size;
-    if (sz.width < 10 || sz.height < 10 || sz.width > 48 || sz.height > 48) return;
-    if ([l.delegate isKindOfClass:UIImageView.class]) return;
-    if (l.cornerRadius > 0 && l.masksToBounds) return;
-
-    CGImageRef cg = (__bridge CGImageRef)c;
-    unsigned long p = (unsigned long)(uintptr_t)cg;
-    NSNumber *outP = objc_getAssociatedObject(l, kCtxOut);
-    id src = objc_getAssociatedObject(l, kCtxSrc);
-    BOOL ours = outP && outP.unsignedLongValue == p && src;
-    BOOL onFill = (gFillCount > 0 && gOn[AACFill]) ? LayerUnderFill(l) : NO;
-    int want = gVersion * 4 + (gDark ? 2 : 0) + (onFill ? 1 : 0);
-
-    if (ours) {
-        if ([objc_getAssociatedObject(l, kCtxStamp) intValue] == want) return;
-    } else {
-        NSArray *sk = objc_getAssociatedObject(l, kCtxSkip);
-        if (sk.count == 2 && [sk[0] unsignedLongValue] == p && [sk[1] intValue] == want) return;
-    }
-
-    CGImageRef base = ours ? (__bridge CGImageRef)src : cg;
-    CGFloat lum = CGIconLum(base);
-    if (lum == -2) return;
-    CGColorRef col = onFill ? gCGWhite : CGFor(AACIcon, NO);
-    CGImageRef out = IsFgLum(lum) ? CreateTintedCG(base, col) : NULL;
-    if (!out) {
-        if (ours) {
-            gInContents = YES;
-            l.contents = src;
-            gInContents = NO;
-            objc_setAssociatedObject(l, kCtxOut, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(l, kCtxSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            unsigned long sp = (unsigned long)(uintptr_t)(__bridge CGImageRef)src;
-            objc_setAssociatedObject(l, kCtxSkip, @[@(sp), @(want)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } else {
-            objc_setAssociatedObject(l, kCtxSkip, @[@(p), @(want)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        return;
-    }
-    id keep = (__bridge id)base;
-    gInContents = YES;
-    l.contents = (__bridge id)out;
-    gInContents = NO;
-    objc_setAssociatedObject(l, kCtxSrc, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(l, kCtxOut, @((unsigned long)(uintptr_t)out), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(l, kCtxStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    CGImageRelease(out);
-}
-
-#pragma mark - Nội dung nằm trên nền accent -> màu trắng
-
-// Label nằm trong nút đã đổi accent: nền đen/trắng -> trong suốt, chữ accent/đen -> trắng
-static void FixLabelOnFill(UILabel *lb) {
-    if (!gMaster || !gOn[AACFill] || gFillCount <= 0 || !OnMain()) return;
-    if (lb.bounds.size.height > 64) return;
-    UIColor *bg = lb.backgroundColor;
-    UIColor *tc = lb.textColor;
-    BOOL bgBad = bg && IsFillCandidateColor(bg);
-    BOOL txtBad = tc && (IsBlackColor(tc) || IsAccentColor(tc));
-    if (!bgBad && !txtBad) return;
-    if (!UnderFill(lb) || IsFillLayer(lb.layer)) {
-        if (!(IsFillLayer(lb.layer) && txtBad)) return;
-    }
-    if (bgBad) lb.backgroundColor = UIColor.clearColor;
-    if (txtBad) lb.textColor = UIColor.whiteColor;
-}
-
-static BOOL WhitenLayer(CALayer *l) {
-    if (!gCGWhite || !gOn[AACFill] || !OnMain()) return NO;
-    if (objc_getAssociatedObject(l, kFill)) return NO;
-    BOOL ch = NO;
-    gInTry = YES;
-    if ([l isKindOfClass:CATextLayer.class]) {
-        CATextLayer *t = (CATextLayer *)l;
-        if (IsAccentOrBlackCG(t.foregroundColor)) { t.foregroundColor = gCGWhite; ch = YES; }
-    }
-    if ([l isKindOfClass:CAShapeLayer.class]) {
-        CAShapeLayer *sh = (CAShapeLayer *)l;
-        if (IsAccentOrBlackCG(sh.fillColor))   { sh.fillColor = gCGWhite; ch = YES; }
-        if (IsAccentOrBlackCG(sh.strokeColor)) { sh.strokeColor = gCGWhite; ch = YES; }
-        if (ch) objc_setAssociatedObject(sh, kIconShape, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    if ([l respondsToSelector:@selector(contentsMultiplyColor)]) {
-        CGColorRef m = [l contentsMultiplyColor];
-        if (m && IsAccentOrBlackCG(m)) { [l setContentsMultiplyColor:gCGWhite]; ch = YES; }
-    }
-    gInTry = NO;
-    ContentsCheck(l);
-    id d = l.delegate;
-    if ([d isKindOfClass:UILabel.class]) FixLabelOnFill((UILabel *)d);
-    else if ([d isKindOfClass:UIImageView.class] || [d isKindOfClass:UIButton.class]) [(UIView *)d tintColorDidChange];
-    return ch;
-}
-
-static void WhitenTree(CALayer *n, CALayer *fill, int depth) {
-    if (depth > 8) return;
-    for (CALayer *s in [n.sublayers copy]) {
-        if (s != fill && !objc_getAssociatedObject(s, kFill)) {
-            CGRect r = [s convertRect:s.bounds toLayer:fill];
-            if (!CGRectIsEmpty(r) && CGRectIntersectsRect(r, fill.bounds)) WhitenLayer(s);
-        }
-        WhitenTree(s, fill, depth + 1);
-    }
-}
-
-static void WhitenOnFill(CALayer *fill) {
-    if (!OnMain() || !gOn[AACFill] || !gMaster) return;
-    CALayer *host = fill.superlayer;
-    if (!host || host.bounds.size.height > 120) host = fill;
-    WhitenTree(host, fill, 0);
-}
-
-static void WhitenIfOnFill(CALayer *l) {
-    if (!l || objc_getAssociatedObject(l, kFill)) return;
-    if (LayerUnderFill(l)) WhitenLayer(l);
-}
-
-static void WhitenLater(CALayer *l) {
-    if (!OnMain() || gFillCount <= 0 || !gOn[AACFill] || !gMaster) return;
-    WhitenIfOnFill(l);
-    __weak CALayer *w = l;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        CALayer *s = w;
-        if (s) WhitenIfOnFill(s);
-    });
-}
-
-static void FillLayoutWhiten(CALayer *l) {
-    int n = [objc_getAssociatedObject(l, kWhitenN) intValue];
-    if (n >= 6) return;
-    objc_setAssociatedObject(l, kWhitenN, @(n + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    WhitenOnFill(l);
-}
-
-#pragma mark - Đổi nền đen/trắng sang accent
-
-static void TryBlack(CALayer *l) {
-    if (!gOn[AACFill] || !OnMain()) return;
-    CGSize sz = l.bounds.size;
-    // Không đổi nền của UIImageView / layer đang hiển thị ảnh / hình tròn (avatar)
-    id dv = l.delegate;
-    if ([dv isKindOfClass:UIImageView.class] || l.contents) return;
-    if (sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45) return;
-    BOOL nested = LayerUnderFill(l.superlayer);
-    CGColorRef bg = l.backgroundColor;
-    BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
-    BOOL shapeOK = l.cornerRadius >= 6 || nested || (l.mask && sz.width >= sz.height * 1.5);
-    if (cand && sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && shapeOK) {
-        l.backgroundColor = CGFor(AACFill, NO);
-        MarkFill(l);
-    }
-    if (l.borderWidth > 0 && IsBlackCG(l.borderColor) && (nested || LayerUnderFill(l))) {
-        l.borderColor = CGFor(AACFill, NO);
-    }
-}
-
-static void TryBlackShape(CAShapeLayer *sh) {
-    if (!gOn[AACFill] || !OnMain()) return;
-    if (!IsFillCandidateCG(sh.fillColor)) return;
-    if (LayerUnderFill(sh)) return;
-    CGPathRef path = sh.path;
-    if (!path || CGPathIsEmpty(path)) return;
-    CGRect b = CGPathGetBoundingBox(path);
-    if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
-    if (b.size.height < 20 || b.size.height > 64 || b.size.width < b.size.height * 1.6) return;
-    gInTry = YES;
-    sh.fillColor = CGFor(AACFill, NO);
-    gInTry = NO;
-    MarkFill(sh);
-}
-
-// SwiftUI vẽ nền đặc bằng layer + contentsMultiplyColor đen
-static void TryMultiplyFill(CALayer *l) {
-    if (!gOn[AACFill] || !OnMain()) return;
-    if (![l respondsToSelector:@selector(contentsMultiplyColor)]) return;
-    CGColorRef m = [l contentsMultiplyColor];
-    if (!IsBlackCG(m)) return;
-    CGSize sz = l.bounds.size;
-    if (sz.height < 20 || sz.height > 64 || sz.width < sz.height * 1.5) return;
-    if (InControlKnob(l) || LayerUnderFill(l)) return;
-    gInTry = YES;
-    [l setContentsMultiplyColor:CGFor(AACFill, NO)];
-    gInTry = NO;
-    MarkFill(l);
-}
-
-static void TryBlackIconShape(CAShapeLayer *sh) {
-    if (!gOn[AACIcon] || gInTry || !OnMain()) return;
-    BOOL fill = IsIconFgCG(sh.fillColor), stroke = IsIconFgCG(sh.strokeColor);
-    if (!fill && !stroke) return;
-    if (LayerUnderFill(sh)) return;
-    CGPathRef path = sh.path;
-    if (!path || CGPathIsEmpty(path)) return;
-    CGRect b = CGPathGetBoundingBox(path);
-    if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
-    CGFloat mx = fmax(b.size.width, b.size.height);
-    if (mx < 6 || mx > 48) return;
-    gInTry = YES;
-    int bits = 0;
-    if (fill)   { sh.fillColor   = CGFor(AACIcon, NO); bits |= 1; }
-    if (stroke) { sh.strokeColor = CGFor(AACIcon, NO); bits |= 2; }
-    gInTry = NO;
-    NSNumber *old = objc_getAssociatedObject(sh, kIconShape);
-    objc_setAssociatedObject(sh, kIconShape, @(bits | old.intValue), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-#pragma mark - Hàng đợi kiểm tra trễ
-
-static NSHashTable *gPend;
-static volatile int32_t gHasPend;
-static const void *kAttempts  = &kAttempts;
-static const void *kPendKind  = &kPendKind;
-#define PEND_LOCK @"AACPend"
-
-// kind: 0 = nền layer, 1 = shape, 2 = contentsMultiplyColor
-static void RunCheck(CALayer *l, int kind) {
-    if (kind == 1) {
-        if ([l isKindOfClass:CAShapeLayer.class]) {
-            TryBlackShape((CAShapeLayer *)l);
-            TryBlackIconShape((CAShapeLayer *)l);
-        }
-    } else if (kind == 2) {
-        TryMultiplyFill(l);
-    } else {
-        TryBlack(l);
-    }
-}
-
-static BOOL CheckDone(CALayer *l, int kind) {
-    if (kind == 1) {
-        if (![l isKindOfClass:CAShapeLayer.class]) return YES;
-        CAShapeLayer *sh = (CAShapeLayer *)l;
-        return !IsIconFgCG(sh.fillColor) && !IsIconFgCG(sh.strokeColor) && !IsFillCandidateCG(sh.fillColor);
-    }
-    if (kind == 2) {
-        if (![l respondsToSelector:@selector(contentsMultiplyColor)]) return YES;
-        return !IsBlackCG([l contentsMultiplyColor]);
-    }
-    return !IsFillCandidateCG(l.backgroundColor) && !(l.borderWidth > 0 && IsBlackCG(l.borderColor));
-}
-
-static void AddPending(CALayer *l, int kind) {
-    @synchronized (PEND_LOCK) {
-        if (!gPend) gPend = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
-        if (gPend.count > 400) return;
-        [gPend addObject:l];
-        gHasPend = 1;
-    }
-    objc_setAssociatedObject(l, kPendKind, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static void PendingRun(CALayer *l) {
-    BOOL has;
-    @synchronized (PEND_LOCK) { has = [gPend containsObject:l]; }
-    if (!has) return;
-    int kind = [objc_getAssociatedObject(l, kPendKind) intValue];
-    RunCheck(l, kind);
-    int n = [objc_getAssociatedObject(l, kAttempts) intValue] + 1;
-    objc_setAssociatedObject(l, kAttempts, @(n), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (n >= 8 || CheckDone(l, kind)) {
-        @synchronized (PEND_LOCK) {
-            [gPend removeObject:l];
-            if (!gPend.count) gHasPend = 0;
-        }
-    }
-}
-
-static void ScheduleCheck(CALayer *l, int kind) {
-    if (!l) return;
-    if (OnMain()) {
-        RunCheck(l, kind);
-        if (CheckDone(l, kind)) return;
-    }
-    AddPending(l, kind);
-    if (gPending > 96) return;
-    __sync_fetch_and_add(&gPending, 1);
-    __weak CALayer *wl = l;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CALayer *s = wl;
-        if (s) RunCheck(s, kind);
-        __sync_fetch_and_sub(&gPending, 1);
-    });
 }
 
 #pragma mark - Tab bar
@@ -867,7 +678,7 @@ static UIImage *TabColorize(UIImage *im) {
     UIImage *base = src ?: im;
     CGSize sz = base.size;
     if (sz.width > 80 || sz.height > 80) return im;
-    BOOL ok = base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || ImageIsMonoIcon(base);
+    BOOL ok = base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || ImageIsBlackMono(base);
     if (!ok) return im;
     UIColor *c = [UIColor colorWithCGColor:CGFor(AACIcon, NO)];
     UIImage *out = [base imageWithTintColor:c renderingMode:UIImageRenderingModeAlwaysOriginal];
@@ -913,61 +724,42 @@ static void TabLabelFix(UILabel *lb) {
     lb.textColor = gColor[AACIcon];
 }
 
-#pragma mark - Làm mới toàn bộ
-
-static void RefreshLayerTree(CALayer *l, int depth) {
-    if (depth > 40) return;
-    if ([l isKindOfClass:CAShapeLayer.class] && gOn[AACIcon]) {
-        NSNumber *m = objc_getAssociatedObject(l, kIconShape);
-        if (m) {
-            CAShapeLayer *sh = (CAShapeLayer *)l;
-            gInTry = YES;
-            if (m.intValue & 1) sh.fillColor   = CGFor(AACIcon, NO);
-            if (m.intValue & 2) sh.strokeColor = CGFor(AACIcon, NO);
-            gInTry = NO;
-        }
-    }
-    if (l.contents && gOn[AACIcon]) ContentsCheck(l);
-    for (CALayer *sub in [l.sublayers copy]) RefreshLayerTree(sub, depth + 1);
-}
-
-static void RefreshViewTree(UIView *v, int depth) {
-    if (depth > 40) return;
-    if (gOn[AACFill]) {
-        if ([v isKindOfClass:UISwitch.class]) ((UISwitch *)v).onTintColor = gColor[AACFill];
-        else if ([v isKindOfClass:UISlider.class]) ((UISlider *)v).minimumTrackTintColor = gColor[AACFill];
-    }
-    if ([v isKindOfClass:UITabBar.class]) TabBarFix((UITabBar *)v);
-    for (UIView *s in [v.subviews copy]) RefreshViewTree(s, depth + 1);
-}
-
-static void ApplyAll(void) {
-    if (gApplying || !OnMain()) return;
-    gApplying = YES;
-    RefreshCache();
-    if (gOn[AACFill]) {
-        [UISwitch appearance].onTintColor = gColor[AACFill];
-        [UISlider appearance].minimumTrackTintColor = gColor[AACFill];
-    }
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if (![s isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) {
-            gDark = (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
-            w.tintColor = gOn[AACIcon] ? gColor[AACIcon] : nil;
-            objc_setAssociatedObject(w, kTintVer, @(gVersion), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            RefreshViewTree(w, 0);
-            RefreshLayerTree(w.layer, 0);
-        }
-    }
-    gApplying = NO;
-}
-
 #pragma mark - Bảng cài đặt
 
 static UIViewController *TopVC(UIWindow *w) {
     UIViewController *v = w.rootViewController;
     while (v.presentedViewController) v = v.presentedViewController;
     return v;
+}
+
+static NSString *HexCG(CGColorRef c) {
+    if (!c) return @"nil";
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *k = CGColorGetComponents(c);
+    if (!k) return @"?";
+    CGFloat al = CGColorGetAlpha(c);
+    NSString *h = n >= 3 ? HexFromRGB(k[0], k[1], k[2]) : HexFromRGB(k[0], k[0], k[0]);
+    return al < 0.99 ? [NSString stringWithFormat:@"%@@%.2f", h, al] : h;
+}
+
+static void DumpLayer(CALayer *l, int depth, NSMutableString *out) {
+    if (depth > 30 || out.length > 60000) return;
+    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    NSMutableString *line = [NSMutableString stringWithFormat:@"%@%@", pad, NSStringFromClass(l.class)];
+    id d = l.delegate;
+    if ([d isKindOfClass:UIView.class]) [line appendFormat:@" view=%@", NSStringFromClass([d class])];
+    CGRect f = l.frame;
+    [line appendFormat:@" [%.0f,%.0f %.0fx%.0f]", f.origin.x, f.origin.y, f.size.width, f.size.height];
+    if (l.backgroundColor) [line appendFormat:@" bg=%@", HexCG(l.backgroundColor)];
+    if ([l isKindOfClass:CAShapeLayer.class]) {
+        CAShapeLayer *sh = (CAShapeLayer *)l;
+        if (sh.fillColor) [line appendFormat:@" fill=%@", HexCG(sh.fillColor)];
+        if (sh.strokeColor) [line appendFormat:@" stroke=%@", HexCG(sh.strokeColor)];
+    }
+    if (l.contents) [line appendFormat:@" contents=%@", NSStringFromClass([(id)l.contents class])];
+    if (objc_getAssociatedObject(l, kCtxOut)) [line appendString:@" [recolored]"];
+    [out appendFormat:@"%@\n", line];
+    for (CALayer *s in [l.sublayers copy]) DumpLayer(s, depth + 1, out);
 }
 
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
@@ -989,7 +781,7 @@ static UIViewController *TopVC(UIWindow *w) {
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 4; }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Màu nhấn"; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1010,8 +802,11 @@ static UIViewController *TopVC(UIWindow *w) {
         sw.layer.borderWidth = 1;
         sw.layer.borderColor = UIColor.separatorColor.CGColor;
         cell.accessoryView = sw;
-    } else {
+    } else if (ip.row == 2) {
         cell.textLabel.text = @"Chọn màu…";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else {
+        cell.textLabel.text = @"Sao chép thông tin debug";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return cell;
@@ -1021,6 +816,18 @@ static UIViewController *TopVC(UIWindow *w) {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row == 1) [self editHex];
     else if (ip.row == 2) [self pickColor];
+    else if (ip.row == 3) [self dumpDebug];
+}
+
+- (void)dumpDebug {
+    UIViewController *root = self.view.window.rootViewController;
+    NSMutableString *out = [NSMutableString stringWithFormat:@"gDark=%d fillCount=%d hex=%@\n", gDark, gFillCount, CurHex()];
+    if (root.view) DumpLayer(root.view.layer, 0, out);
+    UIPasteboard.generalPasteboard.string = out;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Đã sao chép"
+        message:@"Dán nội dung vào cuộc trò chuyện để gửi lại." preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)masterChanged:(UISwitch *)sw {
@@ -1134,11 +941,7 @@ static void Setup(UIWindow *w) {
 - (void)setRootViewController:(UIViewController *)vc { %orig; Setup(self); }
 - (void)traitCollectionDidChange:(UITraitCollection *)prev {
     %orig;
-    BOOL nowDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
-    if (nowDark != gDark) {
-        gDark = nowDark;
-        if (gMaster) dispatch_async(dispatch_get_main_queue(), ^{ ApplyAll(); });
-    }
+    gDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
 }
 %end
 
@@ -1149,7 +952,7 @@ static void Setup(UIWindow *w) {
     return gColor[AACIcon];
 }
 - (void)setTintColor:(UIColor *)c {
-    if (gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) { %orig(gColor[AACIcon]); return; }
+    if (gMaster && gOn[AACIcon] && c && OnMain() && IsNearBlackColor(c)) { %orig(gColor[AACIcon]); return; }
     %orig;
 }
 - (void)setBackgroundColor:(UIColor *)c {
@@ -1159,46 +962,36 @@ static void Setup(UIWindow *w) {
     UIColor *n = ColorRemap(c, AACFill, &cls);
     %orig(n ?: c);
     if (n && cls == 1) MarkFill(self.layer);
-    else if (!n && gOn[AACFill] && IsFillCandidateColor(c)) ScheduleCheck(self.layer, 0);
+    else if (!n && gOn[AACFill] && IsFillCandidateColor(c)) ScheduleCheck(self.layer, NO);
 }
 %end
 
 %hook CALayer
-- (void)layoutSublayers {
-    %orig;
-    if (!OnMain()) return;
-    if (gHasPend) PendingRun(self);
-    if (gFillCount > 0 && gOn[AACFill] && objc_getAssociatedObject(self, kFill)) FillLayoutWhiten(self);
-    if (gMaster && gOn[AACIcon] && self.contents) ContentsCheck(self);
-}
-- (void)setContents:(id)c {
-    %orig;
-    if (c && gMaster && gOn[AACIcon] && !gInContents && OnMain()) ContentsCheck(self);
-}
 - (void)setBackgroundColor:(CGColorRef)c {
     if (!gMaster || !c) { %orig; return; }
     int cls = 0;
     CGColorRef n = LayerRemap(c, AACFill, &cls);
     if (n) { %orig(n); if (cls == 1 && OnMain()) MarkFill(self); return; }
     %orig;
-    if (gOn[AACFill] && IsFillCandidateCG(c)) ScheduleCheck(self, 0);
+    if (gOn[AACFill] && IsFillCandidateCG(c)) ScheduleCheck(self, NO);
 }
 - (void)setBorderColor:(CGColorRef)c {
     CGColorRef n = gMaster ? LayerRemap(c, AACFill, NULL) : NULL;
     if (n) { %orig(n); return; }
     %orig;
-    if (gMaster && gOn[AACFill] && IsBlackCG(c)) ScheduleCheck(self, 0);
+    if (gMaster && gOn[AACFill] && IsBlackCG(c)) ScheduleCheck(self, NO);
 }
-// SwiftUI tô symbol/template image và nền đặc bằng contentsMultiplyColor
+// SwiftUI tô symbol/template image bằng contentsMultiplyColor
 - (void)setContentsMultiplyColor:(CGColorRef)c {
     CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
     %orig(n ?: c);
-    if (!gMaster || !c || gInTry || !OnMain()) return;
-    if (n) { WhitenLater(self); return; }
-    if (IsBlackCG(c)) {
-        if (gOn[AACFill]) ScheduleCheck(self, 2);
-        WhitenLater(self);
-    }
+}
+// Texture/ASImageNode gán thẳng CGImage vào layer.contents (icon Messenger, v.v.)
+- (void)setContents:(id)c {
+    if (!c || !gMaster || !gOn[AACIcon] || !OnMain()) { %orig; return; }
+    if (CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) { %orig; return; }
+    id n = ContentsRemap(self, c);
+    %orig(n ?: c);
 }
 %end
 
@@ -1206,8 +999,6 @@ static void Setup(UIWindow *w) {
 - (void)setForegroundColor:(CGColorRef)c {
     CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
     %orig(n ?: c);
-    if (!gMaster || !c || gInTry || !OnMain()) return;
-    if (n || IsBlackCG(c)) WhitenLater(self);
 }
 %end
 
@@ -1215,22 +1006,16 @@ static void Setup(UIWindow *w) {
 - (void)setFillColor:(CGColorRef)c {
     if (!gMaster || !c) { %orig; return; }
     CGColorRef n = LayerRemap(c, AACIcon, NULL);
-    if (n) { %orig(n); if (!gInTry && OnMain()) WhitenLater(self); return; }
+    if (n) { %orig(n); return; }
     %orig;
-    if (!gInTry && (gOn[AACFill] || gOn[AACIcon]) && IsIconFgCG(c)) {
-        ScheduleCheck(self, 1);
-        if (IsBlackCG(c)) WhitenLater(self);
-    }
+    if (!gInTry && (gOn[AACFill] || gOn[AACIcon]) && IsNearBlackCG(c)) ScheduleCheck(self, YES);
 }
 - (void)setStrokeColor:(CGColorRef)c {
     if (!gMaster || !c) { %orig; return; }
     CGColorRef n = LayerRemap(c, AACIcon, NULL);
-    if (n) { %orig(n); if (!gInTry && OnMain()) WhitenLater(self); return; }
+    if (n) { %orig(n); return; }
     %orig;
-    if (!gInTry && gOn[AACIcon] && IsIconFgCG(c)) {
-        ScheduleCheck(self, 1);
-        if (IsBlackCG(c)) WhitenLater(self);
-    }
+    if (!gInTry && gOn[AACIcon] && IsNearBlackCG(c)) ScheduleCheck(self, YES);
 }
 %end
 
@@ -1255,11 +1040,11 @@ static void Setup(UIWindow *w) {
 }
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) { FixLabelOnFill(self); TabLabelFix(self); }
+    if (self.window) { FixLabelBG(self); TabLabelFix(self); }
 }
 - (void)layoutSubviews {
     %orig;
-    FixLabelOnFill(self);
+    FixLabelBG(self);
     TabLabelFix(self);
 }
 %end
@@ -1271,12 +1056,6 @@ static void Setup(UIWindow *w) {
 }
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
     %orig(BlueImageRemap(IconRemapImage(img)), st);
-}
-%end
-
-%hook UIBarButtonItem
-- (void)setImage:(UIImage *)img {
-    %orig(BlueImageRemap(IconRemapImage(img)));
 }
 %end
 
@@ -1307,13 +1086,13 @@ static void Setup(UIWindow *w) {
 - (void)setSelectedItem:(UITabBarItem *)item { %orig; TabBarFixLater(self); }
 - (void)traitCollectionDidChange:(UITraitCollection *)prev { %orig; TabBarFixLater(self); }
 - (void)setUnselectedItemTintColor:(UIColor *)c {
-    %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) ? gColor[AACIcon] : c);
+    %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsNearBlackColor(c)) ? gColor[AACIcon] : c);
 }
 %end
 
 %hook UITabBarItemStateAppearance
 - (void)setIconColor:(UIColor *)c {
-    %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) ? gColor[AACIcon] : c);
+    %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsNearBlackColor(c)) ? gColor[AACIcon] : c);
 }
 - (void)setTitleTextAttributes:(NSDictionary<NSAttributedStringKey, id> *)attrs {
     if (gMaster && gOn[AACIcon] && gColor[AACIcon] && OnMain()) {
@@ -1331,7 +1110,7 @@ static void Setup(UIWindow *w) {
 }
 + (UIImageSymbolConfiguration *)configurationWithPaletteColors:(NSArray<UIColor *> *)colors {
     NSMutableArray *m = [NSMutableArray arrayWithCapacity:colors.count];
-    for (UIColor *c in colors) [m addObject:IconTintFix(c) ?: c];
+    for (UIColor *c in colors) [m addObject:IconTintFix(c)];
     return %orig(m);
 }
 %end
@@ -1350,6 +1129,8 @@ static void Setup(UIWindow *w) {
 }
 %end
 
+// Lưu ý: KHÔNG hook -[UIColor initWithRed:green:blue:alpha:]. UIColor là class cluster,
+// trả về object khác từ init làm crash khi Facebook tạo màu ở tab video/feed.
 %hook UIColor
 + (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
     return RemapRGBA(r, g, b, a) ?: %orig;
