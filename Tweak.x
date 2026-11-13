@@ -15,6 +15,10 @@ static const void *kIconShape   = &kIconShape;
 static const void *kMonoBlack   = &kMonoBlack;
 static const void *kAccentSrc   = &kAccentSrc;
 static const void *kAccentStamp = &kAccentStamp;
+static const void *kBlueState   = &kBlueState;
+static const void *kBlueOut     = &kBlueOut;
+static const void *kBlueStamp   = &kBlueStamp;
+static const void *kBlueSrc     = &kBlueSrc;
 
 static BOOL        gMaster = YES;
 static BOOL        gOn[AACCount];
@@ -265,7 +269,11 @@ static UIColor *RemapRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
     int cls = BlueClass(r, g, b);
     if (!cls) return nil;
     CGFloat al = (cls == 2 ? 0.2 : 1.0) * a;
-    return al >= 0.99 ? gColor[AACFill] : [gColor[AACFill] colorWithAlphaComponent:al];
+    if (al >= 0.99) return gColor[AACFill];
+    gRaw = YES;
+    UIColor *res = [gColor[AACFill] colorWithAlphaComponent:al];
+    gRaw = NO;
+    return res;
 }
 
 static BOOL IsAccentCG(CGColorRef c) {
@@ -452,8 +460,104 @@ static UIImage *IconRemapImage(UIImage *img) {
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
+// Ảnh/symbol đã được tô sẵn màu xanh (palette/hierarchical hoặc PNG) -> tô lại theo accent
+static UIImage *BlueImageRemap(UIImage *img) {
+    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (objc_getAssociatedObject(img, kBlueSrc) || objc_getAssociatedObject(img, kAccentSrc)) return img;
+    if (img.renderingMode == UIImageRenderingModeAlwaysTemplate) return img;
+    CGSize sz = img.size;
+    if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64 || img.images.count > 1) return img;
+
+    NSNumber *state = objc_getAssociatedObject(img, kBlueState);
+    if (state && !state.boolValue) return img;
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    if (state) {
+        UIImage *cached = objc_getAssociatedObject(img, kBlueOut);
+        if (cached && [objc_getAssociatedObject(img, kBlueStamp) intValue] == want) return cached;
+    } else {
+        static CFAbsoluteTime winStart; static int winCount;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - winStart > 1.0) { winStart = now; winCount = 0; }
+        if (++winCount > 60) return img;
+    }
+
+    CGFloat scale = img.scale > 0 ? img.scale : 1;
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = scale;
+    fmt.opaque = NO;
+    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
+        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
+        }];
+    CGImageRef cg = flat.CGImage;
+    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
+    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) {
+        objc_setAssociatedObject(img, kBlueState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+
+    uint8_t *buf = calloc(w * h, 4);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) {
+        free(buf);
+        return img;
+    }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+
+    int solid = 0, blue = 0, other = 0;
+    for (size_t i = 0; i < w * h; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) continue;
+        solid++;
+        CGFloat a = px[3];
+        if (BlueClass(fmin(1, px[0] / a), fmin(1, px[1] / a), fmin(1, px[2] / a))) blue++;
+        else other++;
+    }
+    BOOL ok = solid >= 6 && blue > 0 && other * 40 <= solid;
+    if (!ok) {
+        CGContextRelease(ctx);
+        free(buf);
+        objc_setAssociatedObject(img, kBlueState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+
+    const CGFloat *k = CGColorGetComponents(CGFor(AACIcon, NO));
+    CGFloat ar = k[0], ag = k[1], ab = k[2];
+    for (size_t i = 0; i < w * h; i++) {
+        uint8_t *px = buf + i * 4;
+        if (px[3] < 24) continue;
+        CGFloat a = px[3];
+        int cls = BlueClass(fmin(1, px[0] / a), fmin(1, px[1] / a), fmin(1, px[2] / a));
+        if (!cls) continue;
+        CGFloat al = (a / 255.0) * (cls == 2 ? 0.2 : 1.0);
+        px[0] = (uint8_t)lround(fmax(0, fmin(1, ar)) * al * 255);
+        px[1] = (uint8_t)lround(fmax(0, fmin(1, ag)) * al * 255);
+        px[2] = (uint8_t)lround(fmax(0, fmin(1, ab)) * al * 255);
+        px[3] = (uint8_t)lround(al * 255);
+    }
+    CGImageRef outCG = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    free(buf);
+    if (!outCG) return img;
+    UIImage *out = [UIImage imageWithCGImage:outCG scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(outCG);
+
+    objc_setAssociatedObject(out, kBlueSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kBlueState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kBlueOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kBlueStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
 static UIColor *IconTintFix(UIColor *c) {
-    if (gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) return gColor[AACIcon];
+    if (gMaster && gOn[AACIcon] && c && OnMain()) {
+        if (IsBlackColor(c)) return gColor[AACIcon];
+        UIColor *n = ColorRemap(c, AACIcon, NULL);
+        if (n) return n;
+    }
     return c;
 }
 
@@ -506,6 +610,14 @@ static void TabBarFix(UITabBar *bar) {
 
 static void TabBarFixLater(UITabBar *bar) {
     dispatch_async(dispatch_get_main_queue(), ^{ TabBarFix(bar); });
+}
+
+// Chữ dưới tab bar (tab chưa chọn đang màu đen) -> màu accent
+static void TabLabelFix(UILabel *lb) {
+    if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
+    if (lb.textColor == gColor[AACIcon]) return;
+    if (!InTabBar(lb)) return;
+    lb.textColor = gColor[AACIcon];
 }
 
 #pragma mark - Bảng cài đặt
@@ -761,11 +873,12 @@ static void Setup(UIWindow *w) {
 }
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) FixLabelBG(self);
+    if (self.window) { FixLabelBG(self); TabLabelFix(self); }
 }
 - (void)layoutSubviews {
     %orig;
     FixLabelBG(self);
+    TabLabelFix(self);
 }
 %end
 
@@ -775,13 +888,13 @@ static void Setup(UIWindow *w) {
     %orig(n ?: c, st);
 }
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
-    %orig(IconRemapImage(img), st);
+    %orig(BlueImageRemap(IconRemapImage(img)), st);
 }
 %end
 
 %hook UIImageView
 - (void)setImage:(UIImage *)img {
-    UIImage *n = IconRemapImage(img);
+    UIImage *n = BlueImageRemap(IconRemapImage(img));
     if (n && gMaster && gOn[AACIcon] && OnMain()) {
         CGSize s = n.size;
         if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
@@ -813,6 +926,25 @@ static void Setup(UIWindow *w) {
 - (void)setIconColor:(UIColor *)c {
     %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsBlackColor(c)) ? gColor[AACIcon] : c);
 }
+- (void)setTitleTextAttributes:(NSDictionary<NSAttributedStringKey, id> *)attrs {
+    if (gMaster && gOn[AACIcon] && gColor[AACIcon] && OnMain()) {
+        NSMutableDictionary *m = attrs ? [attrs mutableCopy] : [NSMutableDictionary new];
+        m[NSForegroundColorAttributeName] = gColor[AACIcon];
+        attrs = m;
+    }
+    %orig(attrs);
+}
+%end
+
+%hook UIImageSymbolConfiguration
++ (UIImageSymbolConfiguration *)configurationWithHierarchicalColor:(UIColor *)c {
+    return %orig(IconTintFix(c));
+}
++ (UIImageSymbolConfiguration *)configurationWithPaletteColors:(NSArray<UIColor *> *)colors {
+    NSMutableArray *m = [NSMutableArray arrayWithCapacity:colors.count];
+    for (UIColor *c in colors) [m addObject:IconTintFix(c)];
+    return %orig(m);
+}
 %end
 
 %hook UISwitch
@@ -839,6 +971,13 @@ static void Setup(UIWindow *w) {
 - (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
     UIColor *n = RemapRGBA(r, g, b, a);
     return n ?: %orig;
+}
++ (UIColor *)colorWithCGColor:(CGColorRef)cg {
+    UIColor *o = %orig;
+    if (gRaw || !gMaster || !gOn[AACFill] || !o) return o;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![o getRed:&r green:&g blue:&b alpha:&a]) return o;
+    return RemapRGBA(r, g, b, a) ?: o;
 }
 + (UIColor *)systemBlueColor {
     if (gMaster && gOn[AACIcon] && gColor[AACIcon]) return gColor[AACIcon];
