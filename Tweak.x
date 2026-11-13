@@ -22,6 +22,8 @@ static const void *kBlueSrc     = &kBlueSrc;
 static const void *kCtl         = &kCtl;
 static const void *kImgView     = &kImgView;
 static const void *kOwner       = &kOwner;
+static const void *kAttempts    = &kAttempts;
+static const void *kPendShape   = &kPendShape;
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -43,6 +45,7 @@ static __thread BOOL gRaw;
 static BOOL        gInTry;
 static BOOL        gInTabFix;
 static volatile int32_t gPending;
+static volatile int32_t gHasPend;
 
 @interface CALayer (AACPrivate)
 - (void)setContentsMultiplyColor:(CGColorRef)c;
@@ -68,12 +71,16 @@ static UIColor *ColorFromHex(NSString *s) {
     return c;
 }
 
-static NSString *HexFromColor(UIColor *c) {
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    [c getRed:&r green:&g blue:&b alpha:&a];
+static NSString *HexFromRGB(CGFloat r, CGFloat g, CGFloat b) {
     #define CH(x) ((int)lround(fmax(0, fmin(1, x)) * 255))
     return [NSString stringWithFormat:@"%02X%02X%02X", CH(r), CH(g), CH(b)];
     #undef CH
+}
+
+static NSString *HexFromColor(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    [c getRed:&r green:&g blue:&b alpha:&a];
+    return HexFromRGB(r, g, b);
 }
 
 static UIColor *DarkVariant(UIColor *c) {
@@ -104,11 +111,10 @@ static BOOL CGRGBA(CGColorRef c, CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a)
     if (!c) return NO;
     CGColorSpaceRef cs = CGColorGetColorSpace(c);
     if (!cs) return NO;
-    CGColorSpaceModel m = CGColorSpaceGetModel(cs);
-    if (m != kCGColorSpaceModelMonochrome && m != kCGColorSpaceModelRGB) return NO;
     size_t n = CGColorGetNumberOfComponents(c);
     const CGFloat *k = CGColorGetComponents(c);
     if (!k) return NO;
+    CGColorSpaceModel m = CGColorSpaceGetModel(cs);
     if (m == kCGColorSpaceModelMonochrome && n >= 2) {
         *r = *g = *b = k[0]; *a = k[1];
         return YES;
@@ -226,6 +232,8 @@ static CGColorRef IconShapeColor(CALayer *l) {
 
 static CGColorRef LayerRemap(CGColorRef c, int cat, int *clsOut) {
     if (!c || !gOn[cat] || IsOurs(c)) return NULL;
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    if (!cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) return NULL;
     CGFloat r, g, b, a;
     if (!CGRGBA(c, &r, &g, &b, &a)) return NULL;
     int cls = BlueClass(r, g, b);
@@ -242,6 +250,28 @@ static UIColor *ColorRemap(UIColor *c, int cat, int *clsOut) {
     if (cls == 0) return nil;
     if (clsOut) *clsOut = cls;
     return cls == 2 ? [gColor[cat] colorWithAlphaComponent:0.2] : gColor[cat];
+}
+
+static UIColor *RemapRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
+    if (gRaw || !gMaster || !gOn[AACFill] || !gColor[AACFill]) return nil;
+    int cls = BlueClass(r, g, b);
+    if (!cls) return nil;
+    CGFloat al = (cls == 2 ? 0.2 : 1.0) * a;
+    if (al >= 0.99) return gColor[AACFill];
+    gRaw = YES;
+    UIColor *res = [gColor[AACFill] colorWithAlphaComponent:al];
+    gRaw = NO;
+    return res;
+}
+
+static BOOL RemapComps(CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
+    if (gRaw || !gMaster || !gOn[AACFill]) return NO;
+    int cls = BlueClass(*r, *g, *b);
+    if (!cls) return NO;
+    const CGFloat *q = gDark ? gRGBD : gRGBL;
+    *a = *a * (cls == 2 ? 0.2 : 1.0);
+    *r = q[0]; *g = q[1]; *b = q[2];
+    return YES;
 }
 
 static int CGImageIsBlackMono(CGImageRef cg) {
@@ -330,17 +360,58 @@ static void ApplyAll(void) {
     }
 }
 
-static BOOL GlassName(NSString *cn) {
-    return [cn containsString:@"Glass"] || [cn containsString:@"Backdrop"] ||
-           [cn containsString:@"Material"] || [cn containsString:@"VisualEffect"] ||
-           [cn containsString:@"UISwitch"] || [cn containsString:@"AVPlayer"] ||
-           [cn containsString:@"Metal"] || [cn containsString:@"Video"];
+static void FixUnderFill(CALayer *l, int depth) {
+    if (!l || depth > 6) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (CALayer *s in [l.sublayers copy]) {
+        if ([s isKindOfClass:CAShapeLayer.class]) {
+            NSNumber *m = objc_getAssociatedObject(s, kIconShape);
+            if (m) {
+                CAShapeLayer *sh = (CAShapeLayer *)s;
+                CGColorRef c = IconShapeColor(s);
+                gInTry = YES;
+                if (m.intValue & 1) sh.fillColor   = c;
+                if (m.intValue & 2) sh.strokeColor = c;
+                gInTry = NO;
+            }
+        }
+        FixUnderFill(s, depth + 1);
+    }
+    [CATransaction commit];
 }
 
-static BOOL InGlassLayer(CALayer *l) {
-    for (int i = 0; i < 8 && l; i++, l = l.superlayer) {
-        if (objc_getAssociatedObject(l, kCtl)) return YES;
-        if (GlassName(NSStringFromClass(l.class))) return YES;
+static void FixUnderFillView(UIView *v, int depth) {
+    if (!v || depth > 6) return;
+    for (UIView *sv in [v.subviews copy]) {
+        if (sv.bounds.size.height > 120) continue;
+        [sv tintColorDidChange];
+        [sv setNeedsDisplay];
+        FixUnderFillView(sv, depth + 1);
+    }
+}
+
+static void MarkFill(CALayer *l, UIView *v) {
+    if (!OnMain() || l.bounds.size.height > 120) return;
+    if (objc_getAssociatedObject(l, kFill)) return;
+    objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gFillCount++;
+    if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
+    __weak CALayer *wl = l;
+    __weak UIView *wv = v;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CALayer *sl = wl;
+        if (!sl) return;
+        FixUnderFill(sl, 0);
+        UIView *sv = wv;
+        if (sv) FixUnderFillView(sv, 0);
+    });
+}
+
+static BOOL UnderFill(UIView *v) {
+    for (int i = 0; i < 4 && v; i++) {
+        if (objc_getAssociatedObject(v.layer, kFill)) return YES;
+        v = v.superview;
     }
     return NO;
 }
@@ -348,6 +419,20 @@ static BOOL InGlassLayer(CALayer *l) {
 static BOOL InControlKnob(CALayer *l) {
     for (int i = 0; i < 8 && l; i++, l = l.superlayer)
         if (objc_getAssociatedObject(l, kCtl)) return YES;
+    return NO;
+}
+
+static BOOL GlassName(NSString *cn) {
+    return [cn containsString:@"Glass"] || [cn containsString:@"Backdrop"] ||
+           [cn containsString:@"Material"] || [cn containsString:@"VisualEffect"] ||
+           [cn containsString:@"UISwitch"];
+}
+
+static BOOL InGlassLayer(CALayer *l) {
+    for (int i = 0; i < 8 && l; i++, l = l.superlayer) {
+        if (objc_getAssociatedObject(l, kCtl)) return YES;
+        if (GlassName(NSStringFromClass(l.class))) return YES;
+    }
     return NO;
 }
 
@@ -380,60 +465,6 @@ static BOOL LooksLikeAvatarView(UIView *v) {
     CGSize s = v.bounds.size;
     if (s.width <= 0 || s.height <= 0) return YES;
     return l.cornerRadius >= fmin(s.width, s.height) * 0.25;
-}
-
-static void FixUnderFill(CALayer *l, int depth) {
-    if (!l || depth > 6) return;
-    for (CALayer *s in [l.sublayers copy]) {
-        if ([s isKindOfClass:CAShapeLayer.class]) {
-            NSNumber *m = objc_getAssociatedObject(s, kIconShape);
-            if (m) {
-                CAShapeLayer *sh = (CAShapeLayer *)s;
-                CGColorRef c = IconShapeColor(s);
-                gInTry = YES;
-                if (m.intValue & 1) sh.fillColor   = c;
-                if (m.intValue & 2) sh.strokeColor = c;
-                gInTry = NO;
-            }
-        }
-        FixUnderFill(s, depth + 1);
-    }
-}
-
-static void FixUnderFillView(UIView *v, int depth) {
-    if (!v || depth > 6) return;
-    for (UIView *sv in [v.subviews copy]) {
-        if (GlassName(NSStringFromClass(sv.class))) continue;
-        if ([sv isKindOfClass:UIImageView.class] || [sv isKindOfClass:UIButton.class] ||
-            [sv isKindOfClass:UILabel.class]) {
-            [sv tintColorDidChange];
-            [sv setNeedsDisplay];
-        }
-        FixUnderFillView(sv, depth + 1);
-    }
-}
-
-static void MarkFill(CALayer *l, UIView *v) {
-    if (!OnMain() || l.bounds.size.height > 120) return;
-    if (objc_getAssociatedObject(l, kFill)) return;
-    objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    gFillCount++;
-    if (!v) {
-        id o = objc_getAssociatedObject(l, kOwner);
-        if ([o isKindOfClass:AACWeak.class]) v = ((AACWeak *)o).obj;
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        FixUnderFill(l, 0);
-        if (v) FixUnderFillView(v, 0);
-    });
-}
-
-static BOOL UnderFill(UIView *v) {
-    for (int i = 0; i < 4 && v; i++) {
-        if (objc_getAssociatedObject(v.layer, kFill)) return YES;
-        v = v.superview;
-    }
-    return NO;
 }
 
 static void TryBlack(CALayer *l) {
@@ -498,12 +529,15 @@ static void TryBlackIconShape(CAShapeLayer *sh) {
 }
 
 static void RunCheck(CALayer *l, BOOL shape) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     if (shape && [l isKindOfClass:CAShapeLayer.class]) {
         TryBlackShape((CAShapeLayer *)l);
         TryBlackIconShape((CAShapeLayer *)l);
     } else {
         TryBlack(l);
     }
+    [CATransaction commit];
 }
 
 static BOOL CheckDone(CALayer *l, BOOL shape) {
@@ -514,20 +548,39 @@ static BOOL CheckDone(CALayer *l, BOOL shape) {
     return !IsFillCandidateCG(l.backgroundColor) && !(l.borderWidth > 0 && IsBlackCG(l.borderColor));
 }
 
+static void AddPending(CALayer *l, BOOL shape) {
+    if (objc_getAssociatedObject(l, kPendShape)) return;
+    objc_setAssociatedObject(l, kPendShape, @(shape), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gHasPend = 1;
+}
+
+static void PendingRun(CALayer *l) {
+    NSNumber *p = objc_getAssociatedObject(l, kPendShape);
+    if (!p) return;
+    BOOL shape = p.boolValue;
+    RunCheck(l, shape);
+    int n = [objc_getAssociatedObject(l, kAttempts) intValue] + 1;
+    if (n >= 8 || CheckDone(l, shape)) {
+        objc_setAssociatedObject(l, kPendShape, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(l, kAttempts, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        objc_setAssociatedObject(l, kAttempts, @(n), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 static void ScheduleCheck(CALayer *l, BOOL shape) {
     if (!l) return;
     if (OnMain()) {
         RunCheck(l, shape);
         if (CheckDone(l, shape)) return;
     }
+    AddPending(l, shape);
     if (gPending > 96) return;
     __sync_fetch_and_add(&gPending, 1);
+    __weak CALayer *wl = l;
     dispatch_async(dispatch_get_main_queue(), ^{
-        RunCheck(l, shape);
-        if (!shape && CGRectIsEmpty(l.bounds)) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ RunCheck(l, shape); });
-        }
+        CALayer *sl = wl;
+        if (sl) RunCheck(sl, shape);
         __sync_fetch_and_sub(&gPending, 1);
     });
 }
@@ -689,7 +742,11 @@ static void TabBarFix(UITabBar *bar) {
 }
 
 static void TabBarFixLater(UITabBar *bar) {
-    dispatch_async(dispatch_get_main_queue(), ^{ TabBarFix(bar); });
+    __weak UITabBar *wb = bar;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITabBar *b = wb;
+        if (b) TabBarFix(b);
+    });
 }
 
 static void TabLabelFix(UILabel *lb) {
@@ -840,14 +897,17 @@ static void Setup(UIWindow *w) {
             [cn containsString:@"Keyboard"] || [cn containsString:@"TextEffects"] || [cn containsString:@"Shim"];
         objc_setAssociatedObject(w, kGestureFlag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (!skip) {
+            __weak UIWindow *ww = w;
             dispatch_async(dispatch_get_main_queue(), ^{
+                UIWindow *sw = ww;
+                if (!sw) return;
                 UILongPressGestureRecognizer *g = [[UILongPressGestureRecognizer alloc]
                     initWithTarget:[AACHelper shared] action:@selector(onLongPress:)];
                 g.numberOfTouchesRequired = 3;
                 g.minimumPressDuration = 1.0;
                 g.cancelsTouchesInView = NO;
                 g.delegate = [AACHelper shared];
-                [w addGestureRecognizer:g];
+                [sw addGestureRecognizer:g];
             });
         }
     }
@@ -892,6 +952,10 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook CALayer
+- (void)layoutSublayers {
+    %orig;
+    if (gHasPend && OnMain()) PendingRun(self);
+}
 - (void)setBackgroundColor:(CGColorRef)c {
     if (!gMaster || !c) { %orig; return; }
     int cls = 0;
@@ -1076,6 +1140,17 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook UIColor
++ (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    return RemapRGBA(r, g, b, a) ?: %orig;
+}
++ (UIColor *)colorWithDisplayP3Red:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    return RemapRGBA(r, g, b, a) ?: %orig;
+}
+- (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    CGFloat nr = r, ng = g, nb = b, na = a;
+    if (RemapComps(&nr, &ng, &nb, &na)) return %orig(nr, ng, nb, na);
+    return %orig;
+}
 + (UIColor *)systemBlueColor {
     if (gMaster && gOn[AACIcon] && gColor[AACIcon]) return gColor[AACIcon];
     return %orig;
