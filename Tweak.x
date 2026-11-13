@@ -28,7 +28,7 @@ static BOOL        gDark = NO;
 static int         gFillCount = 0;
 static int         gVersion = 0;
 static NSMutableArray *gKeep;
-static BOOL        gRaw;
+static __thread BOOL gRaw;
 static BOOL        gInTry;
 static BOOL        gInTabFix;
 static volatile int32_t gPending;
@@ -300,9 +300,23 @@ static BOOL LayerUnderFill(CALayer *l) {
     return NO;
 }
 
+// Avatar: view bo tròn + cắt theo bounds -> không đụng vào ảnh bên trong
+static BOOL LooksLikeAvatarView(UIView *v) {
+    if (!v) return NO;
+    CALayer *l = v.layer;
+    if (!l.masksToBounds || l.cornerRadius <= 0) return NO;
+    CGSize s = v.bounds.size;
+    if (s.width <= 0 || s.height <= 0) return YES;
+    return l.cornerRadius >= fmin(s.width, s.height) * 0.25;
+}
+
 static void TryBlack(CALayer *l) {
     if (!gOn[AACFill] || !OnMain()) return;
     CGSize sz = l.bounds.size;
+    // Không đổi nền của UIImageView / layer đang hiển thị ảnh / hình tròn (avatar)
+    id dv = l.delegate;
+    if ([dv isKindOfClass:UIImageView.class] || l.contents) return;
+    if (sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45) return;
     BOOL nested = LayerUnderFill(l.superlayer);
     CGColorRef bg = l.backgroundColor;
     BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
@@ -448,7 +462,8 @@ static BOOL ImageIsBlackMono(UIImage *img) {
                 int mxc = MAX(px[0], MAX(px[1], px[2]));
                 if (mxc * 255 > 40 * px[3]) { bad++; break; }
             }
-            res = (solid >= 6 && clear >= 1 && bad == 0);
+            // Icon đen thường là nét mảnh (<= ~62% diện tích). Ảnh đen đặc/avatar thì bỏ qua.
+            res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62);
         }
     }
     objc_setAssociatedObject(img, kMonoBlack, @(res), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -597,7 +612,7 @@ static void TabFixView(UIView *v, int depth) {
     if ([v isKindOfClass:UIImageView.class]) {
         UIImageView *iv = (UIImageView *)v;
         UIImage *im = iv.image;
-        if (im) {
+        if (im && !LooksLikeAvatarView(iv)) {
             UIImage *n = TabColorize(IconRemapImage(im));
             if (n != im) iv.image = n;
         }
@@ -899,32 +914,6 @@ static void Setup(UIWindow *w) {
 }
 %end
 
-// Vẽ trực tiếp bằng CoreGraphics (SwiftUI / drawRect)
-%hookf(void, CGContextSetFillColorWithColor, CGContextRef ctx, CGColorRef color) {
-    CGColorRef n = (gMaster && color) ? LayerRemap(color, AACIcon, NULL) : NULL;
-    %orig(ctx, n ?: color);
-}
-
-%hookf(void, CGContextSetStrokeColorWithColor, CGContextRef ctx, CGColorRef color) {
-    CGColorRef n = (gMaster && color) ? LayerRemap(color, AACIcon, NULL) : NULL;
-    %orig(ctx, n ?: color);
-}
-
-%hookf(void, CGContextSetRGBFillColor, CGContextRef ctx, CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
-    if (gMaster && gOn[AACIcon] && !gRaw) {
-        int cls = BlueClass(r, g, b);
-        if (cls) { CGContextSetFillColorWithColor(ctx, CGFor(AACIcon, cls == 2)); return; }
-    }
-    %orig(ctx, r, g, b, a);
-}
-
-%hookf(void, CGContextSetRGBStrokeColor, CGContextRef ctx, CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
-    if (gMaster && gOn[AACIcon] && !gRaw) {
-        int cls = BlueClass(r, g, b);
-        if (cls) { CGContextSetStrokeColorWithColor(ctx, CGFor(AACIcon, cls == 2)); return; }
-    }
-    %orig(ctx, r, g, b, a);
-}
 
 %hook CAShapeLayer
 - (void)setFillColor:(CGColorRef)c {
@@ -985,6 +974,7 @@ static void Setup(UIWindow *w) {
 
 %hook UIImageView
 - (void)setImage:(UIImage *)img {
+    if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
     UIImage *n = BlueImageRemap(IconRemapImage(img));
     if (n && gMaster && gOn[AACIcon] && OnMain()) {
         CGSize s = n.size;
@@ -1063,13 +1053,6 @@ static void Setup(UIWindow *w) {
     UIColor *n = RemapRGBA(r, g, b, a);
     return n ?: %orig;
 }
-+ (UIColor *)colorWithCGColor:(CGColorRef)cg {
-    UIColor *o = %orig;
-    if (gRaw || !gMaster || !gOn[AACFill] || !o) return o;
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![o getRed:&r green:&g blue:&b alpha:&a]) return o;
-    return RemapRGBA(r, g, b, a) ?: o;
-}
 + (UIColor *)systemBlueColor {
     if (gMaster && gOn[AACIcon] && gColor[AACIcon]) return gColor[AACIcon];
     return %orig;
@@ -1082,6 +1065,8 @@ static void Setup(UIWindow *w) {
 
 %ctor {
     @autoreleasepool {
+        NSString *bp = NSBundle.mainBundle.bundlePath;
+        if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
         RefreshCache();
         %init;
