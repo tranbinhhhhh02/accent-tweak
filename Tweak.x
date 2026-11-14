@@ -7,6 +7,11 @@
 #import <unistd.h>
 #import <string.h>
 
+// Cho phép dùng API iOS 15+ (UIButtonConfiguration, hierarchical/palette symbol...) khi build với deployment target thấp hơn.
+// Trên máy iOS cũ hơn, class không tồn tại thì hook tự bị bỏ qua.
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+#pragma clang diagnostic ignored "-Wunguarded-availability"
+
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
 
 static NSString *const kMasterKey  = @"AccentColorAll_Enabled";
