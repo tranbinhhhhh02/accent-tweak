@@ -8,7 +8,6 @@
 #import <string.h>
 
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
-
 static NSString *const kMasterKey  = @"AccentColorAll_Enabled";
 static NSString *const kHexKey     = @"AccentColorAll_Hex";
 static NSString *const kDefaultHex = @"B8A8FF";
