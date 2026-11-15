@@ -1,10 +1,3 @@
-// Build với deployment target 14.0 + -Werror: tắt các cảnh báo availability/không dùng
-#pragma clang diagnostic ignored "-Wunguarded-availability-new"
-#pragma clang diagnostic ignored "-Wunguarded-availability"
-#pragma clang diagnostic ignored "-Wunused-function"
-#pragma clang diagnostic ignored "-Wunused-variable"
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
@@ -328,11 +321,15 @@ static void TryBlack(CALayer *l) {
     // Không đổi nền của UIImageView / layer đang hiển thị ảnh / hình tròn (avatar)
     id dv = l.delegate;
     if ([dv isKindOfClass:UIImageView.class] || l.contents) return;
-    if (sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45) return;
+    // Hình tròn lớn (avatar) thì bỏ qua; hình tròn nhỏ (badge "+", chấm) vẫn được đổi
+    if (sz.width > 28 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45) return;
     BOOL nested = LayerUnderFill(l.superlayer);
     CGColorRef bg = l.backgroundColor;
     BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
-    if (cand && sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested)) {
+    CGFloat mnS = fmin(sz.width, sz.height), mxS = fmax(sz.width, sz.height);
+    BOOL smallCircle = mnS >= 8 && mxS <= 28 && l.cornerRadius >= mnS / 2.0 - 0.5;
+    BOOL box = sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested);
+    if (cand && (box || smallCircle)) {
         l.backgroundColor = CGFor(AACFill, NO);
         MarkFill(l);
     }
@@ -953,6 +950,11 @@ static void Setup(UIWindow *w) {
 - (UIColor *)tintColor {
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon]) return %orig;
     if (gFillCount > 0 && gOn[AACFill] && OnMain() && UnderFill(self)) return UIColor.whiteColor;
+    // Light mode: icon được app đặt tint trắng (vd dấu "+" trên nền đen) -> giữ nguyên màu trắng gốc
+    if (!gDark) {
+        UIColor *o = %orig;
+        if (o && IsWhiteColor(o)) return o;
+    }
     return gColor[AACIcon];
 }
 - (void)setTintColor:(UIColor *)c {
