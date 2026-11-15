@@ -3,6 +3,15 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+#if __has_feature(objc_arc)
+#define AAC_BRIDGE(T) (__bridge T)
+#else
+#define AAC_BRIDGE(T) (T)
+#endif
+
 #define kEnabledKey  @"AccentColorAll_Enabled"
 #define kHexKey      @"AccentColorAll_Hex"
 #define kDefaultHex  @"B8A8FF"
@@ -34,7 +43,7 @@ static void AACReloadPrefs(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     gEnabled = [d objectForKey:kEnabledKey] ? [d boolForKey:kEnabledKey] : YES;
     UIColor *c = AACColorFromHex([d stringForKey:kHexKey] ?: kDefaultHex);
-    gAccent = c ?: AACColorFromHex(kDefaultHex);
+    gAccent = [(c ?: AACColorFromHex(kDefaultHex)) copy];
 }
 
 static UIColor *AACAccent(void) {
@@ -163,11 +172,13 @@ static UIView *AACDarkFillView(UIView *v) {
     if (v.layer.backgroundColor &&
         AACIsDark([UIColor colorWithCGColor:v.layer.backgroundColor], tc)) return v;
 
+if (@available(iOS 15.0, *)) {
     if ([v isKindOfClass:[UIButton class]]) {
         UIButtonConfiguration *cf = ((UIButton *)v).configuration;
         if (cf && (AACIsDark(cf.baseBackgroundColor, tc) || AACIsDark(cf.background.backgroundColor, tc)))
             return v;
     }
+}
     CGSize s = v.bounds.size;
     for (UIView *sub in v.subviews) {
         if (AACSkipClassName(NSStringFromClass([sub class]))) continue;
@@ -186,11 +197,13 @@ static BOOL AACIsRound(UIView *v) {
     for (UIView *s in v.subviews) {
         if (s.bounds.size.width >= w * 0.9 && s.layer.cornerRadius >= w / 2 - 1.5) return YES;
     }
+if (@available(iOS 15.0, *)) {
     if ([v isKindOfClass:[UIButton class]]) {
         UIButtonConfiguration *cf = ((UIButton *)v).configuration;
         if (cf && cf.background.cornerRadius >= w / 2 - 1.5) return YES;
         if (cf && cf.cornerStyle == UIButtonConfigurationCornerStyleCapsule) return YES;
     }
+}
     return NO;
 }
 
@@ -260,6 +273,7 @@ static void AACApplySend(UIView *v) {
         fill.backgroundColor = acc;
         fill.layer.backgroundColor = acc.CGColor;
     }
+if (@available(iOS 15.0, *)) {
     if ([v isKindOfClass:[UIButton class]]) {
         UIButton *b = (UIButton *)v;
         UIButtonConfiguration *cf = b.configuration;
@@ -271,6 +285,7 @@ static void AACApplySend(UIView *v) {
             b.configuration = cf;
         }
     }
+}
     // 2) Mũi tên -> trắng (màu gốc)
     for (UIView *s in v.subviews) {
         if (s == fill && s != v) { if (!AACHasIcon(s, 0)) continue; }
@@ -309,10 +324,10 @@ static void AACProcessImageView(UIImageView *iv) {
 static void AACProcessLayerContents(CALayer *l) {
     if (!gEnabled || gGuard) return;
     id c = l.contents;
-    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
+    if (!c || CFGetTypeID(AAC_BRIDGE(CFTypeRef)c) != CGImageGetTypeID()) return;
     if (objc_getAssociatedObject(l, &kOutKey) == c) return;
 
-    CGImageRef src = (__bridge CGImageRef)c;
+    CGImageRef src = AAC_BRIDGE(CGImageRef)c;
     size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
     if (!w || !h || w > 240 || h > 240) return;
 
@@ -328,9 +343,9 @@ static void AACProcessLayerContents(CALayer *l) {
     CGImageRef out = AACCreateTinted(src, target);
     if (!out) return;
     gGuard = YES;
-    l.contents = (__bridge id)out;
+    l.contents = AAC_BRIDGE(id)out;
     gGuard = NO;
-    objc_setAssociatedObject(l, &kOutKey, (__bridge id)out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(l, &kOutKey, AAC_BRIDGE(id)out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     CGImageRelease(out);
 }
 
@@ -509,13 +524,7 @@ static BOOL AACIsAppex(void) {
         if (AACIsBlueish(c) && !AACSkipClassName(NSStringFromClass([self class]))) { %orig(AACAccent()); return; }
     }
     %orig;
-    if (gEnabled && c && !AACIsMarkedSend(self) && AACIsDark(c, nil)) {
-        CGFloat w = self.bounds.size.width;
-        if (w >= 24 && w <= 64) {
-            __weak UIView *ws = self;
-            dispatch_async(dispatch_get_main_queue(), ^{ if (ws) AACMaybeSend(ws); });
-        }
-    }
+    if (gEnabled && c && !AACIsMarkedSend(self) && AACIsDark(c, nil)) AACMaybeSend(self);
 }
 
 - (void)layoutSubviews {
