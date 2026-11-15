@@ -3,6 +3,11 @@
 #import <math.h>
 #import <string.h>
 
+// Deployment target là iOS 14 nhưng ta hook UIButtonConfiguration / UIBackgroundConfiguration (iOS 15+).
+// Class không tồn tại trên máy cũ thì Logos tự bỏ qua hook đó.
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+#pragma clang diagnostic ignored "-Wunguarded-availability"
+
 // Bật hook vẽ lại icon trong layer.contents cho MỌI app (Messenger của Facebook). Mặc định TẮT để tránh crash.
 // Riêng bàn phím (phím return...) luôn được xử lý, không phụ thuộc cờ này.
 #define AAC_CONTENTS_HOOK 0
