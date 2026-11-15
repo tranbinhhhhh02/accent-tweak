@@ -1,11 +1,3 @@
-// AccentColorAll - Tweak.x
-// Đã thêm:
-//   1) Icon "return/back" màu đen trên bàn phím  -> đổi sang màu accent
-//   2) Nút gửi: NỀN tròn đen -> màu accent, MŨI TÊN giữ màu trắng (gốc)
-//
-// Prefs (NSUserDefaults): AccentColorAll_Enabled (BOOL), AccentColorAll_Hex (RRGGBB)
-// Mở menu chỉnh màu: nhấn giữ 3 ngón ~1 giây trên màn hình.
-
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
