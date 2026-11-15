@@ -1,3 +1,10 @@
+// Build với deployment target 14.0 + -Werror: tắt các cảnh báo availability/không dùng
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+#pragma clang diagnostic ignored "-Wunguarded-availability"
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
