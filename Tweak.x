@@ -2,8 +2,6 @@
 #import <objc/runtime.h>
 #import <math.h>
 
-// Bật hook vẽ lại icon trong layer.contents (Messenger của Facebook). Mặc định TẮT để loại trừ nguyên nhân crash.
-// Khi Facebook đã ổn định thì đổi thành 1 để thử.
 #define AAC_CONTENTS_HOOK 0
 
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
@@ -402,7 +400,7 @@ static void ApplyAll(void) {
     }
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+        for (UIWindow *w in [((UIWindowScene *)s).windows copy]) {
             gDark = (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
             w.tintColor = gOn[AACIcon] ? gColor[AACIcon] : nil;
             objc_setAssociatedObject(w, kTintVer, @(gVersion), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -449,8 +447,14 @@ static void MarkFill(CALayer *l, UIView *v) {
     if (!objc_getAssociatedObject(l, kFill)) {
         objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         gFillCount++;
-        if (gSafe) v = nil;
-        else if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
+        // Facebook: tuyệt đối không tạo __weak tới view (nhiều lớp view của FB/ô tìm kiếm cấm weak reference -> crash)
+        if (gSafe) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                FixUnderFill(l, 0);
+            });
+            return;
+        }
+        if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
         __weak UIView *wv = v;
         dispatch_async(dispatch_get_main_queue(), ^{
             FixUnderFill(l, 0);
@@ -829,12 +833,40 @@ static void TabLabelFix(UILabel *lb) {
 
 // Bảng cài đặt được hiện trong một UIWindow riêng (không present lên view controller của Facebook,
 // vì VC của Facebook có thể đang chuyển cảnh / bị app hook -> crash)
+//
+// FIX CRASH (Facebook, màn hình tìm kiếm + nhấn 3 ngón):
+//  - Trên Facebook KHÔNG makeKeyAndVisible cho cửa sổ của tweak. Việc cướp key window khi ô tìm kiếm
+//    đang là first responder (bàn phím đang hiện) làm Facebook xử lý resign/become key giữa chừng -> crash.
+//    Chỉ hiện cửa sổ (hidden = NO); chạm vẫn nhận bình thường vì cửa sổ nằm trên cùng.
+//  - Trì hoãn việc hiện bảng 0.2s + present ở lượt runloop kế tiếp, tránh trùng với animation/layout của FB.
+//  - Chống bấm trùng (gPanelPending), tìm scene foreground nếu g.view không có windowScene.
+//  - Không bao giờ tạo UIWindow bằng initWithFrame (iOS 13+ có scene sẽ crash).
 static UIWindow *gPanelWin;
+static BOOL      gPanelPending;
 
 static void ClosePanelWindow(void) {
     UIWindow *w = gPanelWin;
     gPanelWin = nil;
-    if (w) w.hidden = YES;
+    gPanelPending = NO;
+    if (w) {
+        w.hidden = YES;
+        w.rootViewController = nil;
+    }
+}
+
+static UIWindowScene *ActiveScene(void) {
+    UIWindowScene *fallback = nil;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:UIWindowScene.class]) continue;
+        if (sc.activationState == UISceneActivationStateForegroundActive) return (UIWindowScene *)sc;
+        if (!fallback && sc.activationState == UISceneActivationStateForegroundInactive) fallback = (UIWindowScene *)sc;
+    }
+    return fallback;
+}
+
+static void ShowPanelWindowKey(UIWindow *w) {
+    if (gSafe) w.hidden = NO;       // Facebook: không cướp key window
+    else [w makeKeyAndVisible];
 }
 
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
@@ -911,6 +943,8 @@ static void ClosePanelWindow(void) {
         if (col) [ws saveColor:col];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
+    // Chỉ khi người dùng thật sự muốn gõ mã màu mới cần key window (để bàn phím gõ vào alert)
+    if (gSafe) [self.view.window makeKeyWindow];
     [self presentViewController:ac animated:YES completion:nil];
 }
 
@@ -938,6 +972,36 @@ static void ClosePanelWindow(void) {
 + (instancetype)shared;
 @end
 
+// Hiện bảng cài đặt trong cửa sổ riêng
+static void ShowPanel(UIWindowScene *scene) {
+    gPanelPending = NO;
+    if (gPanelWin || !scene) return;
+    @try {
+        UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+        w.windowLevel = UIWindowLevelAlert + 1;
+        w.backgroundColor = UIColor.clearColor;
+        UIViewController *host = [UIViewController new];
+        host.view.backgroundColor = UIColor.clearColor;
+        w.rootViewController = host;
+        gPanelWin = w;
+        ShowPanelWindowKey(w);
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        nav.presentationController.delegate = [AACHelper shared];
+        // present ở lượt runloop kế tiếp, sau khi cửa sổ đã layout xong
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (gPanelWin != w) return;
+            @try {
+                [host presentViewController:nav animated:YES completion:nil];
+            } @catch (NSException *e) {
+                ClosePanelWindow();
+            }
+        });
+    } @catch (NSException *e) {
+        ClosePanelWindow();
+    }
+}
+
 @implementation AACHelper
 + (instancetype)shared {
     static AACHelper *h; static dispatch_once_t once;
@@ -955,27 +1019,16 @@ static void ClosePanelWindow(void) {
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    if (gPanelWin) return;
-    UIWindowScene *scene = ((UIWindow *)g.view).windowScene;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gPanelWin) return;
-        @try {
-            UIWindow *w = scene ? [[UIWindow alloc] initWithWindowScene:scene]
-                                : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-            w.windowLevel = UIWindowLevelAlert + 1;
-            w.backgroundColor = UIColor.clearColor;
-            UIViewController *host = [UIViewController new];
-            host.view.backgroundColor = UIColor.clearColor;
-            w.rootViewController = host;
-            gPanelWin = w;
-            [w makeKeyAndVisible];
-            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
-            nav.modalPresentationStyle = UIModalPresentationPageSheet;
-            nav.presentationController.delegate = [AACHelper shared];
-            [host presentViewController:nav animated:YES completion:nil];
-        } @catch (NSException *e) {
-            ClosePanelWindow();
-        }
+    if (gPanelWin || gPanelPending) return;
+    UIWindowScene *scene = nil;
+    UIView *gv = g.view;
+    if ([gv isKindOfClass:UIWindow.class]) scene = ((UIWindow *)gv).windowScene;
+    if (!scene) scene = ActiveScene();
+    if (!scene) return;
+    gPanelPending = YES;
+    // Trì hoãn một chút: tránh trùng với animation / layout / bàn phím của màn hình tìm kiếm Facebook
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ShowPanel(scene);
     });
 }
 @end
@@ -994,6 +1047,8 @@ static void Setup(UIWindow *w) {
                 g.numberOfTouchesRequired = 3;
                 g.minimumPressDuration = 1.0;
                 g.cancelsTouchesInView = NO;
+                g.delaysTouchesBegan = NO;
+                g.delaysTouchesEnded = NO;
                 g.delegate = [AACHelper shared];
                 [w addGestureRecognizer:g];
             });
@@ -1341,7 +1396,7 @@ static BOOL ShowCrashReport(NSString *text) {
     host.view.backgroundColor = UIColor.clearColor;
     w.rootViewController = host;
     gPanelWin = w;
-    [w makeKeyAndVisible];
+    ShowPanelWindowKey(w);
     NSString *shown = text.length > 1200 ? [text substringToIndex:1200] : text;
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Lỗi crash lần trước"
         message:shown preferredStyle:UIAlertControllerStyleAlert];
