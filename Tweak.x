@@ -49,6 +49,7 @@ static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
 static volatile int32_t gPending;
+static BOOL        gSafe;   // app họ Facebook (Facebook/Messenger): tắt các cơ chế dễ crash
 
 @interface CALayer (AACPrivate)
 - (void)setContentsMultiplyColor:(CGColorRef)c;
@@ -639,6 +640,8 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
         RunCheck(l, shape);
         if (CheckDone(l, shape)) return;
     }
+    // Facebook: không giữ layer trong hash table / không chạy async (nguồn crash khi chuyển trang)
+    if (gSafe) return;
     AddPending(l, shape);
     if (gPending > 96) return;
     __sync_fetch_and_add(&gPending, 1);
@@ -649,7 +652,7 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
 }
 
 static UIImage *IconRemapImage(UIImage *img) {
-    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (!img || gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
     CGSize sz = img.size;
     if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return img;
@@ -659,7 +662,7 @@ static UIImage *IconRemapImage(UIImage *img) {
 
 // Ảnh/symbol đã được tô sẵn màu xanh (palette/hierarchical hoặc PNG) -> tô lại theo accent
 static UIImage *BlueImageRemap(UIImage *img) {
-    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (!img || gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (objc_getAssociatedObject(img, kBlueSrc) || objc_getAssociatedObject(img, kAccentSrc)) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate) return img;
     CGSize sz = img.size;
@@ -847,7 +850,7 @@ static UIViewController *TopVC(UIWindow *w) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Thay đổi màu"; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Màu nhấn"; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -1015,10 +1018,6 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook CALayer
-- (void)layoutSublayers {
-    %orig;
-    if (gHasPend && OnMain()) PendingRun(self);
-}
 - (void)setBackgroundColor:(CGColorRef)c {
     if (!gMaster || !c) { %orig; return; }
     int cls = 0;
@@ -1256,13 +1255,32 @@ static void Setup(UIWindow *w) {
 %end
 %end
 
+%group AACPending
+%hook CALayer
+- (void)layoutSublayers {
+    %orig;
+    if (gHasPend && OnMain()) PendingRun(self);
+}
+%end
+%end
+
+static BOOL IsFacebookFamily(void) {
+    NSBundle *b = NSBundle.mainBundle;
+    NSString *bid = [b.bundleIdentifier lowercaseString] ?: @"";
+    NSString *exe = [[b objectForInfoDictionaryKey:@"CFBundleExecutable"] lowercaseString] ?: @"";
+    return [bid containsString:@"facebook"] || [bid containsString:@"messenger"] ||
+           [exe isEqualToString:@"facebook"] || [exe isEqualToString:@"messenger"];
+}
+
 %ctor {
     @autoreleasepool {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
+        gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
+        if (!gSafe) { %init(AACPending); }
         if (AAC_CONTENTS_HOOK) { %init(AACContents); }
     }
 }
