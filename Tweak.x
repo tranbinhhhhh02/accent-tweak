@@ -7,12 +7,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-
-// Bật hook vẽ lại icon trong layer.contents (Messenger của Facebook). Mặc định TẮT để loại trừ nguyên nhân crash.
-// Khi Facebook đã ổn định thì đổi thành 1 để thử.
 #define AAC_CONTENTS_HOOK 0
 
-// Cách hiện bảng cài đặt:
 //   0 = present lên view controller trên cùng của app (mặc định, cách phổ biến của tweak Facebook/Instagram)
 //   1 = cửa sổ UIWindow riêng (cách cũ, dễ crash trên Facebook)
 #define AAC_PANEL_OWN_WINDOW 0
@@ -56,6 +52,14 @@ static int         gFillCount = 0;
 static int         gVersion = 0;
 static NSMutableArray *gKeep;
 static __thread BOOL gRaw;
+
+// Chống đệ quy vô hạn giữa các hook (log crash: tràn stack, các hàm hook gọi lẫn nhau).
+// Mỗi hook tăng gDepth khi chạy; nếu lồng quá sâu thì chỉ gọi hàm gốc (%orig), không làm gì thêm.
+#define AAC_MAXDEPTH 12
+static __thread int gDepth;
+static inline int  AACDepthEnter(void)      { gDepth++; return 0; }
+static inline void AACDepthLeave(int *p)    { gDepth--; }
+#define AAC_DEPTH_SCOPE int _aacScope __attribute__((cleanup(AACDepthLeave))) = AACDepthEnter()
 static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
@@ -957,6 +961,9 @@ static UIWindowScene *ActiveScene(void) {
 }
 #endif
 
+static NSString *PeekCrash(void);
+static void ClearCrash(void);
+
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
 
@@ -977,7 +984,7 @@ static UIWindowScene *ActiveScene(void) {
 - (void)close { [self dismissViewControllerAnimated:YES completion:^{ ClosePanelWindow(); }]; }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return PeekCrash().length ? 4 : 3; }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Màu nhấn"; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -998,8 +1005,11 @@ static UIWindowScene *ActiveScene(void) {
         sw.layer.borderWidth = 1;
         sw.layer.borderColor = UIColor.separatorColor.CGColor;
         cell.accessoryView = sw;
-    } else {
+    } else if (ip.row == 2) {
         cell.textLabel.text = @"Chọn màu…";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else {
+        cell.textLabel.text = @"Lỗi crash lần trước";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return cell;
@@ -1009,6 +1019,25 @@ static UIWindowScene *ActiveScene(void) {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row == 1) [self editHex];
     else if (ip.row == 2) [self pickColor];
+    else if (ip.row == 3) [self showCrash];
+}
+
+- (void)showCrash {
+    NSString *t = PeekCrash();
+    if (!t.length) return;
+    NSString *shown = t.length > 1800 ? [t substringToIndex:1800] : t;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Lỗi crash lần trước"
+        message:shown preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Sao chép" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIPasteboard.generalPasteboard.string = t;
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Xoá" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        ClearCrash();
+        [ws.tableView reloadData];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)masterChanged:(UISwitch *)sw {
@@ -1190,6 +1219,8 @@ static void Setup(UIWindow *w) {
 - (void)becomeKeyWindow { %orig; Setup(self); }
 - (void)setRootViewController:(UIViewController *)vc { %orig; Setup(self); }
 - (void)traitCollectionDidChange:(UITraitCollection *)prev {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig;
     gDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
 }
@@ -1197,15 +1228,21 @@ static void Setup(UIWindow *w) {
 
 %hook UIView
 - (UIColor *)tintColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon]) return %orig;
     if (gFillCount > 0 && gOn[AACFill] && OnMain() && UnderFill(self) && !InControlView(self)) return UIColor.whiteColor;
     return gColor[AACIcon];
 }
 - (void)setTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (gMaster && gOn[AACIcon] && c && OnMain() && IsInkColor(c)) { %orig(gColor[AACIcon]); return; }
     %orig;
 }
 - (void)setBackgroundColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (!gMaster || !c) { %orig; return; }
     if (!OnMain()) { UIColor *m = ColorRemap(c, AACFill, NULL); %orig(m ?: c); return; }
     int cls = 0;
@@ -1219,6 +1256,8 @@ static void Setup(UIWindow *w) {
 
 %hook CALayer
 - (void)setBackgroundColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (!gMaster || !c) { %orig; return; }
     int cls = 0;
     CGColorRef n = LayerRemap(c, AACFill, &cls);
@@ -1228,6 +1267,8 @@ static void Setup(UIWindow *w) {
     if (gOn[AACFill] && IsFillCandidateCG(c)) ScheduleCheck(self, NO);
 }
 - (void)setBorderColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     CGColorRef n = gMaster ? LayerRemap(c, AACFill, NULL) : NULL;
     if (n) { %orig(n); return; }
     %orig;
@@ -1235,6 +1276,8 @@ static void Setup(UIWindow *w) {
 }
 // SwiftUI tô symbol/template image bằng contentsMultiplyColor
 - (void)setContentsMultiplyColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     CGColorRef n = NULL;
     if (gMaster && c) {
         int mcls = 0;
@@ -1251,6 +1294,8 @@ static void Setup(UIWindow *w) {
 
 %hook CATextLayer
 - (void)setForegroundColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
     %orig(n ?: c);
 }
@@ -1259,6 +1304,8 @@ static void Setup(UIWindow *w) {
 
 %hook CAShapeLayer
 - (void)setFillColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (!gMaster || !c) { %orig; return; }
     CGColorRef n = LayerRemap(c, AACIcon, NULL);
     if (n) { %orig(n); return; }
@@ -1266,6 +1313,8 @@ static void Setup(UIWindow *w) {
     if (!gInTry && (gOn[AACFill] || gOn[AACIcon]) && (IsBlackCG(c) || (gOn[AACIcon] && IsInkCG(c)))) ScheduleCheck(self, YES);
 }
 - (void)setStrokeColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (!gMaster || !c) { %orig; return; }
     CGColorRef n = LayerRemap(c, AACIcon, NULL);
     if (n) { %orig(n); return; }
@@ -1276,10 +1325,14 @@ static void Setup(UIWindow *w) {
 
 %hook UISegmentedControl
 - (void)setSelectedSegmentTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     UIColor *n = (gMaster && gOn[AACFill] && c && OnMain() && IsBlackColor(c)) ? gColor[AACFill] : nil;
     %orig(n ?: c);
 }
 - (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig;
     if (gMaster && gOn[AACFill] && OnMain()) {
         UIColor *cur = self.selectedSegmentTintColor;
@@ -1290,14 +1343,20 @@ static void Setup(UIWindow *w) {
 
 %hook UILabel
 - (void)setTextColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     UIColor *n = gMaster ? ColorRemap(c, AACText, NULL) : nil;
     %orig(n ?: c);
 }
 - (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig;
     if (self.window) { FixLabelBG(self); TabLabelFix(self); }
 }
 - (void)layoutSubviews {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig;
     FixLabelBG(self);
     TabLabelFix(self);
@@ -1306,22 +1365,30 @@ static void Setup(UIWindow *w) {
 
 %hook UIButton
 - (void)setTitleColor:(UIColor *)c forState:(UIControlState)st {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     UIColor *n = gMaster ? ColorRemap(c, AACText, NULL) : nil;
     %orig(n ?: c, st);
 }
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig(BlueImageRemap(IconRemapImage(img)), st);
 }
 %end
 
 %hook UIBarButtonItem
 - (void)setImage:(UIImage *)img {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig(BlueImageRemap(IconRemapImage(img)));
 }
 %end
 
 %hook UIImageView
 - (void)setImage:(UIImage *)img {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (OnMain() && !objc_getAssociatedObject(self.layer, kImgView))
         objc_setAssociatedObject(self.layer, kImgView, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
@@ -1336,9 +1403,13 @@ static void Setup(UIWindow *w) {
 
 %hook UIImage
 - (UIImage *)imageWithTintColor:(UIColor *)c renderingMode:(UIImageRenderingMode)m {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     return %orig(IconTintFix(c), m);
 }
 - (UIImage *)imageWithTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     return %orig(IconTintFix(c));
 }
 %end
@@ -1349,15 +1420,21 @@ static void Setup(UIWindow *w) {
 - (void)setSelectedItem:(UITabBarItem *)item { %orig; TabBarFixLater(self); }
 - (void)traitCollectionDidChange:(UITraitCollection *)prev { %orig; TabBarFixLater(self); }
 - (void)setUnselectedItemTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsInkColor(c)) ? gColor[AACIcon] : c);
 }
 %end
 
 %hook UITabBarItemStateAppearance
 - (void)setIconColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig((gMaster && gOn[AACIcon] && c && OnMain() && IsInkColor(c)) ? gColor[AACIcon] : c);
 }
 - (void)setTitleTextAttributes:(NSDictionary<NSAttributedStringKey, id> *)attrs {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (gMaster && gOn[AACIcon] && gColor[AACIcon] && OnMain()) {
         NSMutableDictionary *m = attrs ? [attrs mutableCopy] : [NSMutableDictionary new];
         m[NSForegroundColorAttributeName] = gColor[AACIcon];
@@ -1369,9 +1446,13 @@ static void Setup(UIWindow *w) {
 
 %hook UIImageSymbolConfiguration
 + (UIImageSymbolConfiguration *)configurationWithHierarchicalColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     return %orig(IconTintFix(c));
 }
 + (UIImageSymbolConfiguration *)configurationWithPaletteColors:(NSArray<UIColor *> *)colors {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     NSMutableArray *m = [NSMutableArray arrayWithCapacity:colors.count];
     for (UIColor *c in colors) [m addObject:(c ? IconTintFix(c) : c) ?: (id)NSNull.null];
     if ([m containsObject:NSNull.null]) return %orig(colors);
@@ -1390,13 +1471,19 @@ static void Setup(UIWindow *w) {
 %hook UISwitch
 - (void)layoutSubviews { %orig; TagControl(self); }
 - (void)setOnTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig((gMaster && gOn[AACFill]) ? gColor[AACFill] : c);
 }
 - (UIColor *)onTintColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     if (gMaster && gOn[AACFill]) return gColor[AACFill];
     return %orig;
 }
 - (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig;
     TagControl(self);
     if (gMaster && gOn[AACFill] && OnMain()) self.onTintColor = gColor[AACFill];
@@ -1405,22 +1492,32 @@ static void Setup(UIWindow *w) {
 
 %hook UIColor
 + (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     return RemapRGBA(r, g, b, a) ?: %orig;
 }
 + (UIColor *)colorWithDisplayP3Red:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     return RemapRGBA(r, g, b, a) ?: %orig;
 }
 // KHÔNG trả về object khác trong init (gây crash Facebook) -> chỉ thay số liệu rồi gọi %orig
 - (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     CGFloat nr = r, ng = g, nb = b, na = a;
     if (RemapComps(&nr, &ng, &nb, &na)) return %orig(nr, ng, nb, na);
     return %orig;
 }
 + (UIColor *)systemBlueColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     if (gMaster && gOn[AACIcon] && gColor[AACIcon]) return gColor[AACIcon];
     return %orig;
 }
 + (UIColor *)linkColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
     if (gMaster && gOn[AACText] && gColor[AACText]) return gColor[AACText];
     return %orig;
 }
@@ -1430,6 +1527,8 @@ static void Setup(UIWindow *w) {
 %hook CALayer
 // Facebook/Messenger (Components/ASDK) vẽ icon thẳng vào layer.contents bằng CGImage
 - (void)setContents:(id)contents {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     if (gInContents) { %orig; return; }
     if (objc_getAssociatedObject(self, kContentsSrc))
         objc_setAssociatedObject(self, kContentsSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1458,6 +1557,8 @@ static void Setup(UIWindow *w) {
 %group AACPending
 %hook CALayer
 - (void)layoutSublayers {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
     %orig;
     if (gHasPend && OnMain()) PendingRun(self);
 }
@@ -1501,45 +1602,25 @@ static void InstallEH(int n) {
     if (n < 4) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ InstallEH(n + 1); });
 }
 
-static NSString *gPendingCrash;
-
 static NSString *SigPathStr(void) { return gSigPath[0] ? [NSString stringWithUTF8String:gSigPath] : nil; }
 
-// Lấy nội dung crash (NSException + signal) rồi XOÁ NGAY nguồn, để nếu việc hiện thông báo lại crash thì không bị lặp vô hạn
-static NSString *TakePendingCrash(void) {
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    NSString *t = [d stringForKey:kCrashKey];
+// Nội dung crash lần trước (NSException + signal). KHÔNG tự hiện popup khi mở app
+// (popup lúc khởi động có thể làm Facebook crash lại -> vòng lặp crash). Xem trong bảng cài đặt (3 ngón).
+static NSString *PeekCrash(void) {
+    NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kCrashKey];
     NSString *sp = SigPathStr();
     NSString *sg = sp ? [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:nil] : nil;
     if (!t.length && !sg.length) return nil;
-    [d removeObjectForKey:kCrashKey];
-    if (sp) [NSFileManager.defaultManager removeItemAtPath:sp error:nil];
     NSMutableString *m = [NSMutableString new];
     if (t.length) [m appendFormat:@"[NSException]\n%@\n", t];
     if (sg.length) [m appendFormat:@"[Signal]\n%@\n", sg];
     return m;
 }
 
-static BOOL ShowCrashReport(NSString *text) {
-    if (gPanelShown) return NO;
-    UIViewController *top = TopVC();
-    if (VCBusy(top)) return NO;
-    NSString *shown = text.length > 1800 ? [text substringToIndex:1800] : text;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Lỗi crash lần trước"
-        message:shown preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Sao chép" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIPasteboard.generalPasteboard.string = text;
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-    [top presentViewController:ac animated:YES completion:nil];
-    return YES;
-}
-
-static void CrashReportTick(int n) {
-    if (!gPendingCrash) gPendingCrash = TakePendingCrash();
-    if (!gPendingCrash.length) return;
-    if (ShowCrashReport(gPendingCrash)) { gPendingCrash = nil; return; }
-    if (n < 10) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(n + 1); });
+static void ClearCrash(void) {
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:kCrashKey];
+    NSString *sp = SigPathStr();
+    if (sp) [NSFileManager.defaultManager removeItemAtPath:sp error:nil];
 }
 
 %ctor {
@@ -1549,7 +1630,6 @@ static void CrashReportTick(int n) {
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
         InstallSignals();
         InstallEH(0);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(0); });
         gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
