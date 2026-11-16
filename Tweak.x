@@ -449,7 +449,8 @@ static void MarkFill(CALayer *l, UIView *v) {
     if (!objc_getAssociatedObject(l, kFill)) {
         objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         gFillCount++;
-        if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
+        if (gSafe) v = nil;
+        else if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
         __weak UIView *wv = v;
         dispatch_async(dispatch_get_main_queue(), ^{
             FixUnderFill(l, 0);
@@ -504,6 +505,8 @@ static void TagControl(UIView *v) {
 }
 
 static void SetOwner(UIView *v) {
+    // Facebook: không lưu weak tới view (một số lớp view, vd. của ô tìm kiếm, không cho phép weak reference -> crash)
+    if (gSafe) return;
     CALayer *l = v.layer;
     if (objc_getAssociatedObject(l, kOwner)) return;
     AACWeak *w = [AACWeak new];
@@ -824,10 +827,14 @@ static void TabLabelFix(UILabel *lb) {
 
 #pragma mark - Bảng cài đặt
 
-static UIViewController *TopVC(UIWindow *w) {
-    UIViewController *v = w.rootViewController;
-    while (v.presentedViewController) v = v.presentedViewController;
-    return v;
+// Bảng cài đặt được hiện trong một UIWindow riêng (không present lên view controller của Facebook,
+// vì VC của Facebook có thể đang chuyển cảnh / bị app hook -> crash)
+static UIWindow *gPanelWin;
+
+static void ClosePanelWindow(void) {
+    UIWindow *w = gPanelWin;
+    gPanelWin = nil;
+    if (w) w.hidden = YES;
 }
 
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
@@ -846,7 +853,7 @@ static UIViewController *TopVC(UIWindow *w) {
     self.tableView.estimatedRowHeight = 56;
 }
 
-- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)close { [self dismissViewControllerAnimated:YES completion:^{ ClosePanelWindow(); }]; }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
@@ -927,7 +934,7 @@ static UIViewController *TopVC(UIWindow *w) {
 - (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc { [self saveColor:vc.selectedColor]; }
 @end
 
-@interface AACHelper : NSObject <UIGestureRecognizerDelegate>
+@interface AACHelper : NSObject <UIGestureRecognizerDelegate, UIAdaptivePresentationControllerDelegate>
 + (instancetype)shared;
 @end
 
@@ -942,17 +949,34 @@ static UIViewController *TopVC(UIWindow *w) {
     return YES;
 }
 
+- (void)presentationControllerDidDismiss:(UIPresentationController *)pc {
+    ClosePanelWindow();
+}
+
 - (void)onLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    UIWindow *win = (UIWindow *)g.view;
-    UIViewController *top = TopVC(win);
-    if (!top) return;
-    if ([top isKindOfClass:UINavigationController.class] &&
-        [((UINavigationController *)top).viewControllers.firstObject isKindOfClass:AACSettingsVC.class]) return;
-    if ([top isKindOfClass:UIAlertController.class] || [top isKindOfClass:UIColorPickerViewController.class]) return;
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [top presentViewController:nav animated:YES completion:nil];
+    if (gPanelWin) return;
+    UIWindowScene *scene = ((UIWindow *)g.view).windowScene;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gPanelWin) return;
+        @try {
+            UIWindow *w = scene ? [[UIWindow alloc] initWithWindowScene:scene]
+                                : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+            w.windowLevel = UIWindowLevelAlert + 1;
+            w.backgroundColor = UIColor.clearColor;
+            UIViewController *host = [UIViewController new];
+            host.view.backgroundColor = UIColor.clearColor;
+            w.rootViewController = host;
+            gPanelWin = w;
+            [w makeKeyAndVisible];
+            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
+            nav.modalPresentationStyle = UIModalPresentationPageSheet;
+            nav.presentationController.delegate = [AACHelper shared];
+            [host presentViewController:nav animated:YES completion:nil];
+        } @catch (NSException *e) {
+            ClosePanelWindow();
+        }
+    });
 }
 @end
 
