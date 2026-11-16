@@ -1296,11 +1296,81 @@ static BOOL IsFacebookFamily(void) {
            [exe isEqualToString:@"facebook"] || [exe isEqualToString:@"messenger"];
 }
 
+#pragma mark - Ghi lỗi crash (NSException) để xem lần mở app sau
+
+static NSString *const kCrashKey = @"AccentColorAll_LastCrash";
+static NSUncaughtExceptionHandler *gPrevEH;
+
+static void AACExceptionHandler(NSException *e) {
+    @try {
+        NSMutableString *t = [NSMutableString stringWithFormat:@"%@: %@\n", e.name, e.reason];
+        for (NSString *l in e.callStackSymbols) {
+            [t appendFormat:@"%@\n", l];
+            if (t.length > 6000) break;
+        }
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        [d setObject:t forKey:kCrashKey];
+        [d synchronize];
+    } @catch (__unused id x) {}
+    if (gPrevEH) gPrevEH(e);
+}
+
+// Facebook có thể tự đặt handler của nó sau khi app khởi động -> đặt lại vài lần, vẫn gọi handler cũ
+static void InstallEH(int n) {
+    NSUncaughtExceptionHandler *cur = NSGetUncaughtExceptionHandler();
+    if (cur != AACExceptionHandler) {
+        gPrevEH = cur;
+        NSSetUncaughtExceptionHandler(AACExceptionHandler);
+    }
+    if (n < 4) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ InstallEH(n + 1); });
+}
+
+static BOOL ShowCrashReport(NSString *text) {
+    if (gPanelWin) return NO;
+    UIWindowScene *scene = nil;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if ([sc isKindOfClass:UIWindowScene.class] && sc.activationState == UISceneActivationStateForegroundActive) {
+            scene = (UIWindowScene *)sc;
+            break;
+        }
+    }
+    if (!scene) return NO;
+    UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+    w.windowLevel = UIWindowLevelAlert + 1;
+    UIViewController *host = [UIViewController new];
+    host.view.backgroundColor = UIColor.clearColor;
+    w.rootViewController = host;
+    gPanelWin = w;
+    [w makeKeyAndVisible];
+    NSString *shown = text.length > 1200 ? [text substringToIndex:1200] : text;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Lỗi crash lần trước"
+        message:shown preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Sao chép" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIPasteboard.generalPasteboard.string = text;
+        ClosePanelWindow();
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        ClosePanelWindow();
+    }]];
+    [host presentViewController:ac animated:YES completion:nil];
+    return YES;
+}
+
+static void CrashReportTick(int n) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSString *t = [d stringForKey:kCrashKey];
+    if (!t.length) return;
+    if (ShowCrashReport(t)) { [d removeObjectForKey:kCrashKey]; return; }
+    if (n < 6) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(n + 1); });
+}
+
 %ctor {
     @autoreleasepool {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
+        InstallEH(0);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(0); });
         gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
