@@ -7,10 +7,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-#define AAC_CONTENTS_HOOK 0
+#define AAC_CONTENTS_HOOK 1
 
-//   0 = present lên view controller trên cùng của app (mặc định, cách phổ biến của tweak Facebook/Instagram)
-//   1 = cửa sổ UIWindow riêng (cách cũ, dễ crash trên Facebook)
 #define AAC_PANEL_OWN_WINDOW 0
 
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
@@ -31,9 +29,9 @@ static const void *kBlueOut     = &kBlueOut;
 static const void *kBlueStamp   = &kBlueStamp;
 static const void *kBlueSrc     = &kBlueSrc;
 static const void *kContentsSrc = &kContentsSrc;
-static const void *kCtl         = &kCtl;      // layer của UISwitch / UISlider / UIVisualEffectView
-static const void *kImgView     = &kImgView;  // layer của UIImageView
-static const void *kOwner       = &kOwner;    // view sở hữu layer (weak)
+static const void *kCtl         = &kCtl;
+static const void *kImgView     = &kImgView;
+static const void *kOwner       = &kOwner;
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -53,8 +51,6 @@ static int         gVersion = 0;
 static NSMutableArray *gKeep;
 static __thread BOOL gRaw;
 
-// Chống đệ quy vô hạn giữa các hook (log crash: tràn stack, các hàm hook gọi lẫn nhau).
-// Mỗi hook tăng gDepth khi chạy; nếu lồng quá sâu thì chỉ gọi hàm gốc (%orig), không làm gì thêm.
 #define AAC_MAXDEPTH 12
 static __thread int gDepth;
 static inline int  AACDepthEnter(void)      { gDepth++; return 0; }
@@ -64,15 +60,13 @@ static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
 static volatile int32_t gPending;
-static BOOL        gSafe;   // app họ Facebook (Facebook/Messenger): tắt các cơ chế dễ crash
+static BOOL        gSafe;
 
 @interface CALayer (AACPrivate)
 - (void)setContentsMultiplyColor:(CGColorRef)c;
 @end
 
 static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
-
-#pragma mark - Chẩn đoán crash (signal) - ghi backtrace ra file, lần mở app sau sẽ hiện
 
 static char gSigPath[1024];
 static char gCrumb[160];
@@ -103,7 +97,7 @@ static void InstallSignals(void) {
     ss.ss_size = 64 * 1024;
     ss.ss_sp = malloc(ss.ss_size);
     ss.ss_flags = 0;
-    if (ss.ss_sp) sigaltstack(&ss, NULL);   // để bắt cả lỗi tràn stack (đệ quy vô hạn)
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = AACSignalHandler;
@@ -114,8 +108,6 @@ static void InstallSignals(void) {
 }
 
 static void TabBarFix(UITabBar *bar);
-
-#pragma mark - Màu
 
 static UIColor *ColorFromHex(NSString *s) {
     s = [[s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] uppercaseString];
@@ -169,7 +161,6 @@ static inline int BlueClass(CGFloat r, CGFloat g, CGFloat b) {
     return 0;
 }
 
-// Đọc RGBA từ CGColor (chỉ RGB hoặc gray). Pattern / CMYK / ... -> NO (tránh crash trên Facebook)
 static BOOL CGRGBA(CGColorRef c, CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
     if (!c) return NO;
     CGColorSpaceRef cs = CGColorGetColorSpace(c);
@@ -226,19 +217,15 @@ static void RefreshCache(void) {
     gVersion++;
 }
 
-#pragma mark - Nhận diện đen / trắng / accent
-
 static BOOL IsDarkRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a, CGFloat thr) {
     return a >= 0.99 && r < thr && g < thr && b < thr;
 }
 
-// Đen thuần (dùng cho nền / nút)
 static BOOL IsBlackColor(UIColor *c) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
     if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
     return IsDarkRGBA(r, g, b, a, 0.03);
 }
-// "Mực" gần đen (#1C1E21, #050505...) dùng cho icon
 static BOOL IsInkColor(UIColor *c) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
     if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
@@ -265,7 +252,6 @@ static BOOL IsWhiteCG(CGColorRef c) {
     return CGRGBA(c, &r, &g, &b, &a) && a >= 0.99 && r > 0.97 && g > 0.97 && b > 0.97;
 }
 
-// Nền cần đổi sang accent: đen, hoặc trắng khi đang ở dark mode
 static BOOL IsFillCandidateCG(CGColorRef c) {
     return IsBlackCG(c) || (gDark && IsWhiteCG(c));
 }
@@ -291,7 +277,6 @@ static BOOL LayerUnderFill(CALayer *l) {
     return NO;
 }
 
-// Màu icon: nằm trên nền accent (badge "+", nút...) -> trắng, còn lại -> accent
 static CGColorRef IconShapeColor(CALayer *l) {
     if (gCGWhite && LayerUnderFill(l.superlayer)) return gCGWhite;
     return CGFor(AACIcon, NO);
@@ -331,8 +316,6 @@ static UIColor *RemapRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
     return res;
 }
 
-// Dùng cho hook -initWithRed:... : chỉ thay thành phần màu, KHÔNG trả về object khác
-// (trả object khác từ init làm crash Facebook vì màu xanh FB dùng khắp nơi)
 static BOOL RemapComps(CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
     if (gRaw || !gMaster || !gOn[AACFill]) return NO;
     int cls = BlueClass(*r, *g, *b);
@@ -343,9 +326,6 @@ static BOOL RemapComps(CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
     return YES;
 }
 
-#pragma mark - Ảnh / contents
-
-// 1 = icon đen đơn sắc, 0 = không, -1 = bị giới hạn tốc độ (chưa kết luận)
 static int CGImageIsBlackMono(CGImageRef cg) {
     if (!cg) return 0;
     static CFAbsoluteTime winStart; static int winCount;
@@ -371,7 +351,6 @@ static int CGImageIsBlackMono(CGImageRef cg) {
             int mxc = MAX(px[0], MAX(px[1], px[2]));
             if (mxc * 100 > 30 * px[3]) { bad++; break; }
         }
-        // Icon đen thường là nét mảnh (<= ~62% diện tích). Ảnh đen đặc/avatar thì bỏ qua.
         res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62) ? 1 : 0;
     }
     return res;
@@ -387,7 +366,6 @@ static BOOL ImageIsBlackMono(UIImage *img) {
     return r == 1;
 }
 
-// Tô CGImage (giữ alpha) bằng một màu
 static CGImageRef CopyTintedCG(CGImageRef src, CGColorRef color) {
     if (!src || !color) return NULL;
     size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
@@ -407,7 +385,6 @@ static CGImageRef CopyTintedCG(CGImageRef src, CGColorRef color) {
     return out;
 }
 
-// Tô lại layer.contents (icon Facebook/Messenger vẽ bằng CGImage, không qua UIImageView)
 static void ReapplyContents(CALayer *l) {
     id src = objc_getAssociatedObject(l, kContentsSrc);
     if (!src || !OnMain()) return;
@@ -418,8 +395,6 @@ static void ReapplyContents(CALayer *l) {
     gInContents = NO;
     CGImageRelease(t);
 }
-
-#pragma mark - Refresh
 
 static void RefreshLayerTree(CALayer *l, int depth) {
     if (depth > 40) return;
@@ -468,9 +443,6 @@ static void ApplyAll(void) {
     }
 }
 
-#pragma mark - Hỗ trợ hook
-
-// Sau khi một layer trở thành nền accent: các icon con (dấu "+" ...) phải đổi sang trắng
 static void FixUnderFill(CALayer *l, int depth) {
     if (!l || depth > 6) return;
     for (CALayer *s in [l.sublayers copy]) {
@@ -505,7 +477,6 @@ static void MarkFill(CALayer *l, UIView *v) {
     if (!objc_getAssociatedObject(l, kFill)) {
         objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         gFillCount++;
-        // Facebook: tuyệt đối không tạo __weak tới view (nhiều lớp view của FB/ô tìm kiếm cấm weak reference -> crash)
         if (gSafe) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 FixUnderFill(l, 0);
@@ -530,14 +501,12 @@ static BOOL UnderFill(UIView *v) {
     return NO;
 }
 
-// Tránh đổi nhầm núm trắng của UISwitch / UISlider (không dùng layer.delegate: có thể là con trỏ treo)
 static BOOL InControlKnob(CALayer *l) {
     for (int i = 0; i < 8 && l; i++, l = l.superlayer)
         if (objc_getAssociatedObject(l, kCtl)) return YES;
     return NO;
 }
 
-// ---- Liquid Glass (iOS 26): không tô đè lên UISwitch / UISlider / lớp glass / backdrop ----
 static BOOL GlassName(NSString *cn) {
     return [cn containsString:@"Glass"] || [cn containsString:@"Backdrop"] ||
            [cn containsString:@"Material"] || [cn containsString:@"VisualEffect"] ||
@@ -548,6 +517,14 @@ static BOOL InGlassLayer(CALayer *l) {
     for (int i = 0; i < 8 && l; i++, l = l.superlayer) {
         if (objc_getAssociatedObject(l, kCtl)) return YES;
         if (GlassName(NSStringFromClass(l.class))) return YES;
+    }
+    return NO;
+}
+
+static BOOL InBackdropLayer(CALayer *l) {
+    for (int i = 0; i < 3 && l; i++, l = l.superlayer) {
+        NSString *cn = NSStringFromClass(l.class);
+        if ([cn containsString:@"Backdrop"] || [cn containsString:@"UISwitch"]) return YES;
     }
     return NO;
 }
@@ -567,7 +544,6 @@ static void TagControl(UIView *v) {
 }
 
 static void SetOwner(UIView *v) {
-    // Facebook: không lưu weak tới view (một số lớp view, vd. của ô tìm kiếm, không cho phép weak reference -> crash)
     if (gSafe) return;
     CALayer *l = v.layer;
     if (objc_getAssociatedObject(l, kOwner)) return;
@@ -576,7 +552,6 @@ static void SetOwner(UIView *v) {
     objc_setAssociatedObject(l, kOwner, w, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-// Avatar: view bo tròn + cắt theo bounds -> không đụng vào ảnh bên trong
 static BOOL LooksLikeAvatarView(UIView *v) {
     if (!v) return NO;
     CALayer *l = v.layer;
@@ -590,9 +565,7 @@ static void TryBlack(CALayer *l) {
     if (!gOn[AACFill] || !OnMain()) return;
     if (InGlassLayer(l)) return;
     CGSize sz = l.bounds.size;
-    // Không đổi nền của UIImageView / layer đang hiển thị ảnh
     if (l.contents || objc_getAssociatedObject(l, kImgView)) return;
-    // Avatar tròn lớn thì bỏ qua; nhưng badge tròn nhỏ (dấu "+" của Threads ~ 16-24pt) thì vẫn đổi
     BOOL round = sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45;
     if (round && sz.width >= 40) return;
     BOOL nested = LayerUnderFill(l.superlayer);
@@ -607,7 +580,6 @@ static void TryBlack(CALayer *l) {
     }
 }
 
-// Label nằm trong nút đã đổi accent mà vẫn giữ nền đen/trắng -> làm trong suốt
 static void FixLabelBG(UILabel *lb) {
     if (!gMaster || !gOn[AACFill] || !OnMain()) return;
     UIColor *bg = lb.backgroundColor;
@@ -705,7 +677,6 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
         RunCheck(l, shape);
         if (CheckDone(l, shape)) return;
     }
-    // Facebook: không giữ layer trong hash table / không chạy async (nguồn crash khi chuyển trang)
     if (gSafe) return;
     AddPending(l, shape);
     if (gPending > 96) return;
@@ -717,7 +688,7 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
 }
 
 static UIImage *IconRemapImage(UIImage *img) {
-    if (!img || gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
     CGSize sz = img.size;
     if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return img;
@@ -725,7 +696,6 @@ static UIImage *IconRemapImage(UIImage *img) {
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
-// Ảnh/symbol đã được tô sẵn màu xanh (palette/hierarchical hoặc PNG) -> tô lại theo accent
 static UIImage *BlueImageRemap(UIImage *img) {
     if (!img || gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (objc_getAssociatedObject(img, kBlueSrc) || objc_getAssociatedObject(img, kAccentSrc)) return img;
@@ -828,8 +798,6 @@ static UIColor *IconTintFix(UIColor *c) {
     return c;
 }
 
-#pragma mark - Tab bar
-
 static BOOL InTabBar(UIView *v) {
     for (int i = 0; i < 10 && v; i++, v = v.superview)
         if ([v isKindOfClass:UITabBar.class]) return YES;
@@ -879,7 +847,6 @@ static void TabBarFixLater(UITabBar *bar) {
     dispatch_async(dispatch_get_main_queue(), ^{ TabBarFix(bar); });
 }
 
-// Chữ dưới tab bar (tab chưa chọn đang màu đen) -> màu accent
 static void TabLabelFix(UILabel *lb) {
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
     if (lb.textColor == gColor[AACIcon]) return;
@@ -887,14 +854,7 @@ static void TabLabelFix(UILabel *lb) {
     lb.textColor = gColor[AACIcon];
 }
 
-#pragma mark - Bảng cài đặt
-
-// FIX CRASH (Facebook, nhấn 3 ngón -> mở cài đặt):
-//  - Mặc định (AAC_PANEL_OWN_WINDOW = 0): present bảng lên view controller trên cùng của app, KHÔNG tạo UIWindow mới
-//    và KHÔNG đổi key window. Chỉ present khi VC đó đã ổn định (không đang chuyển cảnh / present / dismiss),
-//    nếu chưa thì thử lại tối đa 8 lần mỗi 0.3s.
-//  - Chống bấm trùng, trì hoãn 0.25s để không đè lên animation / bàn phím của màn hình tìm kiếm.
-static UIWindow *gPanelWin;      // chỉ dùng khi AAC_PANEL_OWN_WINDOW = 1
+static UIWindow *gPanelWin;
 static BOOL      gPanelShown;
 static BOOL      gPanelPending;
 
@@ -918,7 +878,6 @@ static BOOL VCBusy(UIViewController *vc) {
     return NO;
 }
 
-// View controller trên cùng của cửa sổ chính (bỏ qua bàn phím / cửa sổ hệ thống / cửa sổ của tweak)
 static UIViewController *TopVC(void) {
     UIWindow *best = nil;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -1089,7 +1048,6 @@ static void ClearCrash(void);
 @end
 
 #if AAC_PANEL_OWN_WINDOW
-// Cách cũ: cửa sổ riêng
 static void ShowPanelOwnWindow(UIWindowScene *scene) {
     gPanelPending = NO;
     if (gPanelWin || !scene) return;
@@ -1116,7 +1074,6 @@ static void ShowPanelOwnWindow(UIWindowScene *scene) {
     }
 }
 #else
-// Present lên view controller trên cùng
 static void ShowPanel(int attempt) {
     if (gPanelShown) { gPanelPending = NO; return; }
     Crumb("ShowPanel:begin");
@@ -1212,8 +1169,6 @@ static void Setup(UIWindow *w) {
     }
 }
 
-#pragma mark - Hook
-
 %hook UIWindow
 - (void)makeKeyAndVisible { %orig; Setup(self); }
 - (void)becomeKeyWindow { %orig; Setup(self); }
@@ -1247,7 +1202,7 @@ static void Setup(UIWindow *w) {
     if (!OnMain()) { UIColor *m = ColorRemap(c, AACFill, NULL); %orig(m ?: c); return; }
     int cls = 0;
     UIColor *n = ColorRemap(c, AACFill, &cls);
-    if (n && cls == 2 && InGlassLayer(self.layer)) n = nil;   // highlight xanh nhạt của glass: giữ nguyên
+    if (n && cls == 2 && InGlassLayer(self.layer)) n = nil;
     %orig(n ?: c);
     if (n && cls == 1) MarkFill(self.layer, self);
     else if (!n && gOn[AACFill] && IsFillCandidateColor(c)) { SetOwner(self); ScheduleCheck(self.layer, NO); }
@@ -1274,7 +1229,6 @@ static void Setup(UIWindow *w) {
     %orig;
     if (gMaster && gOn[AACFill] && IsBlackCG(c)) ScheduleCheck(self, NO);
 }
-// SwiftUI tô symbol/template image bằng contentsMultiplyColor
 - (void)setContentsMultiplyColor:(CGColorRef)c {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
@@ -1300,7 +1254,6 @@ static void Setup(UIWindow *w) {
     %orig(n ?: c);
 }
 %end
-
 
 %hook CAShapeLayer
 - (void)setFillColor:(CGColorRef)c {
@@ -1501,7 +1454,6 @@ static void Setup(UIWindow *w) {
     AAC_DEPTH_SCOPE;
     return RemapRGBA(r, g, b, a) ?: %orig;
 }
-// KHÔNG trả về object khác trong init (gây crash Facebook) -> chỉ thay số liệu rồi gọi %orig
 - (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
@@ -1525,7 +1477,6 @@ static void Setup(UIWindow *w) {
 
 %group AACContents
 %hook CALayer
-// Facebook/Messenger (Components/ASDK) vẽ icon thẳng vào layer.contents bằng CGImage
 - (void)setContents:(id)contents {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
@@ -1541,9 +1492,9 @@ static void Setup(UIWindow *w) {
     BOOL skip = objc_getAssociatedObject(self, kImgView) || [self isKindOfClass:CAShapeLayer.class] ||
                 (self.masksToBounds && self.cornerRadius > 0) ||
                 w < 8 || h < 8 || w > 192 || h > 192 ||
-                s.width > 40 || s.height > 40 ||
-                (double)MIN(w, h) / (double)MAX(w, h) < 0.6;   // icon vuông, bỏ qua chữ/ảnh dẹt
-    if (skip || InGlassLayer(self) || CGImageIsBlackMono(cg) != 1) { %orig; return; }
+                s.width > 48 || s.height > 48 ||
+                (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
+    if (skip || InBackdropLayer(self) || CGImageIsBlackMono(cg) != 1) { %orig; return; }
 
     CGImageRef t = CopyTintedCG(cg, IconShapeColor(self));
     if (!t) { %orig; return; }
@@ -1573,8 +1524,6 @@ static BOOL IsFacebookFamily(void) {
            [exe isEqualToString:@"facebook"] || [exe isEqualToString:@"messenger"];
 }
 
-#pragma mark - Ghi lỗi crash (NSException) để xem lần mở app sau
-
 static NSString *const kCrashKey = @"AccentColorAll_LastCrash";
 static NSUncaughtExceptionHandler *gPrevEH;
 
@@ -1592,7 +1541,6 @@ static void AACExceptionHandler(NSException *e) {
     if (gPrevEH) gPrevEH(e);
 }
 
-// Facebook có thể tự đặt handler của nó sau khi app khởi động -> đặt lại vài lần, vẫn gọi handler cũ
 static void InstallEH(int n) {
     NSUncaughtExceptionHandler *cur = NSGetUncaughtExceptionHandler();
     if (cur != AACExceptionHandler) {
@@ -1604,8 +1552,6 @@ static void InstallEH(int n) {
 
 static NSString *SigPathStr(void) { return gSigPath[0] ? [NSString stringWithUTF8String:gSigPath] : nil; }
 
-// Nội dung crash lần trước (NSException + signal). KHÔNG tự hiện popup khi mở app
-// (popup lúc khởi động có thể làm Facebook crash lại -> vòng lặp crash). Xem trong bảng cài đặt (3 ngón).
 static NSString *PeekCrash(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kCrashKey];
     NSString *sp = SigPathStr();
