@@ -1,8 +1,21 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
 
+// Bật hook vẽ lại icon trong layer.contents (Messenger của Facebook). Mặc định TẮT để loại trừ nguyên nhân crash.
+// Khi Facebook đã ổn định thì đổi thành 1 để thử.
 #define AAC_CONTENTS_HOOK 0
+
+// Cách hiện bảng cài đặt:
+//   0 = present lên view controller trên cùng của app (mặc định, cách phổ biến của tweak Facebook/Instagram)
+//   1 = cửa sổ UIWindow riêng (cách cũ, dễ crash trên Facebook)
+#define AAC_PANEL_OWN_WINDOW 0
 
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
 
@@ -54,6 +67,47 @@ static BOOL        gSafe;   // app họ Facebook (Facebook/Messenger): tắt cá
 @end
 
 static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
+
+#pragma mark - Chẩn đoán crash (signal) - ghi backtrace ra file, lần mở app sau sẽ hiện
+
+static char gSigPath[1024];
+static char gCrumb[160];
+static void Crumb(const char *s) { if (s) strlcpy(gCrumb, s, sizeof gCrumb); }
+
+static void AACSignalHandler(int sig) {
+    if (gSigPath[0]) {
+        int fd = open(gSigPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            char head[320];
+            int n = snprintf(head, sizeof head, "signal %d\nbuoc cuoi: %s\n", sig, gCrumb);
+            if (n > 0) write(fd, head, (size_t)n);
+            void *bt[40];
+            int c = backtrace(bt, 40);
+            backtrace_symbols_fd(bt, c, fd);
+            close(fd);
+        }
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void InstallSignals(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+    const char *path = [dir stringByAppendingPathComponent:@"aac_signal.txt"].fileSystemRepresentation;
+    if (path) strlcpy(gSigPath, path, sizeof gSigPath);
+    static stack_t ss;
+    ss.ss_size = 64 * 1024;
+    ss.ss_sp = malloc(ss.ss_size);
+    ss.ss_flags = 0;
+    if (ss.ss_sp) sigaltstack(&ss, NULL);   // để bắt cả lỗi tràn stack (đệ quy vô hạn)
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = AACSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_ONSTACK;
+    int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+}
 
 static void TabBarFix(UITabBar *bar);
 
@@ -831,29 +885,67 @@ static void TabLabelFix(UILabel *lb) {
 
 #pragma mark - Bảng cài đặt
 
-// Bảng cài đặt được hiện trong một UIWindow riêng (không present lên view controller của Facebook,
-// vì VC của Facebook có thể đang chuyển cảnh / bị app hook -> crash)
-//
-// FIX CRASH (Facebook, màn hình tìm kiếm + nhấn 3 ngón):
-//  - Trên Facebook KHÔNG makeKeyAndVisible cho cửa sổ của tweak. Việc cướp key window khi ô tìm kiếm
-//    đang là first responder (bàn phím đang hiện) làm Facebook xử lý resign/become key giữa chừng -> crash.
-//    Chỉ hiện cửa sổ (hidden = NO); chạm vẫn nhận bình thường vì cửa sổ nằm trên cùng.
-//  - Trì hoãn việc hiện bảng 0.2s + present ở lượt runloop kế tiếp, tránh trùng với animation/layout của FB.
-//  - Chống bấm trùng (gPanelPending), tìm scene foreground nếu g.view không có windowScene.
-//  - Không bao giờ tạo UIWindow bằng initWithFrame (iOS 13+ có scene sẽ crash).
-static UIWindow *gPanelWin;
+// FIX CRASH (Facebook, nhấn 3 ngón -> mở cài đặt):
+//  - Mặc định (AAC_PANEL_OWN_WINDOW = 0): present bảng lên view controller trên cùng của app, KHÔNG tạo UIWindow mới
+//    và KHÔNG đổi key window. Chỉ present khi VC đó đã ổn định (không đang chuyển cảnh / present / dismiss),
+//    nếu chưa thì thử lại tối đa 8 lần mỗi 0.3s.
+//  - Chống bấm trùng, trì hoãn 0.25s để không đè lên animation / bàn phím của màn hình tìm kiếm.
+static UIWindow *gPanelWin;      // chỉ dùng khi AAC_PANEL_OWN_WINDOW = 1
+static BOOL      gPanelShown;
 static BOOL      gPanelPending;
 
 static void ClosePanelWindow(void) {
+    gPanelShown = NO;
+    gPanelPending = NO;
     UIWindow *w = gPanelWin;
     gPanelWin = nil;
-    gPanelPending = NO;
     if (w) {
         w.hidden = YES;
         w.rootViewController = nil;
     }
 }
 
+static BOOL VCBusy(UIViewController *vc) {
+    if (!vc) return YES;
+    if (!vc.viewIfLoaded.window) return YES;
+    if (vc.isBeingPresented || vc.isBeingDismissed || vc.isMovingToParentViewController || vc.isMovingFromParentViewController) return YES;
+    if (vc.transitionCoordinator != nil) return YES;
+    if ([vc isKindOfClass:UIAlertController.class]) return YES;
+    return NO;
+}
+
+// View controller trên cùng của cửa sổ chính (bỏ qua bàn phím / cửa sổ hệ thống / cửa sổ của tweak)
+static UIViewController *TopVC(void) {
+    UIWindow *best = nil;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:UIWindowScene.class]) continue;
+        if (sc.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
+            if (w == gPanelWin || w.hidden || w.windowLevel != UIWindowLevelNormal || !w.rootViewController) continue;
+            if (w.isKeyWindow) { best = w; break; }
+            if (!best) best = w;
+        }
+        if (best && best.isKeyWindow) break;
+    }
+    UIViewController *vc = best.rootViewController;
+    for (int i = 0; i < 20 && vc; i++) {
+        UIViewController *next = nil;
+        UIViewController *pr = vc.presentedViewController;
+        if (pr && !pr.isBeingDismissed) next = pr;
+        else if ([vc isKindOfClass:UINavigationController.class]) {
+            UIViewController *vis = ((UINavigationController *)vc).visibleViewController;
+            if (vis && vis != vc) next = vis;
+        } else if ([vc isKindOfClass:UITabBarController.class]) {
+            UIViewController *sel = ((UITabBarController *)vc).selectedViewController;
+            if (sel && sel != vc) next = sel;
+        }
+        if (!next) break;
+        vc = next;
+    }
+    return vc;
+}
+
+#if AAC_PANEL_OWN_WINDOW
 static UIWindowScene *ActiveScene(void) {
     UIWindowScene *fallback = nil;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -863,11 +955,7 @@ static UIWindowScene *ActiveScene(void) {
     }
     return fallback;
 }
-
-static void ShowPanelWindowKey(UIWindow *w) {
-    if (gSafe) w.hidden = NO;       // Facebook: không cướp key window
-    else [w makeKeyAndVisible];
-}
+#endif
 
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
@@ -878,6 +966,7 @@ static void ShowPanelWindowKey(UIWindow *w) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    Crumb("settingsVC:viewDidLoad");
     self.title = @"Màu nhấn";
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
@@ -943,8 +1032,6 @@ static void ShowPanelWindowKey(UIWindow *w) {
         if (col) [ws saveColor:col];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
-    // Chỉ khi người dùng thật sự muốn gõ mã màu mới cần key window (để bàn phím gõ vào alert)
-    if (gSafe) [self.view.window makeKeyWindow];
     [self presentViewController:ac animated:YES completion:nil];
 }
 
@@ -972,8 +1059,9 @@ static void ShowPanelWindowKey(UIWindow *w) {
 + (instancetype)shared;
 @end
 
-// Hiện bảng cài đặt trong cửa sổ riêng
-static void ShowPanel(UIWindowScene *scene) {
+#if AAC_PANEL_OWN_WINDOW
+// Cách cũ: cửa sổ riêng
+static void ShowPanelOwnWindow(UIWindowScene *scene) {
     gPanelPending = NO;
     if (gPanelWin || !scene) return;
     @try {
@@ -984,23 +1072,50 @@ static void ShowPanel(UIWindowScene *scene) {
         host.view.backgroundColor = UIColor.clearColor;
         w.rootViewController = host;
         gPanelWin = w;
-        ShowPanelWindowKey(w);
+        gPanelShown = YES;
+        if (gSafe) w.hidden = NO; else [w makeKeyAndVisible];
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
         nav.modalPresentationStyle = UIModalPresentationPageSheet;
         nav.presentationController.delegate = [AACHelper shared];
-        // present ở lượt runloop kế tiếp, sau khi cửa sổ đã layout xong
         dispatch_async(dispatch_get_main_queue(), ^{
             if (gPanelWin != w) return;
-            @try {
-                [host presentViewController:nav animated:YES completion:nil];
-            } @catch (NSException *e) {
-                ClosePanelWindow();
-            }
+            @try { [host presentViewController:nav animated:YES completion:nil]; }
+            @catch (NSException *e) { ClosePanelWindow(); }
         });
     } @catch (NSException *e) {
         ClosePanelWindow();
     }
 }
+#else
+// Present lên view controller trên cùng
+static void ShowPanel(int attempt) {
+    if (gPanelShown) { gPanelPending = NO; return; }
+    Crumb("ShowPanel:begin");
+    UIViewController *top = TopVC();
+    if (VCBusy(top)) {
+        if (attempt < 8) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                ShowPanel(attempt + 1);
+            });
+        } else {
+            gPanelPending = NO;
+        }
+        return;
+    }
+    @try {
+        Crumb("ShowPanel:create");
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        nav.presentationController.delegate = [AACHelper shared];
+        gPanelShown = YES;
+        gPanelPending = NO;
+        Crumb("ShowPanel:present");
+        [top presentViewController:nav animated:YES completion:^{ Crumb("ShowPanel:presented"); }];
+    } @catch (NSException *e) {
+        ClosePanelWindow();
+    }
+}
+#endif
 
 @implementation AACHelper
 + (instancetype)shared {
@@ -1019,17 +1134,23 @@ static void ShowPanel(UIWindowScene *scene) {
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    if (gPanelWin || gPanelPending) return;
+    if (gPanelShown || gPanelWin || gPanelPending) return;
+    Crumb("onLongPress");
+    gPanelPending = YES;
+#if AAC_PANEL_OWN_WINDOW
     UIWindowScene *scene = nil;
     UIView *gv = g.view;
     if ([gv isKindOfClass:UIWindow.class]) scene = ((UIWindow *)gv).windowScene;
     if (!scene) scene = ActiveScene();
-    if (!scene) return;
-    gPanelPending = YES;
-    // Trì hoãn một chút: tránh trùng với animation / layout / bàn phím của màn hình tìm kiếm Facebook
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ShowPanel(scene);
+    if (!scene) { gPanelPending = NO; return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ShowPanelOwnWindow(scene);
     });
+#else
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ShowPanel(0);
+    });
+#endif
 }
 @end
 
@@ -1380,43 +1501,45 @@ static void InstallEH(int n) {
     if (n < 4) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ InstallEH(n + 1); });
 }
 
+static NSString *gPendingCrash;
+
+static NSString *SigPathStr(void) { return gSigPath[0] ? [NSString stringWithUTF8String:gSigPath] : nil; }
+
+// Lấy nội dung crash (NSException + signal) rồi XOÁ NGAY nguồn, để nếu việc hiện thông báo lại crash thì không bị lặp vô hạn
+static NSString *TakePendingCrash(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSString *t = [d stringForKey:kCrashKey];
+    NSString *sp = SigPathStr();
+    NSString *sg = sp ? [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:nil] : nil;
+    if (!t.length && !sg.length) return nil;
+    [d removeObjectForKey:kCrashKey];
+    if (sp) [NSFileManager.defaultManager removeItemAtPath:sp error:nil];
+    NSMutableString *m = [NSMutableString new];
+    if (t.length) [m appendFormat:@"[NSException]\n%@\n", t];
+    if (sg.length) [m appendFormat:@"[Signal]\n%@\n", sg];
+    return m;
+}
+
 static BOOL ShowCrashReport(NSString *text) {
-    if (gPanelWin) return NO;
-    UIWindowScene *scene = nil;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if ([sc isKindOfClass:UIWindowScene.class] && sc.activationState == UISceneActivationStateForegroundActive) {
-            scene = (UIWindowScene *)sc;
-            break;
-        }
-    }
-    if (!scene) return NO;
-    UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-    w.windowLevel = UIWindowLevelAlert + 1;
-    UIViewController *host = [UIViewController new];
-    host.view.backgroundColor = UIColor.clearColor;
-    w.rootViewController = host;
-    gPanelWin = w;
-    ShowPanelWindowKey(w);
-    NSString *shown = text.length > 1200 ? [text substringToIndex:1200] : text;
+    if (gPanelShown) return NO;
+    UIViewController *top = TopVC();
+    if (VCBusy(top)) return NO;
+    NSString *shown = text.length > 1800 ? [text substringToIndex:1800] : text;
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Lỗi crash lần trước"
         message:shown preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Sao chép" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         UIPasteboard.generalPasteboard.string = text;
-        ClosePanelWindow();
     }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
-        ClosePanelWindow();
-    }]];
-    [host presentViewController:ac animated:YES completion:nil];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+    [top presentViewController:ac animated:YES completion:nil];
     return YES;
 }
 
 static void CrashReportTick(int n) {
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    NSString *t = [d stringForKey:kCrashKey];
-    if (!t.length) return;
-    if (ShowCrashReport(t)) { [d removeObjectForKey:kCrashKey]; return; }
-    if (n < 6) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(n + 1); });
+    if (!gPendingCrash) gPendingCrash = TakePendingCrash();
+    if (!gPendingCrash.length) return;
+    if (ShowCrashReport(gPendingCrash)) { gPendingCrash = nil; return; }
+    if (n < 10) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(n + 1); });
 }
 
 %ctor {
@@ -1424,6 +1547,7 @@ static void CrashReportTick(int n) {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
+        InstallSignals();
         InstallEH(0);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ CrashReportTick(0); });
         gSafe = IsFacebookFamily();
