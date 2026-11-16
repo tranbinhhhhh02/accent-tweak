@@ -1,15 +1,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
-#import <string.h>
 
-// Deployment target là iOS 14 nhưng ta hook UIButtonConfiguration / UIBackgroundConfiguration (iOS 15+).
-// Class không tồn tại trên máy cũ thì Logos tự bỏ qua hook đó.
-#pragma clang diagnostic ignored "-Wunguarded-availability-new"
-#pragma clang diagnostic ignored "-Wunguarded-availability"
-
-// Bật hook vẽ lại icon trong layer.contents cho MỌI app (Messenger của Facebook). Mặc định TẮT để tránh crash.
-// Riêng bàn phím (phím return...) luôn được xử lý, không phụ thuộc cờ này.
+// Bật hook vẽ lại icon trong layer.contents (Messenger của Facebook). Mặc định TẮT để loại trừ nguyên nhân crash.
+// Khi Facebook đã ổn định thì đổi thành 1 để thử.
 #define AAC_CONTENTS_HOOK 0
 
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
@@ -33,7 +27,6 @@ static const void *kContentsSrc = &kContentsSrc;
 static const void *kCtl         = &kCtl;      // layer của UISwitch / UISlider / UIVisualEffectView
 static const void *kImgView     = &kImgView;  // layer của UIImageView
 static const void *kOwner       = &kOwner;    // view sở hữu layer (weak)
-static const void *kKbd         = &kKbd;      // layer thuộc bàn phím (UIKB*)
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -55,8 +48,6 @@ static __thread BOOL gRaw;
 static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
-static BOOL        gInKB;        // đang vẽ bên trong view của bàn phím
-static BOOL        gInKBDraw;    // chống đệ quy khi vẽ lại ảnh
 static volatile int32_t gPending;
 
 @interface CALayer (AACPrivate)
@@ -243,7 +234,7 @@ static BOOL LayerUnderFill(CALayer *l) {
     return NO;
 }
 
-// Màu icon: nằm trên nền accent (badge "+", nút gửi...) -> trắng, còn lại -> accent
+// Màu icon: nằm trên nền accent (badge "+", nút...) -> trắng, còn lại -> accent
 static CGColorRef IconShapeColor(CALayer *l) {
     if (gCGWhite && LayerUnderFill(l.superlayer)) return gCGWhite;
     return CGFor(AACIcon, NO);
@@ -371,37 +362,6 @@ static void ReapplyContents(CALayer *l) {
     CGImageRelease(t);
 }
 
-#pragma mark - Bàn phím (UIKB*)
-
-static inline BOOL IsKBClassName(const char *n) {
-    return n && (strncmp(n, "UIKB", 4) == 0 || strncmp(n, "_UIKB", 5) == 0 ||
-                 strncmp(n, "UIKeyboard", 10) == 0 || strncmp(n, "UIRemoteKeyboard", 16) == 0);
-}
-
-static BOOL InKeyboardLayer(CALayer *l) {
-    for (int i = 0; i < 10 && l; i++, l = l.superlayer)
-        if (objc_getAssociatedObject(l, kKbd)) return YES;
-    return NO;
-}
-
-static void TagKeyboard(UIView *v) {
-    if (!v) return;
-    if (IsKBClassName(object_getClassName(v)) && !objc_getAssociatedObject(v.layer, kKbd))
-        objc_setAssociatedObject(v.layer, kKbd, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-// Khi bàn phím tự vẽ ảnh (phím return, ...) bằng -[UIImage drawInRect:] thì vẽ bản đã tô accent
-static UIImage *KBTinted(UIImage *img) {
-    if (!gInKB || gInKBDraw || !img || !gMaster || !gOn[AACIcon] || !OnMain()) return nil;
-    CGSize sz = img.size;
-    if (sz.width < 6 || sz.height < 6 || sz.width > 80 || sz.height > 80) return nil;
-    if (img.images.count > 1) return nil;
-    BOOL ok = img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage || ImageIsBlackMono(img);
-    if (!ok) return nil;
-    UIColor *c = [UIColor colorWithCGColor:CGFor(AACIcon, NO)];
-    return [img imageWithTintColor:c renderingMode:UIImageRenderingModeAlwaysOriginal];
-}
-
 #pragma mark - Refresh
 
 static void RefreshLayerTree(CALayer *l, int depth) {
@@ -453,7 +413,7 @@ static void ApplyAll(void) {
 
 #pragma mark - Hỗ trợ hook
 
-// Sau khi một layer trở thành nền accent: các icon con (dấu "+", mũi tên gửi ...) phải đổi sang trắng
+// Sau khi một layer trở thành nền accent: các icon con (dấu "+" ...) phải đổi sang trắng
 static void FixUnderFill(CALayer *l, int depth) {
     if (!l || depth > 6) return;
     for (CALayer *s in [l.sublayers copy]) {
@@ -566,9 +526,9 @@ static void TryBlack(CALayer *l) {
     CGSize sz = l.bounds.size;
     // Không đổi nền của UIImageView / layer đang hiển thị ảnh
     if (l.contents || objc_getAssociatedObject(l, kImgView)) return;
-    // Avatar tròn lớn thì bỏ qua; badge "+" (~16-24pt) và nút gửi tròn (~40-48pt) thì vẫn đổi
+    // Avatar tròn lớn thì bỏ qua; nhưng badge tròn nhỏ (dấu "+" của Threads ~ 16-24pt) thì vẫn đổi
     BOOL round = sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45;
-    if (round && sz.width >= 56) return;
+    if (round && sz.width >= 40) return;
     BOOL nested = LayerUnderFill(l.superlayer);
     CGColorRef bg = l.backgroundColor;
     BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
@@ -599,12 +559,8 @@ static void TryBlackShape(CAShapeLayer *sh) {
     if (!path || CGPathIsEmpty(path)) return;
     CGRect b = CGPathGetBoundingBox(path);
     if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return;
-    // Hình tròn (nút gửi) hoặc hình chữ nhật bo dài (pill)
-    BOOL pill  = b.size.height >= 20 && b.size.height <= 64 && b.size.width >= b.size.height * 1.6;
-    BOOL disc  = b.size.height >= 28 && b.size.height <= 56 && fabs(b.size.width - b.size.height) < 2;
-    if (!pill && !disc) return;
+    if (b.size.height < 20 || b.size.height > 64 || b.size.width < b.size.height * 1.6) return;
     sh.fillColor = CGFor(AACFill, NO);
-    if (disc) MarkFill(sh, nil);
 }
 
 static void TryBlackIconShape(CAShapeLayer *sh) {
@@ -871,50 +827,6 @@ static UIViewController *TopVC(UIWindow *w) {
     return v;
 }
 
-static NSString *HexCG(CGColorRef c) {
-    if (!c) return @"nil";
-    CGFloat r, g, b, a;
-    if (!CGRGBA(c, &r, &g, &b, &a)) return @"?";
-    NSString *h = HexFromRGB(r, g, b);
-    return a < 0.99 ? [NSString stringWithFormat:@"%@@%.2f", h, a] : h;
-}
-
-static void DumpLayer(CALayer *l, int depth, NSMutableString *out) {
-    if (depth > 30 || out.length > 60000) return;
-    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
-    NSMutableString *line = [NSMutableString stringWithFormat:@"%@%@", pad, NSStringFromClass(l.class)];
-    CGRect f = l.frame;
-    [line appendFormat:@" [%.0f,%.0f %.0fx%.0f]", f.origin.x, f.origin.y, f.size.width, f.size.height];
-    if (l.cornerRadius > 0) [line appendFormat:@" cr=%.0f", l.cornerRadius];
-    if (l.backgroundColor) [line appendFormat:@" bg=%@", HexCG(l.backgroundColor)];
-    if ([l isKindOfClass:CAShapeLayer.class]) {
-        CAShapeLayer *sh = (CAShapeLayer *)l;
-        if (sh.fillColor) [line appendFormat:@" fill=%@", HexCG(sh.fillColor)];
-        if (sh.strokeColor) [line appendFormat:@" stroke=%@", HexCG(sh.strokeColor)];
-    }
-    if (l.contents) [line appendFormat:@" contents=%@", NSStringFromClass([(id)l.contents class])];
-    @try {
-        id mc = [l valueForKey:@"contentsMultiplyColor"];
-        if (mc) [line appendFormat:@" multiply=%@", HexCG((__bridge CGColorRef)mc)];
-    } @catch (__unused id e) {}
-    [out appendFormat:@"%@\n", line];
-    for (CALayer *s in [l.sublayers copy]) DumpLayer(s, depth + 1, out);
-}
-
-// Dump cả cây view (class + tintColor) để dò phím return / nút gửi
-static void DumpView(UIView *v, int depth, NSMutableString *out) {
-    if (depth > 30 || out.length > 120000) return;
-    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
-    CGRect f = v.frame;
-    [out appendFormat:@"%@V:%@ [%.0f,%.0f %.0fx%.0f]", pad, NSStringFromClass(v.class), f.origin.x, f.origin.y, f.size.width, f.size.height];
-    if ([v isKindOfClass:UIImageView.class]) {
-        UIImage *im = ((UIImageView *)v).image;
-        if (im) [out appendFormat:@" img=%.0fx%.0f mode=%ld", im.size.width, im.size.height, (long)im.renderingMode];
-    }
-    [out appendString:@"\n"];
-    for (UIView *s in [v.subviews copy]) DumpView(s, depth + 1, out);
-}
-
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
 
@@ -934,8 +846,8 @@ static void DumpView(UIView *v, int depth, NSMutableString *out) {
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 4; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Màu nhấn"; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Thay đổi màu"; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -955,11 +867,8 @@ static void DumpView(UIView *v, int depth, NSMutableString *out) {
         sw.layer.borderWidth = 1;
         sw.layer.borderColor = UIColor.separatorColor.CGColor;
         cell.accessoryView = sw;
-    } else if (ip.row == 2) {
-        cell.textLabel.text = @"Chọn màu…";
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     } else {
-        cell.textLabel.text = @"Sao chép thông tin debug";
+        cell.textLabel.text = @"Chọn màu…";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return cell;
@@ -969,27 +878,6 @@ static void DumpView(UIView *v, int depth, NSMutableString *out) {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row == 1) [self editHex];
     else if (ip.row == 2) [self pickColor];
-    else if (ip.row == 3) [self dumpDebug];
-}
-
-- (void)dumpDebug {
-    UIViewController *root = self.view.window.rootViewController;
-    NSMutableString *out = [NSMutableString stringWithFormat:@"gDark=%d fillCount=%d hex=%@\n", gDark, gFillCount, CurHex()];
-    if (root.view) DumpLayer(root.view.layer, 0, out);
-    // Bàn phím nằm ở window riêng -> dump thêm view tree của mọi window
-    [out appendString:@"\n=== VIEW TREE (mọi window) ===\n"];
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if (![s isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) {
-            [out appendFormat:@"-- window %@ level=%.0f\n", NSStringFromClass(w.class), w.windowLevel];
-            DumpView(w, 0, out);
-        }
-    }
-    UIPasteboard.generalPasteboard.string = out;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Đã sao chép"
-        message:@"Dán nội dung vào cuộc trò chuyện để gửi lại." preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)masterChanged:(UISwitch *)sw {
@@ -1124,19 +1012,6 @@ static void Setup(UIWindow *w) {
     if (n && cls == 1) MarkFill(self.layer, self);
     else if (!n && gOn[AACFill] && IsFillCandidateColor(c)) { SetOwner(self); ScheduleCheck(self.layer, NO); }
 }
-// Đánh dấu view của bàn phím (UIKB*) để xử lý icon phím return...
-- (void)didMoveToWindow {
-    %orig;
-    if (self.window && OnMain()) TagKeyboard(self);
-}
-// Bàn phím tự vẽ (drawRect) -> bật cờ để các hook -[UIImage drawInRect:] biết đang ở trong bàn phím
-- (void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx {
-    BOOL kb = OnMain() && IsKBClassName(object_getClassName(self));
-    BOOL old = gInKB;
-    if (kb) gInKB = YES;
-    %orig;
-    gInKB = old;
-}
 %end
 
 %hook CALayer
@@ -1238,27 +1113,6 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
     %orig(BlueImageRemap(IconRemapImage(img)), st);
 }
-// Nút dùng UIButtonConfiguration (nút gửi tròn đen của Threads) -> nền accent
-- (void)setBackgroundColor:(UIColor *)c {
-    UIColor *n = (gMaster && gOn[AACFill] && c && OnMain() && IsFillCandidateColor(c) &&
-                  !InControlView(self)) ? gColor[AACFill] : nil;
-    %orig(n ?: c);
-}
-%end
-
-// Nền của UIButtonConfiguration / UIBackgroundConfiguration (iOS 15+)
-%hook UIButtonConfiguration
-- (void)setBaseBackgroundColor:(UIColor *)c {
-    UIColor *n = (gMaster && gOn[AACFill] && c && OnMain() && IsFillCandidateColor(c)) ? gColor[AACFill] : nil;
-    %orig(n ?: c);
-}
-%end
-
-%hook UIBackgroundConfiguration
-- (void)setBackgroundColor:(UIColor *)c {
-    UIColor *n = (gMaster && gOn[AACFill] && c && OnMain() && IsBlackColor(c)) ? gColor[AACFill] : nil;
-    %orig(n ?: c);
-}
 %end
 
 %hook UIBarButtonItem
@@ -1287,22 +1141,6 @@ static void Setup(UIWindow *w) {
 }
 - (UIImage *)imageWithTintColor:(UIColor *)c {
     return %orig(IconTintFix(c));
-}
-// Phím return / icon do bàn phím tự vẽ bằng drawInRect: -> vẽ bản đã tô accent
-- (void)drawInRect:(CGRect)rect {
-    UIImage *t = KBTinted(self);
-    if (t) { gInKBDraw = YES; [t drawInRect:rect]; gInKBDraw = NO; return; }
-    %orig;
-}
-- (void)drawInRect:(CGRect)rect blendMode:(CGBlendMode)mode alpha:(CGFloat)alpha {
-    UIImage *t = KBTinted(self);
-    if (t) { gInKBDraw = YES; [t drawInRect:rect blendMode:mode alpha:alpha]; gInKBDraw = NO; return; }
-    %orig;
-}
-- (void)drawAtPoint:(CGPoint)pt {
-    UIImage *t = KBTinted(self);
-    if (t) { gInKBDraw = YES; [t drawAtPoint:pt]; gInKBDraw = NO; return; }
-    %orig;
 }
 %end
 
@@ -1391,8 +1229,7 @@ static void Setup(UIWindow *w) {
 
 %group AACContents
 %hook CALayer
-// Facebook/Messenger (Components/ASDK) vẽ icon thẳng vào layer.contents bằng CGImage.
-// Bàn phím (UIKB*) luôn được xử lý; các layer khác chỉ khi AAC_CONTENTS_HOOK = 1.
+// Facebook/Messenger (Components/ASDK) vẽ icon thẳng vào layer.contents bằng CGImage
 - (void)setContents:(id)contents {
     if (gInContents) { %orig; return; }
     if (objc_getAssociatedObject(self, kContentsSrc))
@@ -1400,19 +1237,14 @@ static void Setup(UIWindow *w) {
     if (!contents || !gMaster || !gOn[AACIcon] || !OnMain() ||
         CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) { %orig; return; }
 
-    BOOL kb = InKeyboardLayer(self);
-    if (!AAC_CONTENTS_HOOK && !kb) { %orig; return; }
-
     CGImageRef cg = (__bridge CGImageRef)contents;
     size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
     CGSize s = self.bounds.size;
-    CGFloat maxPt = kb ? 80 : 40;
-    size_t maxPx = kb ? 320 : 192;
     BOOL skip = objc_getAssociatedObject(self, kImgView) || [self isKindOfClass:CAShapeLayer.class] ||
                 (self.masksToBounds && self.cornerRadius > 0) ||
-                w < 8 || h < 8 || w > maxPx || h > maxPx ||
-                s.width > maxPt || s.height > maxPt ||
-                (double)MIN(w, h) / (double)MAX(w, h) < (kb ? 0.4 : 0.6);   // icon vuông, bỏ qua chữ/ảnh dẹt
+                w < 8 || h < 8 || w > 192 || h > 192 ||
+                s.width > 40 || s.height > 40 ||
+                (double)MIN(w, h) / (double)MAX(w, h) < 0.6;   // icon vuông, bỏ qua chữ/ảnh dẹt
     if (skip || InGlassLayer(self) || CGImageIsBlackMono(cg) != 1) { %orig; return; }
 
     CGImageRef t = CopyTintedCG(cg, IconShapeColor(self));
@@ -1431,6 +1263,6 @@ static void Setup(UIWindow *w) {
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
         RefreshCache();
         %init;
-        %init(AACContents);
+        if (AAC_CONTENTS_HOOK) { %init(AACContents); }
     }
 }
