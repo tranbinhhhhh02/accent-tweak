@@ -1359,13 +1359,22 @@ static void TabLabelFix(UILabel *lb) {
 
 // ---------------- Quet icon trang cua ban phim (qua dia cau, menu chon ban phim trai/giua/phai) ----------------
 // Cac icon nay nam trong lop glass/popup nen hook setContents/setImage co the bo sot -> quet dinh ky cua so ban phim va doi sang accent.
+// Nut back/Enter (icon den) KHONG dong vao: de mac dinh.
 static BOOL InputWindow(UIWindow *w) {
     NSString *cn = NSStringFromClass(w.class);
     return KbName(cn) || [cn containsString:@"TextEffects"] || [cn containsString:@"RemoteKeyboard"];
 }
 
+// Ten class cua view/layer thuoc khu vuc qua dia cau / menu chon ban phim
+static BOOL KbForceName(NSString *cn) {
+    return [cn containsString:@"DockItem"] || [cn containsString:@"DockView"] || [cn containsString:@"Dock"] ||
+           [cn containsString:@"InputSwitcher"] || [cn containsString:@"Switcher"] || [cn containsString:@"Globe"] ||
+           [cn containsString:@"KeyboardMenu"] || [cn containsString:@"UIKBMenu"] || [cn containsString:@"KBMenu"];
+}
+
 // Icon trang/xam nhat (giu alpha) -> accent. Bo qua nen phim (it vung trong suot) va icon den.
-static CGImageRef KbWhiteForce(CGImageRef src) {
+// force = icon cua qua dia cau / menu: noi long nguong (icon trang co do bong xam nhe)
+static CGImageRef KbWhiteForce(CGImageRef src, BOOL force) {
     if (!src || !gMaster) return NULL;
     size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
     if (w < 8 || h < 8 || w > 300 || h > 300) return NULL;
@@ -1374,6 +1383,7 @@ static CGImageRef KbWhiteForce(CGImageRef src) {
     if (!buf) return NULL;
     size_t total = w * h;
     int solid = 0, gray = 0, wt = 0, blk = 0, clear = 0;
+    CGFloat wthr = force ? 0.70 : 0.85;
     for (size_t i = 0; i < total; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) { clear++; continue; }
@@ -1383,11 +1393,14 @@ static CGImageRef KbWhiteForce(CGImageRef src) {
         if (fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) > 0.12) continue;
         gray++;
         CGFloat lum = (r + g + b) / 3.0;
-        if (lum > 0.85) wt++;
+        if (lum > wthr) wt++;
         else if (lum < 0.3) blk++;
     }
-    BOOL ok = solid >= 15 && gray * 100 >= 90 * solid && wt * 100 >= 60 * solid &&
-              blk * 100 <= 8 * solid && (size_t)clear * 100 >= 8 * total;
+    BOOL ok = force
+        ? (solid >= 12 && gray * 100 >= 85 * solid && wt * 100 >= 40 * solid &&
+           blk * 100 <= 20 * solid && (size_t)clear * 100 >= 3 * total)
+        : (solid >= 15 && gray * 100 >= 90 * solid && wt * 100 >= 60 * solid &&
+           blk * 100 <= 8 * solid && (size_t)clear * 100 >= 8 * total);
     if (!ok) { FreeBuf(buf, ctx); return NULL; }
     const CGFloat *q = AccRGB();
     for (size_t i = 0; i < total; i++) {
@@ -1405,9 +1418,17 @@ static CGImageRef KbWhiteForce(CGImageRef src) {
 
 // Icon nam trong nut dock (qua dia cau) hoac menu chon ban phim: luon doi accent, bo qua kiem tra "duoi nut accent"
 static BOOL KbForceView(UIView *v) {
-    for (int i = 0; i < 6 && v; i++, v = v.superview) {
-        NSString *cn = NSStringFromClass(v.class);
-        if ([cn containsString:@"DockItem"] || [cn containsString:@"InputSwitcher"]) return YES;
+    for (int i = 0; i < 8 && v; i++, v = v.superview) {
+        if (KbForceName(NSStringFromClass(v.class))) return YES;
+    }
+    return NO;
+}
+
+static BOOL KbForceLayer(CALayer *l) {
+    for (int i = 0; i < 8 && l; i++, l = l.superlayer) {
+        if (KbForceName(NSStringFromClass(l.class))) return YES;
+        id d = l.delegate;
+        if (d && KbForceName(NSStringFromClass([d class]))) return YES;
     }
     return NO;
 }
@@ -1419,7 +1440,7 @@ static UIImage *SweepRecolorImage(UIImage *im, BOOL force) {
     if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate) {
         out = [im imageWithTintColor:[UIColor colorWithCGColor:CGFor(NO)] renderingMode:UIImageRenderingModeAlwaysOriginal];
     } else if (im.CGImage && im.size.width <= 96 && im.size.height <= 96) {
-        CGImageRef k = KbWhiteForce(im.CGImage);
+        CGImageRef k = KbWhiteForce(im.CGImage, force);
         if (!k && force) k = CopyTintedCG(im.CGImage, CGFor(NO));   // fallback: to accent theo hinh dang (giu alpha)
         if (k) {
             out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
@@ -1433,7 +1454,9 @@ static UIImage *SweepRecolorImage(UIImage *im, BOOL force) {
 }
 
 static void SweepShape(CAShapeLayer *sh) {
-    if (gInTry || !WhiteOK(sh)) return;
+    if (gInTry) return;
+    BOOL force = KbForceLayer(sh);
+    if (!force && !WhiteOK(sh)) return;
     CGRect b;
     if (!PathBounds(sh, &b) || fmax(b.size.width, b.size.height) > 44) return;
     BOOL fill = IsWhiteCG(sh.fillColor), stroke = IsWhiteCG(sh.strokeColor);
@@ -1461,6 +1484,7 @@ static void SweepLayer(CALayer *l, int depth) {
                 uintptr_t p = (uintptr_t)(__bridge void *)c;
                 if (!np || (uintptr_t)np.unsignedLongValue != p) {
                     SET(l, kSweepPtr, @((unsigned long)p));
+                    BOOL force = !gDark && KbForceLayer(l);
                     // Chi dong vao layer co multiply trang/khong co (qua dia cau...). Layer phim chu co multiply den/accent -> de nguyen cho logic ban phim.
                     BOOL mulOK = YES;
                     @try {
@@ -1470,13 +1494,17 @@ static void SweepLayer(CALayer *l, int depth) {
                             mulOK = CGRGBA((__bridge CGColorRef)mm, &mr, &mg, &mb, &ma) && mr > 0.9 && mg > 0.9 && mb > 0.9;
                         }
                     } @catch (NSException *e) { mulOK = NO; }
-                    if (mulOK && WhiteOK(l)) {
-                        CGImageRef k = KbWhiteForce((__bridge CGImageRef)c);
+                    if ((mulOK || force) && (force || WhiteOK(l))) {
+                        CGImageRef k = KbWhiteForce((__bridge CGImageRef)c, force);
+                        if (!k && force && !ContentsLooksAccent(l)) k = CopyTintedCG((__bridge CGImageRef)c, CGFor(NO));
                         if (k) {
                             SET(l, kKbSrc, c);
                             SET(l, kWhiteMark, @YES);
                             PutContents(l, k);
                             CGImageRelease(k);
+                            if (force && !mulOK) {   // multiply khong phai trang -> dua ve trang de khong to 2 lan
+                                @try { [l setContentsMultiplyColor:gCGWhite]; } @catch (NSException *e) {}
+                            }
                         }
                     }
                 }
