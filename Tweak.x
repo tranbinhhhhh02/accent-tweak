@@ -510,7 +510,7 @@ static BOOL HasAccentMark(CALayer *l) {
 }
 
 static void KillShadowDown(CALayer *l, int depth) {
-    if (!l || depth > 4 || !OnMain()) return;
+    if (!l || depth > 4 || !OnMain() || IsKeyboardLayer(l)) return;
     for (CALayer *s in [l.sublayers copy]) {
         CGSize z = s.bounds.size;
         if (z.height > 120 || z.width > 200 || NearControl(s)) continue;
@@ -523,6 +523,7 @@ static void KillShadowDown(CALayer *l, int depth) {
 static void KillShadowUp(CALayer *l, int levels) {
     if (!l || !OnMain()) return;
     for (int i = 0; i < levels && l; i++, l = l.superlayer) {
+        if (IsKeyboardLayer(l)) break;
         CGSize s = l.bounds.size;
         if (s.height > 120) break;
         if (i > 0 && s.width > 120) break;
@@ -543,9 +544,20 @@ static BOOL SubtreeAccent(CALayer *l, int depth, int *budget) {
     return NO;
 }
 
+static BOOL ShadowNamed(CALayer *l) {
+    if ([NSStringFromClass(l.class) containsString:@"Shadow"]) return YES;
+    id d = l.delegate;
+    return d && [NSStringFromClass([d class]) containsString:@"Shadow"];
+}
+
 static BOOL ShadowEligible(CALayer *l) {
     if (!gMaster || !OnMain()) return NO;
+    if (IsKeyboardLayer(l)) return NO;
     if (objc_getAssociatedObject(l, kNoShadow)) return YES;
+    if (ShadowNamed(l)) {
+        CGSize z = l.bounds.size;
+        if (z.height <= 160 && z.width <= 800) return YES;
+    }
     CGSize s = l.bounds.size;
     if (s.height > 120 || s.width > 200) return NO;
     if (NearControl(l)) return NO;
@@ -637,6 +649,7 @@ static BOOL HasTwinSibling(CALayer *l) {
 static void GlowCheck(CALayer *l) {
     if (!l || !gMaster || !OnMain() || l.hidden) return;
     if (!objc_getAssociatedObject(l, kInkTint)) return;
+    if (IsKeyboardLayer(l)) return;   // chu/so ban phim cung kich thuoc canh nhau -> khong duoc an
     if (HasTwinSibling(l)) l.hidden = YES;
 }
 
