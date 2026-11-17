@@ -33,7 +33,12 @@ static const void *kCtl         = &kCtl;
 static const void *kImgView     = &kImgView;
 static const void *kOwner       = &kOwner;
 static const void *kKbSrc       = &kKbSrc;     // [MOI] contents ban phim da doi mau
-static const void *kNoShadow    = &kNoShadow;  // [MOI] layer bi go bong do
+static const void *kNoShadow    = &kNoShadow;  // layer bi go bong do
+static const void *kStripSrc    = &kStripSrc;  // anh da go vien/bong den
+static const void *kStripState  = &kStripState;
+static const void *kStripOut    = &kStripOut;
+static const void *kKbImg       = &kKbImg;     // anh ban phim da doi mau
+static __thread BOOL gKbDraw;                  // dang ve trong view cua ban phim
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -387,17 +392,31 @@ static CGImageRef CopyTintedCG(CGImageRef src, CGColorRef color) {
     return out;
 }
 
-// ---- [MOI] Phim ban phim: nut xanh (Tim kiem/Gui...) -> accent, bieu tuong den (Enter) -> accent ----
-static BOOL InGlassLayer(CALayer *l);
+// ---- Ban phim: nut xanh -> accent, bieu tuong den (Enter/back) -> accent ----
+static BOOL KbName(NSString *cn) {
+    return [cn hasPrefix:@"UIKB"] || [cn containsString:@"Keyboard"] || [cn containsString:@"UIInputWindow"];
+}
+
+static BOOL ViewInKeyboard(UIView *v) {
+    if (!v) return NO;
+    UIWindow *w = v.window;
+    if (w && KbName(NSStringFromClass(w.class))) return YES;
+    for (int i = 0; i < 10 && v; i++, v = v.superview)
+        if (KbName(NSStringFromClass(v.class))) return YES;
+    return NO;
+}
 
 static BOOL IsKeyboardLayer(CALayer *l) {
+    BOOL checked = NO;
     for (int i = 0; i < 10 && l; i++, l = l.superlayer) {
-        NSString *cn = NSStringFromClass(l.class);
-        if ([cn hasPrefix:@"UIKB"] || [cn containsString:@"Keyboard"] || [cn containsString:@"UIInputWindow"]) return YES;
+        if (KbName(NSStringFromClass(l.class))) return YES;
         id d = l.delegate;
         if (d) {
-            NSString *dn = NSStringFromClass([d class]);
-            if ([dn hasPrefix:@"UIKB"] || [dn containsString:@"Keyboard"] || [dn containsString:@"UIInputWindow"]) return YES;
+            if (KbName(NSStringFromClass([d class]))) return YES;
+            if (!checked && [d isKindOfClass:UIView.class]) {
+                checked = YES;
+                if (ViewInKeyboard((UIView *)d)) return YES;
+            }
         }
     }
     return NO;
@@ -474,14 +493,30 @@ static CGImageRef KbRecolor(CGImageRef src) {
     return out;
 }
 
-// ---- [MOI] Go bong do (shadow) tren nut/icon da doi sang accent ----
+// ---- Go bong do (shadow) tren nut/icon accent ----
+static BOOL NearControl(CALayer *l) {
+    for (int i = 0; i < 4 && l; i++, l = l.superlayer) {
+        id d = l.delegate;
+        if ([d isKindOfClass:UISwitch.class] || [d isKindOfClass:UISlider.class]) return YES;
+        NSString *cn = NSStringFromClass(l.class);
+        if ([cn containsString:@"UISwitch"] || [cn containsString:@"Slider"]) return YES;
+    }
+    return NO;
+}
+
+static BOOL HasAccentMark(CALayer *l) {
+    return objc_getAssociatedObject(l, kFill) || objc_getAssociatedObject(l, kIconShape) ||
+           objc_getAssociatedObject(l, kContentsSrc) || objc_getAssociatedObject(l, kKbSrc) ||
+           IsAccentCG(l.backgroundColor);
+}
+
 static void KillShadowUp(CALayer *l, int levels) {
     if (!l || !OnMain()) return;
     for (int i = 0; i < levels && l; i++, l = l.superlayer) {
         CGSize s = l.bounds.size;
         if (s.height > 120) break;
         if (i > 0 && s.width > 120) break;
-        if (InGlassLayer(l)) break;
+        if (NearControl(l)) break;
         objc_setAssociatedObject(l, kNoShadow, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (l.shadowOpacity > 0) l.shadowOpacity = 0;
     }
@@ -492,13 +527,53 @@ static BOOL ShadowEligible(CALayer *l) {
     if (objc_getAssociatedObject(l, kNoShadow)) return YES;
     CGSize s = l.bounds.size;
     if (s.height > 120 || s.width > 200) return NO;
-    if (InGlassLayer(l)) return NO;
-    if (objc_getAssociatedObject(l, kFill) || objc_getAssociatedObject(l, kIconShape) ||
-        objc_getAssociatedObject(l, kContentsSrc) || objc_getAssociatedObject(l, kKbSrc)) return YES;
-    if (IsAccentCG(l.backgroundColor)) return YES;
+    if (NearControl(l)) return NO;
+    if (HasAccentMark(l)) return YES;
     CGColorRef sc = l.shadowColor;
     if (sc && (IsAccentCG(sc) || IsOurs(sc))) return YES;
+    int n = 0;
+    for (CALayer *sub in l.sublayers) {
+        if (++n > 6) break;
+        if (HasAccentMark(sub)) return YES;
+    }
     return NO;
+}
+
+static BOOL gInKbFix;
+
+static void KbLabelFix(UILabel *lb) {
+    if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
+    NSString *t = lb.text ?: lb.attributedText.string;
+    if (t.length > 3) return;
+    if (!ViewInKeyboard(lb)) return;
+    if (IsInkColor(lb.textColor)) lb.textColor = gColor[AACIcon];
+    NSAttributedString *as = lb.attributedText;
+    if (as.length) {
+        UIColor *c = [as attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
+        if (c && IsInkColor(c)) {
+            NSMutableAttributedString *m = [as mutableCopy];
+            [m addAttribute:NSForegroundColorAttributeName value:gColor[AACIcon] range:NSMakeRange(0, m.length)];
+            lb.attributedText = m;
+        }
+    }
+}
+
+static void KbImageFix(UIImageView *iv) {
+    if (gInKbFix || !gMaster || !gOn[AACIcon] || !OnMain()) return;
+    UIImage *im = iv.image;
+    if (!im || !im.CGImage || objc_getAssociatedObject(im, kKbImg)) return;
+    if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate || im.images.count > 1) return;
+    if (im.size.width > 96 || im.size.height > 96) return;
+    if (!ViewInKeyboard(iv)) return;
+    CGImageRef k = KbRecolor(im.CGImage);
+    if (!k) return;
+    UIImage *out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
+    CGImageRelease(k);
+    if (!out) return;
+    objc_setAssociatedObject(out, kKbImg, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gInKbFix = YES;
+    iv.image = out;
+    gInKbFix = NO;
 }
 
 static void ReapplyContents(CALayer *l) {
@@ -772,9 +847,32 @@ static void TryBlackShape(CAShapeLayer *sh) {
     sh.fillColor = CGFor(AACFill, NO);
 }
 
+// Icon trang co vien/bong den (vd icon like, comment tren video): bo vien thay vi doi sang accent
+static void StripWhiteShapeOutline(CAShapeLayer *sh) {
+    if (gInTry || !gMaster || !OnMain()) return;
+    CGColorRef st = sh.strokeColor;
+    if (!st || sh.lineWidth > 3) return;
+    CGFloat r, g, b, a;
+    if (!CGRGBA(sh.fillColor, &r, &g, &b, &a) || a < 0.99 || r <= 0.97 || g <= 0.97 || b <= 0.97) return;
+    NSNumber *m = objc_getAssociatedObject(sh, kIconShape);
+    BOOL ours = (m.intValue & 2) != 0;
+    BOOL dark = CGRGBA(st, &r, &g, &b, &a) && r < 0.3 && g < 0.3 && b < 0.3;
+    if (!dark && !ours) return;
+    CGPathRef path = sh.path;
+    if (path && !CGPathIsEmpty(path)) {
+        CGRect bb = CGPathGetBoundingBox(path);
+        if (!CGRectIsNull(bb) && !CGRectIsInfinite(bb) && fmax(bb.size.width, bb.size.height) > 64) return;
+    }
+    gInTry = YES;
+    sh.strokeColor = NULL;
+    gInTry = NO;
+    if (m) objc_setAssociatedObject(sh, kIconShape, @(m.intValue & ~2), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static void TryBlackIconShape(CAShapeLayer *sh) {
     if (!gOn[AACIcon] || gInTry || !OnMain()) return;
     if (InGlassLayer(sh)) return;
+    StripWhiteShapeOutline(sh);
     BOOL fill = IsInkCG(sh.fillColor), stroke = IsInkCG(sh.strokeColor);
     if (!fill && !stroke) return;
     CGPathRef path = sh.path;
@@ -857,6 +955,85 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
         RunCheck(l, shape);
         __sync_fetch_and_sub(&gPending, 1);
     });
+}
+
+// Icon trang co vien/bong den "nuong" trong anh -> xoa phan toi, giu phan trang
+static UIImage *ShadowStripImage(UIImage *img) {
+    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (objc_getAssociatedObject(img, kStripSrc)) return img;
+    if (img.isSymbolImage || img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.images.count > 1) return img;
+    CGSize sz = img.size;
+    if (sz.width < 14 || sz.height < 14 || sz.width > 64 || sz.height > 64) return img;
+    NSNumber *state = objc_getAssociatedObject(img, kStripState);
+    if (state) return state.boolValue ? (objc_getAssociatedObject(img, kStripOut) ?: img) : img;
+    static CFAbsoluteTime winStart; static int winCount;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - winStart > 1.0) { winStart = now; winCount = 0; }
+    if (++winCount > 50) return img;
+
+    CGFloat scale = img.scale > 0 ? img.scale : 1;
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = scale;
+    fmt.opaque = NO;
+    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
+        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
+        }];
+    CGImageRef cg = flat.CGImage;
+    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
+    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) {
+        objc_setAssociatedObject(img, kStripState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+    uint8_t *buf = calloc(w * h, 4);
+    if (!buf) return img;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return img; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+
+    int solid = 0, light = 0, dark = 0, darkOpq = 0, colored = 0;
+    for (size_t i = 0; i < w * h; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) continue;
+        solid++;
+        CGFloat a = px[3];
+        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn > 0.15) { colored++; continue; }
+        CGFloat lum = (r + g + b) / 3.0;
+        if (lum < 0.35) { dark++; if (px[3] >= 200) darkOpq++; }
+        else if (lum > 0.8 && px[3] >= 200) light++;
+    }
+    BOOL ok = solid >= 20 && colored * 10 <= solid && light * 100 >= 20 * solid &&
+              dark * 100 >= 5 * solid && darkOpq <= light;
+    if (!ok) {
+        CGContextRelease(ctx);
+        free(buf);
+        objc_setAssociatedObject(img, kStripState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+    for (size_t i = 0; i < w * h; i++) {
+        uint8_t *px = buf + i * 4;
+        if (px[3] == 0) continue;
+        CGFloat a = px[3];
+        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn > 0.15) continue;
+        if ((r + g + b) / 3.0 < 0.4) { px[0] = px[1] = px[2] = px[3] = 0; }
+    }
+    CGImageRef outCG = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    free(buf);
+    if (!outCG) return img;
+    UIImage *out = [UIImage imageWithCGImage:outCG scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(outCG);
+    objc_setAssociatedObject(out, kStripSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kStripState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kStripOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
 }
 
 static UIImage *IconRemapImage(UIImage *img) {
@@ -1011,7 +1188,7 @@ static UIImage *DualImageRemap(UIImage *img) {
     if (!ctx) { free(buf); return img; }
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
 
-    int solid = 0, blk = 0, mid = 0, other = 0;
+    int solid = 0, blk = 0, mid = 0, other = 0, opq = 0, opqBlk = 0;
     for (size_t i = 0; i < w * h; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) continue;
@@ -1021,10 +1198,12 @@ static UIImage *DualImageRemap(UIImage *img) {
         CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
         if (mx - mn > 0.12) { other++; continue; }
         CGFloat lum = (r + g + b) / 3.0;
+        if (px[3] >= 200) { opq++; if (lum < 0.16) opqBlk++; }
         if (lum < 0.16) blk++;
         else if (lum > 0.25 && lum < 0.75) mid++;
     }
-    BOOL ok = solid >= 30 && other * 30 <= solid && blk * 100 >= 30 * solid && mid * 100 <= 18 * solid;
+    BOOL ok = solid >= 30 && other * 30 <= solid && blk * 100 >= 30 * solid && mid * 100 <= 18 * solid &&
+              opq > 0 && opqBlk * 100 >= 40 * opq;
     if (!ok) {
         CGContextRelease(ctx);
         free(buf);
@@ -1455,6 +1634,14 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook UIView
+- (void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx {
+    if (gDepth > AAC_MAXDEPTH || !gMaster || !gOn[AACIcon] || !OnMain() || !ViewInKeyboard(self)) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    BOOL prev = gKbDraw;
+    gKbDraw = YES;
+    %orig;
+    gKbDraw = prev;
+}
 - (UIColor *)tintColor {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
@@ -1530,6 +1717,12 @@ static void Setup(UIWindow *w) {
     %orig;
     if (self.shadowOpacity > 0 && ShadowEligible(self)) self.shadowOpacity = 0;
 }
+- (void)layoutSublayers {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.shadowOpacity > 0 && ShadowEligible(self)) self.shadowOpacity = 0;
+}
 %end
 
 %hook CATextLayer
@@ -1537,6 +1730,7 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
+    if (!n && gMaster && gOn[AACIcon] && c && OnMain() && IsInkCG(c) && IsKeyboardLayer(self)) n = CGFor(AACIcon, NO);
     %orig(n ?: c);
 }
 %end
@@ -1549,6 +1743,7 @@ static void Setup(UIWindow *w) {
     CGColorRef n = LayerRemap(c, AACIcon, NULL);
     if (n) { %orig(n); return; }
     %orig;
+    StripWhiteShapeOutline(self);
     if (!gInTry && (gOn[AACFill] || gOn[AACIcon]) && (IsBlackCG(c) || (gOn[AACIcon] && IsInkCG(c)))) ScheduleCheck(self, YES);
 }
 - (void)setStrokeColor:(CGColorRef)c {
@@ -1558,6 +1753,7 @@ static void Setup(UIWindow *w) {
     CGColorRef n = LayerRemap(c, AACIcon, NULL);
     if (n) { %orig(n); return; }
     %orig;
+    StripWhiteShapeOutline(self);
     if (!gInTry && gOn[AACIcon] && IsInkCG(c)) ScheduleCheck(self, YES);
 }
 %end
@@ -1591,7 +1787,7 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
-    if (self.window) { FixLabelBG(self); TabLabelFix(self); }
+    if (self.window) { FixLabelBG(self); TabLabelFix(self); KbLabelFix(self); }
 }
 - (void)layoutSubviews {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
@@ -1603,6 +1799,15 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook UIButton
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window && gMaster && gOn[AACIcon] && OnMain() && ViewInKeyboard(self)) {
+        UIColor *tc = [self titleColorForState:UIControlStateNormal];
+        if (tc && IsInkColor(tc)) [self setTitleColor:gColor[AACIcon] forState:UIControlStateNormal];
+    }
+}
 - (void)setTitleColor:(UIColor *)c forState:(UIControlState)st {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
@@ -1612,7 +1817,7 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(img))), st);
+    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img)))), st);
 }
 %end
 
@@ -1620,18 +1825,24 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(img))));
+    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img)))));
 }
 %end
 
 %hook UIImageView
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window) KbImageFix(self);
+}
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     if (OnMain() && !objc_getAssociatedObject(self.layer, kImgView))
         objc_setAssociatedObject(self.layer, kImgView, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
-    UIImage *n = DualImageRemap(BlueImageRemap(IconRemapImage(img)));
+    UIImage *n = DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img))));
     if (n && gMaster && gOn[AACIcon] && OnMain()) {
         CGSize s = n.size;
         if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
@@ -1639,6 +1850,7 @@ static void Setup(UIWindow *w) {
     %orig(n);
     // [MOI] icon da doi sang accent -> bo bong do
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
+    if (self.window) KbImageFix(self);
 }
 %end
 
@@ -1762,6 +1974,16 @@ static void Setup(UIWindow *w) {
     return %orig;
 }
 %end
+
+// Ve tay trong ban phim (mui ten Enter/back mau den) -> accent
+%hookf(void, CGContextSetFillColorWithColor, CGContextRef c, CGColorRef color) {
+    if (gKbDraw && color && IsInkCG(color) && gOn[AACIcon]) color = CGFor(AACIcon, NO);
+    %orig(c, color);
+}
+%hookf(void, CGContextSetStrokeColorWithColor, CGContextRef c, CGColorRef color) {
+    if (gKbDraw && color && IsInkCG(color) && gOn[AACIcon]) color = CGFor(AACIcon, NO);
+    %orig(c, color);
+}
 
 %group AACContents
 %hook CALayer
