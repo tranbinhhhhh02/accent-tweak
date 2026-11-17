@@ -561,19 +561,59 @@ static BOOL LooksLikeAvatarView(UIView *v) {
     return l.cornerRadius >= fmin(s.width, s.height) * 0.25;
 }
 
+// ---- Nut tron den co mui ten (nut gui + nut "Hien thi cau tra loi") ----
+static const void *kArrowDone = &kArrowDone;
+
+static void ArrowFixView(UIView *v, int depth) {
+    if (!v || depth > 3) return;
+    for (UIView *sv in [v.subviews copy]) {
+        if ([sv isKindOfClass:UIImageView.class]) {
+            UIImageView *iv = (UIImageView *)sv;
+            UIImage *im = iv.image;
+            if (im && im.renderingMode != UIImageRenderingModeAlwaysTemplate &&
+                !objc_getAssociatedObject(im, kArrowDone)) {
+                UIImage *t = [im imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+                if (t) {
+                    objc_setAssociatedObject(t, kArrowDone, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    iv.image = t;
+                }
+            }
+            iv.tintColor = UIColor.whiteColor;
+        }
+        [sv tintColorDidChange];
+        ArrowFixView(sv, depth + 1);
+    }
+}
+
+static void ArrowFix(CALayer *l) {
+    if (!OnMain() || !l) return;
+    __weak CALayer *wl = l;
+    void (^work)(void) = ^{
+        CALayer *ly = wl;
+        if (!ly) return;
+        FixUnderFill(ly, 0);
+        id d = ly.delegate;
+        if ([d isKindOfClass:UIView.class]) ArrowFixView((UIView *)d, 0);
+    };
+    dispatch_async(dispatch_get_main_queue(), work);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), work);
+}
+
 static void TryBlack(CALayer *l) {
     if (!gOn[AACFill] || !OnMain()) return;
     if (InGlassLayer(l)) return;
     CGSize sz = l.bounds.size;
     if (l.contents || objc_getAssociatedObject(l, kImgView)) return;
     BOOL round = sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45;
-    if (round && sz.width >= 40) return;
+    BOOL arrowBtn = round && sz.width >= 10 && sz.width <= 56 && l.sublayers.count > 0 && IsBlackCG(l.backgroundColor);
+    if (round && sz.width >= 40 && !arrowBtn) return;
     BOOL nested = LayerUnderFill(l.superlayer);
     CGColorRef bg = l.backgroundColor;
     BOOL cand = IsFillCandidateCG(bg) && !(IsWhiteCG(bg) && InControlKnob(l));
-    if (cand && sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested)) {
+    if (cand && ((sz.height >= 14 && sz.height <= 64 && sz.width >= 14 && (l.cornerRadius >= 6 || nested)) || arrowBtn)) {
         l.backgroundColor = CGFor(AACFill, NO);
         MarkFill(l, nil);
+        if (arrowBtn) ArrowFix(l);
     }
     if (l.borderWidth > 0 && IsBlackCG(l.borderColor) && (nested || LayerUnderFill(l))) {
         l.borderColor = CGFor(AACFill, NO);
