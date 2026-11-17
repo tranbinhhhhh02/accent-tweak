@@ -23,7 +23,7 @@ KEY(kAccentSrc);   KEY(kAccentStamp); KEY(kContentsSrc); KEY(kCtl);       KEY(kI
 KEY(kOwner);       KEY(kKbSrc);       KEY(kNoShadow);   KEY(kKbImg);      KEY(kInkTint);
 KEY(kInkImg);      KEY(kWhiteMark);   KEY(kArrowDone);  KEY(kAttempts);   KEY(kPendShape);
 KEY(kStripSrc);    KEY(kStripState);  KEY(kStripOut);
-KEY(kSweepPtr);    KEY(kSweepImg);
+KEY(kOrigMul);     KEY(kSweepPtr);    KEY(kSweepImg);
 KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh xanh (app thuong) / anh den (Facebook)
 
 @interface AACWeak : NSObject
@@ -32,6 +32,7 @@ KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh
 @implementation AACWeak
 @end
 
+static BOOL gInMul;
 static BOOL gMaster = YES, gDark, gInTry, gInTabFix, gInContents, gInKbFix, gSafe;
 static UIColor   *gColor;
 static CGColorRef gCGLight, gCGDark, gCGSoftLight, gCGSoftDark, gCGWhite;
@@ -489,16 +490,22 @@ static BOOL KbRootKnown(uintptr_t rp) {
 
 static BOOL IsKeyboardLayer(CALayer *l) {
     if (!l || !OnMain()) return NO;
-    CALayer *root = l;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gKbRootT > 0.3) { RefreshKbRoots(); gKbRootT = CFAbsoluteTimeGetCurrent(); }
+    uintptr_t ptrs[64];
+    int n = 0;
     for (int i = 0; i < 60 && l; i++, l = l.superlayer) {
         if (KbName(NSStringFromClass(l.class))) return YES;
-        root = l;
+        uintptr_t p = (uintptr_t)(__bridge void *)l;
+        if (n < 64) ptrs[n++] = p;
+        if (KbRootKnown(p)) return YES;
     }
-    uintptr_t rp = (uintptr_t)(__bridge void *)root;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - gKbRootT > 0.3) { RefreshKbRoots(); gKbRootT = now; }
-    if (KbRootKnown(rp)) return YES;
-    if (now - gKbRootT > 0.05) return NO;   // vua lam moi xong -> khong co
+    // khong thay: co the cua so ban phim vua xuat hien -> lam moi danh sach (toi da 20 lan/giay) roi kiem tra lai
+    if (CFAbsoluteTimeGetCurrent() - gKbRootT > 0.05) {
+        RefreshKbRoots();
+        gKbRootT = CFAbsoluteTimeGetCurrent();
+        for (int i = 0; i < n; i++) if (KbRootKnown(ptrs[i])) return YES;
+    }
     return NO;
 }
 
@@ -718,7 +725,10 @@ static void FixDoubleTint(CALayer *l) {
         // Layer da duoc ta doi anh sang accent -> multiply bat ke la accent/den deu phai ve trang (tranh to 2 lan => mau khac nhau)
         BOOL marked = GET(l, kKbSrc) || (!gSafe && GET(l, kContentsSrc));
         if (marked) {
-            if (InkAnyAlphaCG(mc) || NearAccentCG(mc, 0.1, 0.05) || IsOurs(mc)) [l setContentsMultiplyColor:gCGWhite];
+            if (InkAnyAlphaCG(mc) || NearAccentCG(mc, 0.1, 0.05) || IsOurs(mc)) {
+                if (!GET(l, kOrigMul)) SET(l, kOrigMul, (__bridge id)mc);
+                [l setContentsMultiplyColor:gCGWhite];
+            }
             return;
         }
         if (NearAccentCG(mc, 0.1, 0.9) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
@@ -1834,6 +1844,7 @@ static void Setup(UIWindow *w) {
 - (void)setContentsMultiplyColor:(CGColorRef)c {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
     Crumb("hook:multiply");
+    if (gInMul) { %orig; return; }
     CGColorRef n = NULL;
     BOOL inkSwap = NO;
     if (gMaster && c) {
@@ -1851,6 +1862,7 @@ static void Setup(UIWindow *w) {
         // anh cua layer nay da duoc to accent (ta da doi contents) -> multiply BAT BUOC ve trang, tranh to 2 lan (mau dam/khac nhau) hoac bi den
         if (main && !IsWhiteCG(c) && (GET(self, kKbSrc) || GET(self, kContentsSrc)) &&
             (n || ink || IsOurs(c) || NearAccentCG(c, 0.1, 0.05))) {
+            if (!GET(self, kOrigMul)) SET(self, kOrigMul, (__bridge id)c);
             n = gCGWhite;
         } else if (n && n != gCGWhite && main) {
             BOOL marked = GET(self, kKbSrc) || GET(self, kContentsSrc);
@@ -1904,6 +1916,15 @@ static void Setup(UIWindow *w) {
     CLEAR(self, kContentsSrc);
     CLEAR(self, kKbSrc);
     CLEAR(self, kWhiteMark);
+    if (GET(self, kOrigMul) && OnMain()) {
+        id om = GET(self, kOrigMul);
+        SET(self, kOrigMul, nil);
+        CGColorRef oc = (__bridge CGColorRef)om;
+        CGColorRef back = (gMaster && (InkAnyAlphaCG(oc) || IsOurs(oc) || NearAccentCG(oc, 0.1, 0.05))) ? CGFor(NO) : oc;
+        gInMul = YES;
+        [self setContentsMultiplyColor:back];
+        gInMul = NO;
+    }
     if (!contents || !gMaster || !OnMain() || CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) { %orig; return; }
 
     CGImageRef cg = (__bridge CGImageRef)contents;
