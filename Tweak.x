@@ -1403,13 +1403,24 @@ static CGImageRef KbWhiteForce(CGImageRef src) {
     return out;
 }
 
-static UIImage *SweepRecolorImage(UIImage *im) {
-    if (!im || GET(im, kKbImg) || GET(im, kSweepImg) || im.images.count > 1) return nil;
+// Icon nam trong nut dock (qua dia cau) hoac menu chon ban phim: luon doi accent, bo qua kiem tra "duoi nut accent"
+static BOOL KbForceView(UIView *v) {
+    for (int i = 0; i < 6 && v; i++, v = v.superview) {
+        NSString *cn = NSStringFromClass(v.class);
+        if ([cn containsString:@"DockItem"] || [cn containsString:@"InputSwitcher"]) return YES;
+    }
+    return NO;
+}
+
+static UIImage *SweepRecolorImage(UIImage *im, BOOL force) {
+    if (!im || GET(im, kKbImg) || im.images.count > 1) return nil;
+    if (GET(im, kSweepImg) && !force) return nil;
     UIImage *out = nil;
     if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate) {
         out = [im imageWithTintColor:[UIColor colorWithCGColor:CGFor(NO)] renderingMode:UIImageRenderingModeAlwaysOriginal];
     } else if (im.CGImage && im.size.width <= 96 && im.size.height <= 96) {
         CGImageRef k = KbWhiteForce(im.CGImage);
+        if (!k && force) k = CopyTintedCG(im.CGImage, CGFor(NO));   // fallback: to accent theo hinh dang (giu alpha)
         if (k) {
             out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
             CGImageRelease(k);
@@ -1480,15 +1491,17 @@ static void SweepView(UIView *v, int depth) {
     CGSize s = v.bounds.size;
     if ([v isKindOfClass:UIImageView.class] && s.width >= 8 && s.width <= 56 && s.height <= 56) {
         UIImageView *iv = (UIImageView *)v;
-        if (iv.image && !GET(iv.image, kKbImg) && WhiteOK(iv.layer)) {
-            UIImage *out = SweepRecolorImage(iv.image);
+        BOOL force = !gDark && KbForceView(iv);
+        if (iv.image && !GET(iv.image, kKbImg) && (force || WhiteOK(iv.layer))) {
+            UIImage *out = SweepRecolorImage(iv.image, force);
             if (out) { gInKbFix = YES; iv.image = out; gInKbFix = NO; }
         }
     } else if ([v isKindOfClass:UIButton.class] && s.width <= 80 && s.height <= 80) {
         UIButton *b = (UIButton *)v;
         UIImage *bi = [b imageForState:UIControlStateNormal];
-        if (bi && !GET(bi, kKbImg) && WhiteOK(b.layer)) {
-            UIImage *out = SweepRecolorImage(bi);
+        BOOL force = !gDark && KbForceView(b);
+        if (bi && !GET(bi, kKbImg) && (force || WhiteOK(b.layer))) {
+            UIImage *out = SweepRecolorImage(bi, force);
             if (out) { gInKbFix = YES; [b setImage:out forState:UIControlStateNormal]; gInKbFix = NO; }
         }
     }
