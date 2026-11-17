@@ -1085,7 +1085,7 @@ static void ClearCrash(void);
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return PeekCrash().length ? 4 : 3; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Màu nhấn"; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"Thay màu nhấn"; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
