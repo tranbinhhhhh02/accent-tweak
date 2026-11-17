@@ -38,7 +38,6 @@ static const void *kStripSrc    = &kStripSrc;  // anh da go vien/bong den
 static const void *kStripState  = &kStripState;
 static const void *kStripOut    = &kStripOut;
 static const void *kKbImg       = &kKbImg;     // anh ban phim da doi mau
-static __thread BOOL gKbDraw;                  // dang ve trong view cua ban phim
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
