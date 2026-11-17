@@ -23,6 +23,7 @@ KEY(kAccentSrc);   KEY(kAccentStamp); KEY(kContentsSrc); KEY(kCtl);       KEY(kI
 KEY(kOwner);       KEY(kKbSrc);       KEY(kNoShadow);   KEY(kKbImg);      KEY(kInkTint);
 KEY(kInkImg);      KEY(kWhiteMark);   KEY(kArrowDone);  KEY(kAttempts);   KEY(kPendShape);
 KEY(kStripSrc);    KEY(kStripState);  KEY(kStripOut);
+KEY(kSweepPtr);    KEY(kSweepImg);
 KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh xanh (app thuong) / anh den (Facebook)
 
 @interface AACWeak : NSObject
@@ -1288,6 +1289,160 @@ static void TabLabelFix(UILabel *lb) {
     lb.textColor = gColor;
 }
 
+// ---------------- Quet icon trang cua ban phim (qua dia cau, menu chon ban phim trai/giua/phai) ----------------
+// Cac icon nay nam trong lop glass/popup nen hook setContents/setImage co the bo sot -> quet dinh ky cua so ban phim va doi sang accent.
+static BOOL InputWindow(UIWindow *w) {
+    NSString *cn = NSStringFromClass(w.class);
+    return KbName(cn) || [cn containsString:@"TextEffects"] || [cn containsString:@"RemoteKeyboard"];
+}
+
+// Icon trang/xam nhat (giu alpha) -> accent. Bo qua nen phim (it vung trong suot) va icon den.
+static CGImageRef KbWhiteForce(CGImageRef src) {
+    if (!src || !gMaster) return NULL;
+    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
+    if (w < 8 || h < 8 || w > 300 || h > 300) return NULL;
+    CGContextRef ctx;
+    uint8_t *buf = LoadBuf(src, w, h, &ctx);
+    if (!buf) return NULL;
+    size_t total = w * h;
+    int solid = 0, gray = 0, wt = 0, blk = 0, clear = 0;
+    for (size_t i = 0; i < total; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) { clear++; continue; }
+        solid++;
+        CGFloat r, g, b;
+        Unpm(px, &r, &g, &b);
+        if (fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) > 0.12) continue;
+        gray++;
+        CGFloat lum = (r + g + b) / 3.0;
+        if (lum > 0.85) wt++;
+        else if (lum < 0.3) blk++;
+    }
+    BOOL ok = solid >= 15 && gray * 100 >= 90 * solid && wt * 100 >= 60 * solid &&
+              blk * 100 <= 8 * solid && (size_t)clear * 100 >= 8 * total;
+    if (!ok) { FreeBuf(buf, ctx); return NULL; }
+    const CGFloat *q = AccRGB();
+    for (size_t i = 0; i < total; i++) {
+        uint8_t *px = buf + i * 4;
+        if (!px[3]) continue;
+        CGFloat r, g, b;
+        Unpm(px, &r, &g, &b);
+        if (fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) > 0.12) continue;
+        SetAcc(px, q, px[3] / 255.0);
+    }
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    FreeBuf(buf, ctx);
+    return out;
+}
+
+static UIImage *SweepRecolorImage(UIImage *im) {
+    if (!im || GET(im, kKbImg) || GET(im, kSweepImg) || im.images.count > 1) return nil;
+    UIImage *out = nil;
+    if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate) {
+        out = [im imageWithTintColor:[UIColor colorWithCGColor:CGFor(NO)] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    } else if (im.CGImage && im.size.width <= 96 && im.size.height <= 96) {
+        CGImageRef k = KbWhiteForce(im.CGImage);
+        if (k) {
+            out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
+            CGImageRelease(k);
+        }
+    }
+    if (!out) { SET(im, kSweepImg, @YES); return nil; }
+    SET(out, kKbImg, @YES);
+    SET(out, kSweepImg, @YES);
+    return out;
+}
+
+static void SweepShape(CAShapeLayer *sh) {
+    if (gInTry || !WhiteOK(sh)) return;
+    CGRect b;
+    if (!PathBounds(sh, &b) || fmax(b.size.width, b.size.height) > 44) return;
+    BOOL fill = IsWhiteCG(sh.fillColor), stroke = IsWhiteCG(sh.strokeColor);
+    if (!fill && !stroke) return;
+    int bits = 0;
+    CGColorRef c = CGFor(NO);
+    gInTry = YES;
+    if (fill)   { sh.fillColor   = c; bits |= 1; }
+    if (stroke) { sh.strokeColor = c; bits |= 2; }
+    gInTry = NO;
+    SET(sh, kIconShape, @(bits | [GET(sh, kIconShape) intValue]));
+}
+
+static void SweepLayer(CALayer *l, int depth) {
+    if (!l || depth > 30) return;
+    CGSize s = l.bounds.size;
+    if (!l.hidden && s.width >= 8 && s.height >= 8 && s.width <= 44 && s.height <= 44) {
+        if ([l isKindOfClass:CAShapeLayer.class]) {
+            SweepShape((CAShapeLayer *)l);
+        } else {
+            id c = l.contents;
+            if (c && CFGetTypeID((__bridge CFTypeRef)c) == CGImageGetTypeID() &&
+                !GET(l, kKbSrc) && !GET(l, kContentsSrc) && ![l.delegate isKindOfClass:UIImageView.class]) {
+                NSNumber *np = GET(l, kSweepPtr);
+                uintptr_t p = (uintptr_t)(__bridge void *)c;
+                if (!np || (uintptr_t)np.unsignedLongValue != p) {
+                    SET(l, kSweepPtr, @((unsigned long)p));
+                    if (WhiteOK(l)) {
+                        CGImageRef k = KbWhiteForce((__bridge CGImageRef)c);
+                        if (k) {
+                            SET(l, kKbSrc, c);
+                            SET(l, kWhiteMark, @YES);
+                            PutContents(l, k);
+                            CGImageRelease(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (CALayer *sub in [l.sublayers copy]) SweepLayer(sub, depth + 1);
+}
+
+static void SweepView(UIView *v, int depth) {
+    if (!v || depth > 30) return;
+    CGSize s = v.bounds.size;
+    if ([v isKindOfClass:UIImageView.class] && s.width >= 8 && s.width <= 56 && s.height <= 56) {
+        UIImageView *iv = (UIImageView *)v;
+        if (iv.image && !GET(iv.image, kKbImg) && WhiteOK(iv.layer)) {
+            UIImage *out = SweepRecolorImage(iv.image);
+            if (out) { gInKbFix = YES; iv.image = out; gInKbFix = NO; }
+        }
+    } else if ([v isKindOfClass:UIButton.class] && s.width <= 80 && s.height <= 80) {
+        UIButton *b = (UIButton *)v;
+        UIImage *bi = [b imageForState:UIControlStateNormal];
+        if (bi && !GET(bi, kKbImg) && WhiteOK(b.layer)) {
+            UIImage *out = SweepRecolorImage(bi);
+            if (out) { gInKbFix = YES; [b setImage:out forState:UIControlStateNormal]; gInKbFix = NO; }
+        }
+    }
+    for (UIView *sv in [v.subviews copy]) SweepView(sv, depth + 1);
+}
+
+static void KbSweepAll(void) {
+    if (!gMaster || gSafe || !OnMain()) return;
+    BOOL oldDark = gDark;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
+            if (w.hidden || w.alpha < 0.01 || !InputWindow(w)) continue;
+            if (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) continue;
+            gDark = NO;
+            SweepView(w, 0);
+            SweepLayer(w.layer, 0);
+        }
+    }
+    gDark = oldDark;
+}
+
+static void StartSweep(void) {
+    static dispatch_source_t t;
+    if (t) return;
+    t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), (uint64_t)(0.3 * NSEC_PER_SEC), (uint64_t)(0.1 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(t, ^{ KbSweepAll(); });
+    dispatch_resume(t);
+}
+
 // ---------------- Bang cai dat ----------------
 static BOOL gPanelShown, gPanelPending;
 
@@ -2005,5 +2160,6 @@ static BOOL IsFacebookFamily(void) {
         gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
+        StartSweep();
     }
 }
