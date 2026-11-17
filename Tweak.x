@@ -496,8 +496,6 @@ static CGImageRef KbRecolor(CGImageRef src) {
 // ---- Go bong do (shadow) tren nut/icon accent ----
 static BOOL NearControl(CALayer *l) {
     for (int i = 0; i < 4 && l; i++, l = l.superlayer) {
-        id d = l.delegate;
-        if ([d isKindOfClass:UISwitch.class] || [d isKindOfClass:UISlider.class]) return YES;
         NSString *cn = NSStringFromClass(l.class);
         if ([cn containsString:@"UISwitch"] || [cn containsString:@"Slider"]) return YES;
     }
@@ -1634,14 +1632,6 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook UIView
-- (void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx {
-    if (gDepth > AAC_MAXDEPTH || !gMaster || !gOn[AACIcon] || !OnMain() || !ViewInKeyboard(self)) { %orig; return; }
-    AAC_DEPTH_SCOPE;
-    BOOL prev = gKbDraw;
-    gKbDraw = YES;
-    %orig;
-    gKbDraw = prev;
-}
 - (UIColor *)tintColor {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
@@ -1712,12 +1702,6 @@ static void Setup(UIWindow *w) {
     %orig;
 }
 - (void)setShadowColor:(CGColorRef)c {
-    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
-    AAC_DEPTH_SCOPE;
-    %orig;
-    if (self.shadowOpacity > 0 && ShadowEligible(self)) self.shadowOpacity = 0;
-}
-- (void)layoutSublayers {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
@@ -1974,16 +1958,6 @@ static void Setup(UIWindow *w) {
     return %orig;
 }
 %end
-
-// Ve tay trong ban phim (mui ten Enter/back mau den) -> accent
-%hookf(void, CGContextSetFillColorWithColor, CGContextRef c, CGColorRef color) {
-    if (gKbDraw && color && IsInkCG(color) && gOn[AACIcon]) color = CGFor(AACIcon, NO);
-    %orig(c, color);
-}
-%hookf(void, CGContextSetStrokeColorWithColor, CGContextRef c, CGColorRef color) {
-    if (gKbDraw && color && IsInkCG(color) && gOn[AACIcon]) color = CGFor(AACIcon, NO);
-    %orig(c, color);
-}
 
 %group AACContents
 %hook CALayer
