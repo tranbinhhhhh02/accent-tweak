@@ -38,6 +38,8 @@ static const void *kStripSrc    = &kStripSrc;  // anh da go vien/bong den
 static const void *kStripState  = &kStripState;
 static const void *kStripOut    = &kStripOut;
 static const void *kKbImg       = &kKbImg;     // anh ban phim da doi mau
+static const void *kInkTint     = &kInkTint;   // layer/anh den da bi doi sang accent
+static const void *kInkImg      = &kInkImg;
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -428,7 +430,7 @@ static CGImageRef KbRecolor(CGImageRef src) {
     static CFAbsoluteTime winStart; static int winCount;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-    if (++winCount > 80) return NULL;
+    if (++winCount > 240) return NULL;
 
     uint8_t *buf = calloc(w * h, 4);
     if (!buf) return NULL;
@@ -571,6 +573,57 @@ static void KbImageFix(UIImageView *iv) {
     gInKbFix = YES;
     iv.image = out;
     gInKbFix = NO;
+}
+
+// Thu lai doi mau cho layer ban phim khi layer da gan vao cua so
+static void KbLate(CALayer *l) {
+    if (!l || !gMaster || !gOn[AACIcon] || !OnMain()) return;
+    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) return;
+    id c = l.contents;
+    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
+    if (!IsKeyboardLayer(l)) return;
+    CGImageRef k = KbRecolor((__bridge CGImageRef)c);
+    if (!k) return;
+    objc_setAssociatedObject(l, kKbSrc, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gInContents = YES;
+    l.contents = (__bridge id)k;
+    gInContents = NO;
+    CGImageRelease(k);
+}
+
+// Glow/vien: lop "den" nam canh lop icon trang cung kich thuoc -> an di thay vi nhuom accent
+static BOOL HasTwinSibling(CALayer *l) {
+    CALayer *p = l.superlayer;
+    if (!p) return NO;
+    CGSize s = l.bounds.size;
+    if (s.width < 6 || s.height < 6 || s.width > 64 || s.height > 64) return NO;
+    int n = 0;
+    for (CALayer *o in p.sublayers) {
+        if (++n > 12) break;
+        if (o == l || o.hidden || objc_getAssociatedObject(o, kInkTint)) continue;
+        CGSize t = o.bounds.size;
+        if (fabs(t.width - s.width) > 10 || fabs(t.height - s.height) > 10) continue;
+        if (o.contents || [o isKindOfClass:CAShapeLayer.class] || o.sublayers.count > 0) return YES;
+    }
+    return NO;
+}
+
+static void GlowCheck(CALayer *l) {
+    if (!l || !gMaster || !OnMain() || l.hidden) return;
+    if (!objc_getAssociatedObject(l, kInkTint)) return;
+    if (HasTwinSibling(l)) l.hidden = YES;
+}
+
+static void MarkInk(CALayer *l) {
+    if (!l || !OnMain()) return;
+    objc_setAssociatedObject(l, kInkTint, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak CALayer *wl = l;
+    double delays[3] = { 0.0, 0.3, 1.0 };
+    for (int i = 0; i < 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            GlowCheck(wl);
+        });
+    }
 }
 
 static void ReapplyContents(CALayer *l) {
@@ -887,6 +940,7 @@ static void TryBlackIconShape(CAShapeLayer *sh) {
     NSNumber *old = objc_getAssociatedObject(sh, kIconShape);
     objc_setAssociatedObject(sh, kIconShape, @(bits | old.intValue), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     KillShadowUp(sh, 2);
+    MarkInk(sh);
 }
 
 static NSHashTable *gPend;
@@ -959,6 +1013,7 @@ static UIImage *ShadowStripImage(UIImage *img) {
     if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (objc_getAssociatedObject(img, kStripSrc)) return img;
     if (img.isSymbolImage || img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.images.count > 1) return img;
+    if (!UIEdgeInsetsEqualToEdgeInsets(img.capInsets, UIEdgeInsetsZero)) return img;
     CGSize sz = img.size;
     if (sz.width < 14 || sz.height < 14 || sz.width > 64 || sz.height > 64) return img;
     NSNumber *state = objc_getAssociatedObject(img, kStripState);
@@ -991,10 +1046,10 @@ static UIImage *ShadowStripImage(UIImage *img) {
     if (!ctx) { free(buf); return img; }
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
 
-    int solid = 0, light = 0, dark = 0, darkOpq = 0, colored = 0;
+    int solid = 0, light = 0, dark = 0, darkOpq = 0, colored = 0, clear = 0;
     for (size_t i = 0; i < w * h; i++) {
         const uint8_t *px = buf + i * 4;
-        if (px[3] < 24) continue;
+        if (px[3] < 24) { clear++; continue; }
         solid++;
         CGFloat a = px[3];
         CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
@@ -1005,7 +1060,8 @@ static UIImage *ShadowStripImage(UIImage *img) {
         else if (lum > 0.8 && px[3] >= 200) light++;
     }
     BOOL ok = solid >= 20 && colored * 10 <= solid && light * 100 >= 20 * solid &&
-              dark * 100 >= 5 * solid && darkOpq <= light;
+              dark * 100 >= 5 * solid && darkOpq <= light &&
+              (size_t)clear * 100 >= 25 * w * h;   // icon that su co nhieu vung trong suot; anh mask/gradient dac thi bo qua
     if (!ok) {
         CGContextRelease(ctx);
         free(buf);
@@ -1492,6 +1548,57 @@ static void ClearCrash(void);
 - (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)vc { [self saveColor:vc.selectedColor]; }
 @end
 
+// ---- Cong cu chan doan: giu 4 ngon 1 giay -> sao chep cay layer vao clipboard ----
+static NSString *HexCG(CGColorRef c) {
+    CGFloat r, g, b, a;
+    if (!CGRGBA(c, &r, &g, &b, &a)) return c ? @"?" : @"nil";
+    return [NSString stringWithFormat:@"%@@%.2f", HexFromRGB(r, g, b), a];
+}
+
+static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUInteger limit) {
+    if (!l || depth > 16 || out.length > limit) return;
+    CGSize s = l.bounds.size;
+    BOOL shp = [l isKindOfClass:CAShapeLayer.class];
+    BOOL txt = [l isKindOfClass:CATextLayer.class];
+    BOOL small = s.width <= 64 && s.height <= 64;
+    BOOL show = kb ? (l.contents != nil || shp || txt) : (l.shadowOpacity > 0 || shp || (l.contents && small));
+    if (show) {
+        [out appendFormat:@"%d %@ %.0fx%.0f", depth, NSStringFromClass(l.class), s.width, s.height];
+        id d = l.delegate;
+        if (d) [out appendFormat:@" del=%@", NSStringFromClass([d class])];
+        if (l.contents) [out appendString:@" contents"];
+        if (l.hidden) [out appendString:@" HIDDEN"];
+        if (l.opacity < 0.99) [out appendFormat:@" op=%.2f", l.opacity];
+        if (l.shadowOpacity > 0)
+            [out appendFormat:@" shadow(op=%.2f r=%.1f col=%@)", l.shadowOpacity, l.shadowRadius, HexCG(l.shadowColor)];
+        if (l.backgroundColor) [out appendFormat:@" bg=%@", HexCG(l.backgroundColor)];
+        if (shp) {
+            CAShapeLayer *sh = (CAShapeLayer *)l;
+            [out appendFormat:@" fill=%@ stroke=%@ lw=%.1f", HexCG(sh.fillColor), HexCG(sh.strokeColor), sh.lineWidth];
+        }
+        @try {
+            id m = [l valueForKey:@"contentsMultiplyColor"];
+            if (m) [out appendFormat:@" mult=%@", HexCG((__bridge CGColorRef)m)];
+        } @catch (NSException *e) {}
+        [out appendString:@"\n"];
+    }
+    for (CALayer *sub in [l.sublayers copy]) DumpLayer(sub, depth + 1, kb, out, limit);
+}
+
+static NSString *DumpAll(void) {
+    NSMutableString *out = [NSMutableString new];
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
+            NSString *cn = NSStringFromClass(w.class);
+            BOOL kb = KbName(cn) || [cn containsString:@"TextEffects"];
+            [out appendFormat:@"== %@ level=%.0f kb=%d\n", cn, w.windowLevel, kb];
+            DumpLayer(w.layer, 0, kb, out, out.length + 7000);
+        }
+    }
+    return out;
+}
+
 @interface AACHelper : NSObject <UIGestureRecognizerDelegate, UIAdaptivePresentationControllerDelegate>
 + (instancetype)shared;
 @end
@@ -1563,6 +1670,12 @@ static void ShowPanel(int attempt) {
     return YES;
 }
 
+- (void)onDump:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    UIPasteboard.generalPasteboard.string = DumpAll();
+    [[UINotificationFeedbackGenerator new] notificationOccurred:UINotificationFeedbackTypeSuccess];
+}
+
 - (void)presentationControllerDidDismiss:(UIPresentationController *)pc {
     ClosePanelWindow();
 }
@@ -1607,6 +1720,13 @@ static void Setup(UIWindow *w) {
                 g.delaysTouchesEnded = NO;
                 g.delegate = [AACHelper shared];
                 [w addGestureRecognizer:g];
+                UILongPressGestureRecognizer *g2 = [[UILongPressGestureRecognizer alloc]
+                    initWithTarget:[AACHelper shared] action:@selector(onDump:)];
+                g2.numberOfTouchesRequired = 4;
+                g2.minimumPressDuration = 1.0;
+                g2.cancelsTouchesInView = NO;
+                g2.delegate = [AACHelper shared];
+                [w addGestureRecognizer:g2];
             });
         }
     }
@@ -1641,7 +1761,11 @@ static void Setup(UIWindow *w) {
 - (void)setTintColor:(UIColor *)c {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    if (gMaster && gOn[AACIcon] && c && OnMain() && IsInkColor(c)) { %orig(gColor[AACIcon]); return; }
+    if (gMaster && gOn[AACIcon] && c && OnMain() && IsInkColor(c)) {
+        %orig(gColor[AACIcon]);
+        if ([self isKindOfClass:UIImageView.class]) MarkInk(self.layer);
+        return;
+    }
     %orig;
 }
 - (void)setBackgroundColor:(UIColor *)c {
@@ -1682,16 +1806,18 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     CGColorRef n = NULL;
+    BOOL inkSwap = NO;
     if (gMaster && c) {
         int mcls = 0;
         n = LayerRemap(c, AACIcon, &mcls);
         if (n && mcls == 2 && OnMain() && InGlassLayer(self)) n = NULL;
         if (!n && gOn[AACIcon] && OnMain() && IsInkCG(c) && !InGlassLayer(self)) {
             CGSize s = self.bounds.size;
-            if (s.width <= 64 && s.height <= 64) n = IconShapeColor(self);
+            if (s.width <= 64 && s.height <= 64) { n = IconShapeColor(self); inkSwap = YES; }
         }
     }
     %orig(n ?: c);
+    if (inkSwap) MarkInk(self);
 }
 // [MOI] Go bong do tren nut/icon da doi sang accent
 - (void)setShadowOpacity:(float)v {
@@ -1834,6 +1960,7 @@ static void Setup(UIWindow *w) {
     // [MOI] icon da doi sang accent -> bo bong do
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
     if (self.window) KbImageFix(self);
+    if (n && objc_getAssociatedObject(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
 }
 %end
 
@@ -1841,12 +1968,18 @@ static void Setup(UIWindow *w) {
 - (UIImage *)imageWithTintColor:(UIColor *)c renderingMode:(UIImageRenderingMode)m {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
-    return %orig(IconTintFix(c), m);
+    UIColor *n = IconTintFix(c);
+    UIImage *o = %orig(n, m);
+    if (o && c && n != c && OnMain()) objc_setAssociatedObject(o, kInkImg, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return o;
 }
 - (UIImage *)imageWithTintColor:(UIColor *)c {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
-    return %orig(IconTintFix(c));
+    UIColor *n = IconTintFix(c);
+    UIImage *o = %orig(n);
+    if (o && c && n != c && OnMain()) objc_setAssociatedObject(o, kInkImg, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return o;
 }
 %end
 
@@ -1994,6 +2127,11 @@ static void Setup(UIWindow *w) {
             }
         }
         %orig;
+        if (w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160 && ![self isKindOfClass:CAShapeLayer.class]) {
+            __weak CALayer *wl = self;
+            dispatch_async(dispatch_get_main_queue(), ^{ KbLate(wl); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
+        }
         return;
     }
 
