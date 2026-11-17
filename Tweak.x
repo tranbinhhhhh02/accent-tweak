@@ -465,19 +465,40 @@ static BOOL ViewInKeyboard(UIView *v) {
     return NO;
 }
 
-static BOOL IsKeyboardLayer(CALayer *l) {
-    BOOL checked = NO;
-    for (int i = 0; i < 10 && l; i++, l = l.superlayer) {
-        if (KbName(NSStringFromClass(l.class))) return YES;
-        id d = l.delegate;
-        if (d) {
-            if (KbName(NSStringFromClass([d class]))) return YES;
-            if (!checked && [d isKindOfClass:UIView.class]) {
-                checked = YES;
-                if (ViewInKeyboard((UIView *)d)) return YES;
-            }
+// Danh sach layer goc cua cac cua so ban phim (chi so sanh con tro, khong bao gio gui message toi chung)
+static uintptr_t gKbRootPtr[8];
+static int gKbRootN;
+static CFAbsoluteTime gKbRootT;
+
+static void RefreshKbRoots(void) {
+    gKbRootN = 0;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
+            NSString *cn = NSStringFromClass(w.class);
+            if ((KbName(cn) || [cn containsString:@"TextEffects"]) && gKbRootN < 8)
+                gKbRootPtr[gKbRootN++] = (uintptr_t)(__bridge void *)w.layer;
         }
     }
+}
+
+static BOOL KbRootKnown(uintptr_t rp) {
+    for (int i = 0; i < gKbRootN; i++) if (gKbRootPtr[i] == rp) return YES;
+    return NO;
+}
+
+static BOOL IsKeyboardLayer(CALayer *l) {
+    if (!l || !OnMain()) return NO;
+    CALayer *root = l;
+    for (int i = 0; i < 60 && l; i++, l = l.superlayer) {
+        if (KbName(NSStringFromClass(l.class))) return YES;
+        root = l;
+    }
+    uintptr_t rp = (uintptr_t)(__bridge void *)root;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gKbRootT > 0.3) { RefreshKbRoots(); gKbRootT = now; }
+    if (KbRootKnown(rp)) return YES;
+    if (now - gKbRootT > 0.05) return NO;   // vua lam moi xong -> khong co
     return NO;
 }
 
@@ -607,9 +628,7 @@ static BOOL SubtreeAccent(CALayer *l, int depth, int *budget) {
 }
 
 static BOOL ShadowNamed(CALayer *l) {
-    if ([NSStringFromClass(l.class) containsString:@"Shadow"]) return YES;
-    id d = l.delegate;
-    return d && [NSStringFromClass([d class]) containsString:@"Shadow"];
+    return [NSStringFromClass(l.class) containsString:@"Shadow"];
 }
 
 static BOOL ShadowEligible(CALayer *l) {
@@ -689,6 +708,7 @@ static BOOL ContentsLooksAccent(CALayer *l) {
 }
 
 static void FixDoubleTint(CALayer *l) {
+    Crumb("FixDoubleTint");
     if (!l || !gCGWhite) return;
     @try {
         id m = [l valueForKey:@"contentsMultiplyColor"];
@@ -696,7 +716,7 @@ static void FixDoubleTint(CALayer *l) {
         CGColorRef mc = (__bridge CGColorRef)m;
         if (IsWhiteCG(mc)) return;
         // Layer da duoc ta doi anh sang accent -> multiply bat ke la accent/den deu phai ve trang (tranh to 2 lan => mau khac nhau)
-        BOOL marked = GET(l, kKbSrc) || GET(l, kContentsSrc);
+        BOOL marked = GET(l, kKbSrc) || (!gSafe && GET(l, kContentsSrc));
         if (marked) {
             if (InkAnyAlphaCG(mc) || NearAccentCG(mc, 0.1, 0.05) || IsOurs(mc)) [l setContentsMultiplyColor:gCGWhite];
             return;
@@ -723,6 +743,7 @@ static void KbWhiteVerify(CALayer *l) {
 }
 
 static void KbLate(CALayer *l) {
+    Crumb("KbLate");
     if (!l || !gMaster || !OnMain()) return;
     KbWhiteVerify(l);
     id c = l.contents;
@@ -753,6 +774,7 @@ static BOOL HasTwinSibling(CALayer *l) {
 }
 
 static void GlowCheck(CALayer *l) {
+    Crumb("GlowCheck");
     if (!l || !gMaster || !OnMain() || l.hidden || !GET(l, kInkTint) || IsKeyboardLayer(l)) return;
     if (HasTwinSibling(l)) l.hidden = YES;
 }
@@ -768,6 +790,7 @@ static void MarkInk(CALayer *l) {
 
 // ---------------- Refresh ----------------
 static void ReapplyContents(CALayer *l) {
+    Crumb("ReapplyContents");
     if (!OnMain()) return;
     id src = GET(l, kContentsSrc);
     if (src) {
@@ -783,6 +806,7 @@ static void ReapplyContents(CALayer *l) {
 }
 
 static void ReapplyShape(CALayer *l) {
+    Crumb("ReapplyShape");
     if (![l isKindOfClass:CAShapeLayer.class]) return;
     NSNumber *m = GET(l, kIconShape);
     if (!m) return;
@@ -832,6 +856,7 @@ static void ApplyAll(void) {
 }
 
 static void FixUnderFill(CALayer *l, int depth) {
+    Crumb("FixUnderFill");
     if (!l || depth > 6) return;
     for (CALayer *s in [l.sublayers copy]) {
         ReapplyShape(s);
@@ -850,6 +875,7 @@ static void FixUnderFillView(UIView *v, int depth) {
 }
 
 static void MarkFill(CALayer *l, UIView *v) {
+    Crumb("MarkFill");
     if (!OnMain() || l.bounds.size.height > 120 || GET(l, kFill)) return;
     SET(l, kFill, @YES);
     gFillCount++;
@@ -929,6 +955,7 @@ static BOOL LooksLikeAvatarView(UIView *v) {
 
 // ---------------- Nut tron den co mui ten (nut gui, "Hien thi cau tra loi") ----------------
 static void ArrowFixView(UIView *v, int depth) {
+    Crumb("ArrowFixView");
     if (!v || depth > 3) return;
     for (UIView *sv in [v.subviews copy]) {
         if ([sv isKindOfClass:UIImageView.class]) {
@@ -948,12 +975,15 @@ static void ArrowFixView(UIView *v, int depth) {
 static void ArrowFix(CALayer *l) {
     if (!OnMain() || !l) return;
     __weak CALayer *wl = l;
+    // lay view ngay luc nay (dang trong setter nen delegate con song), giu bang weak -> khong dung delegate treo sau do
+    id d0 = l.delegate;
+    __weak UIView *wv = [d0 isKindOfClass:UIView.class] ? (UIView *)d0 : nil;
     void (^work)(void) = ^{
         CALayer *ly = wl;
         if (!ly) return;
         FixUnderFill(ly, 0);
-        id d = ly.delegate;
-        if ([d isKindOfClass:UIView.class]) ArrowFixView((UIView *)d, 0);
+        UIView *ov = wv;
+        if (ov) ArrowFixView(ov, 0);
     };
     dispatch_async(dispatch_get_main_queue(), work);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), work);
@@ -1044,6 +1074,7 @@ static NSHashTable *gPend;
 #define PEND_LOCK @"AACPend"
 
 static void RunCheck(CALayer *l, BOOL shape) {
+    Crumb("RunCheck");
     if (shape && [l isKindOfClass:CAShapeLayer.class]) {
         TryBlackShape((CAShapeLayer *)l);
         TryBlackIconShape((CAShapeLayer *)l);
@@ -1071,6 +1102,7 @@ static void AddPending(CALayer *l, BOOL shape) {
 }
 
 static void PendingRun(CALayer *l) {
+    Crumb("PendingRun");
     BOOL has;
     @synchronized (PEND_LOCK) { has = [gPend containsObject:l]; }
     if (!has) return;
@@ -1105,6 +1137,7 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
 // ---------------- Bien doi UIImage ----------------
 // Icon trang co vien/bong den "nuong" trong anh -> xoa phan toi, giu phan trang
 static UIImage *ShadowStripImage(UIImage *img) {
+    Crumb("ShadowStripImage");
     if (!img || !gMaster || !OnMain() || GET(img, kStripSrc)) return img;
     if (img.isSymbolImage || img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.images.count > 1) return img;
     if (!UIEdgeInsetsEqualToEdgeInsets(img.capInsets, UIEdgeInsetsZero)) return img;
@@ -1159,6 +1192,7 @@ static UIImage *IconRemapImage(UIImage *img) {
 
 // App thuong: icon xanh -> accent. Facebook (gSafe): icon den kem chi tiet trang (vd Messenger) -> den thanh accent, giu trang.
 static UIImage *ImageRemap(UIImage *img) {
+    Crumb("ImageRemap");
     BOOL dual = gSafe;
     if (!img || !gMaster || !OnMain() || GET(img, kRemSrc) || GET(img, kAccentSrc)) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || (dual && img.isSymbolImage)) return img;
@@ -1276,6 +1310,7 @@ static void TabFixView(UIView *v, int depth) {
 }
 
 static void TabBarFix(UITabBar *bar) {
+    Crumb("TabBarFix");
     if (!bar || !gMaster || gInTabFix || !OnMain()) return;
     gInTabFix = YES;
     TabFixView(bar, 0);
@@ -1419,6 +1454,7 @@ static void SweepView(UIView *v, int depth) {
 }
 
 static void KbSweepAll(void) {
+    Crumb("KbSweepAll");
     if (!gMaster || gSafe || !OnMain()) return;
     BOOL oldDark = gDark;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -1797,6 +1833,7 @@ static void Setup(UIWindow *w) {
 }
 - (void)setContentsMultiplyColor:(CGColorRef)c {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    Crumb("hook:multiply");
     CGColorRef n = NULL;
     BOOL inkSwap = NO;
     if (gMaster && c) {
@@ -1845,6 +1882,7 @@ static void Setup(UIWindow *w) {
 }
 - (void)layoutSublayers {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    Crumb("hook:layoutSublayers");
     %orig;
     if (gHasPend && OnMain()) PendingRun(self);
     if (!gMaster || !OnMain()) return;
@@ -1861,6 +1899,7 @@ static void Setup(UIWindow *w) {
 }
 - (void)setContents:(id)contents {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    Crumb("hook:setContents");
     if (gInContents) { %orig; return; }
     CLEAR(self, kContentsSrc);
     CLEAR(self, kKbSrc);
