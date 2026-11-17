@@ -722,23 +722,28 @@ static void KbImageFix(UIImageView *iv) {
 }
 
 // Anh da duoc to accent ma contentsMultiplyColor cung la accent / den -> accent x accent (bi dam) hoac bi den. Dua multiply ve trang.
+// FIX: phat hien theo trung binh co trong so alpha (net mong nhu . , ? #+= truoc day bi bo sot vi alpha sau khi thu nho qua thap)
 static BOOL ContentsLooksAccent(CALayer *l) {
     id c = l.contents;
     if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return NO;
     uint8_t buf[SN * SN * 4];
     if (!SampleCG((__bridge CGImageRef)c, buf)) return NO;
-    CGFloat sr = 0, sg = 0, sb = 0;
+    CGFloat sr = 0, sg = 0, sb = 0, sw = 0;
     int n = 0;
     for (int i = 0; i < SN * SN; i++) {
         const uint8_t *px = buf + i * 4;
-        if (px[3] < 160) continue;
+        if (px[3] < 24) continue;
         CGFloat r, g, b;
         Unpm(px, &r, &g, &b);
-        sr += r; sg += g; sb += b;
+        CGFloat wt = px[3] / 255.0;
+        sr += r * wt; sg += g * wt; sb += b * wt; sw += wt;
         n++;
     }
-    return n >= 3 && NearAccentRGB(sr / n, sg / n, sb / n, 0.15);
+    return n >= 1 && sw > 0 && NearAccentRGB(sr / sw, sg / sw, sb / sw, 0.18);
 }
+
+// Layer nay da duoc tweak to accent (anh) -> multiply KHONG duoc phep la accent nua
+static BOOL TintedByUs(CALayer *l) { return GET(l, kKbSrc) || GET(l, kContentsSrc); }
 
 static void FixDoubleTint(CALayer *l) {
     if (!l || !gCGWhite) return;
@@ -746,7 +751,7 @@ static void FixDoubleTint(CALayer *l) {
         id m = [l valueForKey:@"contentsMultiplyColor"];
         if (!m) return;
         CGColorRef mc = (__bridge CGColorRef)m;
-        if (!IsWhiteCG(mc) && NearAccentCG(mc, 0.1, 0.9) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
+        if (!IsWhiteCG(mc) && NearAccentCG(mc, 0.1, 0.9) && (TintedByUs(l) || ContentsLooksAccent(l))) [l setContentsMultiplyColor:gCGWhite];
     } @catch (NSException *e) {}
 }
 
@@ -1369,7 +1374,8 @@ static BOOL InputWindow(UIWindow *w) {
 static BOOL KbForceName(NSString *cn) {
     return [cn containsString:@"DockItem"] || [cn containsString:@"DockView"] || [cn containsString:@"Dock"] ||
            [cn containsString:@"InputSwitcher"] || [cn containsString:@"Switcher"] || [cn containsString:@"Globe"] ||
-           [cn containsString:@"KeyboardMenu"] || [cn containsString:@"UIKBMenu"] || [cn containsString:@"KBMenu"];
+           [cn containsString:@"KeyboardMenu"] || [cn containsString:@"UIKBMenu"] || [cn containsString:@"KBMenu"] ||
+           [cn containsString:@"Popover"] || [cn containsString:@"OneHand"] || [cn containsString:@"Handed"];
 }
 
 // Icon trang/xam nhat (giu alpha) -> accent. Bo qua nen phim (it vung trong suot) va icon den.
@@ -1485,6 +1491,8 @@ static void SweepLayer(CALayer *l, int depth) {
                 if (!np || (uintptr_t)np.unsignedLongValue != p) {
                     SET(l, kSweepPtr, @((unsigned long)p));
                     BOOL force = !gDark && KbForceLayer(l);
+                    // Icon qua dia cau / menu: bo bo loc glass/vibrancy de mau accent hien ra dung
+                    if (force && l.compositingFilter) l.compositingFilter = nil;
                     // Chi dong vao layer co multiply trang/khong co (qua dia cau...). Layer phim chu co multiply den/accent -> de nguyen cho logic ban phim.
                     BOOL mulOK = YES;
                     @try {
@@ -1520,6 +1528,8 @@ static void SweepView(UIView *v, int depth) {
     if ([v isKindOfClass:UIImageView.class] && s.width >= 8 && s.width <= 56 && s.height <= 56) {
         UIImageView *iv = (UIImageView *)v;
         BOOL force = !gDark && KbForceView(iv);
+        // Icon qua dia cau / menu: bo bo loc glass/vibrancy de mau accent hien ra dung
+        if (force && iv.layer.compositingFilter) iv.layer.compositingFilter = nil;
         if (iv.image && !GET(iv.image, kKbImg) && (force || WhiteOK(iv.layer))) {
             UIImage *out = SweepRecolorImage(iv.image, force);
             if (out) { gInKbFix = YES; iv.image = out; gInKbFix = NO; }
@@ -1534,6 +1544,34 @@ static void SweepView(UIView *v, int depth) {
         }
     }
     for (UIView *sv in [v.subviews copy]) SweepView(sv, depth + 1);
+}
+
+// Hook-level: icon qua dia cau / menu chon ban phim doi accent ngay khi duoc gan anh (khong cho den dot quet 0.3s)
+static void KbForceImageFix(UIImageView *iv) {
+    if (gInKbFix || gSafe || !gMaster || !OnMain() || !iv) return;
+    UIWindow *w = iv.window;
+    if (!w || !InputWindow(w) || w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) return;
+    CGSize s = iv.bounds.size;
+    if (s.width < 8 || s.width > 56 || s.height > 56 || !KbForceView(iv)) return;
+    BOOL oldDark = gDark;
+    gDark = NO;
+    if (iv.layer.compositingFilter) iv.layer.compositingFilter = nil;
+    UIImage *im = iv.image;
+    if (im && !GET(im, kKbImg)) {
+        UIImage *out = SweepRecolorImage(im, YES);
+        if (out) { gInKbFix = YES; iv.image = out; gInKbFix = NO; }
+    }
+    gDark = oldDark;
+}
+
+// FIX: chu/so tren phim bi to 2 lan (accent x accent -> dam hon cac phim khac). Quet toan bo cay layer ban phim, dua multiply ve trang.
+static void FixTintTree(CALayer *l, int depth) {
+    if (!l || depth > 30) return;
+    if (l.contents) {
+        CGSize z = l.bounds.size;
+        if (z.width <= 220 && z.height <= 160) FixDoubleTint(l);
+    }
+    for (CALayer *sub in [l.sublayers copy]) FixTintTree(sub, depth + 1);
 }
 
 // FIX: mo lai nhung layer ban phim da bi an nham (kHidMark) trong luc quet dinh ky
@@ -1552,6 +1590,7 @@ static void KbSweepAll(void) {
         for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
             if (w.hidden || w.alpha < 0.01 || !InputWindow(w)) continue;
             UnhideKbLayers(w.layer, 0);
+            FixTintTree(w.layer, 0);
             if (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) continue;
             gDark = NO;
             SweepView(w, 0);
@@ -1940,9 +1979,11 @@ static void Setup(UIWindow *w) {
         }
     }
     // anh cua layer nay da duoc to accent -> multiply de trang, tranh to 2 lan
+    // FIX: layer da duoc tweak to accent (kKbSrc/kContentsSrc) trong ban phim -> luon dua ve trang, khong phu thuoc viec doan mau anh
     if (n && n != gCGWhite && OnMain()) {
         BOOL marked = GET(self, kKbSrc) || GET(self, kContentsSrc);
-        if ((marked || IsKeyboardLayer(self)) && ContentsLooksAccent(self)) n = gCGWhite;
+        BOOL kbl = marked || IsKeyboardLayer(self);
+        if (kbl && ((marked && IsKeyboardLayer(self)) || ContentsLooksAccent(self))) n = gCGWhite;
     }
     %orig(n ?: c);
     if (inkSwap) MarkInk(self);
@@ -2132,7 +2173,7 @@ static void Setup(UIWindow *w) {
 - (void)didMoveToWindow {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
     %orig;
-    if (self.window) KbImageFix(self);
+    if (self.window) { KbImageFix(self); KbForceImageFix(self); }
 }
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
@@ -2145,7 +2186,7 @@ static void Setup(UIWindow *w) {
     }
     %orig(n);
     if (n && n != img && gMaster && OnMain()) KillShadowUp(self.layer, 2);   // icon da doi accent -> bo bong do
-    if (self.window) KbImageFix(self);
+    if (self.window) { KbImageFix(self); KbForceImageFix(self); }
     if (n && GET(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
 }
 %end
