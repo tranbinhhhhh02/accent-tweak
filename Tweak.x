@@ -829,6 +829,107 @@ static UIImage *BlueImageRemap(UIImage *img) {
     return out;
 }
 
+
+// ---- Icon den (kem chi tiet trang, vd icon Messenger tren Facebook) -> doi den thanh accent, giu trang ----
+static const void *kDualSrc   = &kDualSrc;
+static const void *kDualState = &kDualState;
+static const void *kDualOut   = &kDualOut;
+static const void *kDualStamp = &kDualStamp;
+
+static UIImage *DualImageRemap(UIImage *img) {
+    if (!img || !gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (objc_getAssociatedObject(img, kDualSrc) || objc_getAssociatedObject(img, kBlueSrc) || objc_getAssociatedObject(img, kAccentSrc)) return img;
+    if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
+    CGSize sz = img.size;
+    if (sz.width < 18 || sz.height < 18 || sz.width > 44 || sz.height > 44 || img.images.count > 1) return img;
+
+    NSNumber *state = objc_getAssociatedObject(img, kDualState);
+    if (state && !state.boolValue) return img;
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    if (state) {
+        UIImage *cached = objc_getAssociatedObject(img, kDualOut);
+        if (cached && [objc_getAssociatedObject(img, kDualStamp) intValue] == want) return cached;
+    } else {
+        static CFAbsoluteTime winStart; static int winCount;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - winStart > 1.0) { winStart = now; winCount = 0; }
+        if (++winCount > 40) return img;
+    }
+
+    CGFloat scale = img.scale > 0 ? img.scale : 1;
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = scale;
+    fmt.opaque = NO;
+    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
+        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
+        }];
+    CGImageRef cg = flat.CGImage;
+    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
+    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) {
+        objc_setAssociatedObject(img, kDualState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+    uint8_t *buf = calloc(w * h, 4);
+    if (!buf) return img;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return img; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+
+    int solid = 0, blk = 0, mid = 0, other = 0;
+    for (size_t i = 0; i < w * h; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) continue;
+        solid++;
+        CGFloat a = px[3];
+        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn > 0.12) { other++; continue; }
+        CGFloat lum = (r + g + b) / 3.0;
+        if (lum < 0.16) blk++;
+        else if (lum > 0.25 && lum < 0.75) mid++;
+    }
+    BOOL ok = solid >= 30 && other * 30 <= solid && blk * 100 >= 30 * solid && mid * 100 <= 18 * solid;
+    if (!ok) {
+        CGContextRelease(ctx);
+        free(buf);
+        objc_setAssociatedObject(img, kDualState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+
+    CGFloat ar = gDark ? gRGBD[0] : gRGBL[0];
+    CGFloat ag = gDark ? gRGBD[1] : gRGBL[1];
+    CGFloat ab = gDark ? gRGBD[2] : gRGBL[2];
+    for (size_t i = 0; i < w * h; i++) {
+        uint8_t *px = buf + i * 4;
+        if (px[3] == 0) continue;
+        CGFloat a = px[3];
+        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn > 0.12) continue;
+        CGFloat t = fmax(0, fmin(1, (r + g + b) / 3.0));
+        CGFloat nr = ar * (1 - t) + t, ng = ag * (1 - t) + t, nb = ab * (1 - t) + t;
+        px[0] = (uint8_t)lround(nr * a);
+        px[1] = (uint8_t)lround(ng * a);
+        px[2] = (uint8_t)lround(nb * a);
+    }
+    CGImageRef outCG = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    free(buf);
+    if (!outCG) return img;
+    UIImage *out = [UIImage imageWithCGImage:outCG scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(outCG);
+
+    objc_setAssociatedObject(out, kDualSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kDualState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kDualOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kDualStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
 static UIColor *IconTintFix(UIColor *c) {
     if (gMaster && gOn[AACIcon] && c && OnMain()) {
         if (IsInkColor(c)) return gColor[AACIcon];
@@ -1366,7 +1467,7 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    %orig(BlueImageRemap(IconRemapImage(img)), st);
+    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(img))), st);
 }
 %end
 
@@ -1374,7 +1475,7 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    %orig(BlueImageRemap(IconRemapImage(img)));
+    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(img))));
 }
 %end
 
@@ -1385,7 +1486,7 @@ static void Setup(UIWindow *w) {
     if (OnMain() && !objc_getAssociatedObject(self.layer, kImgView))
         objc_setAssociatedObject(self.layer, kImgView, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
-    UIImage *n = BlueImageRemap(IconRemapImage(img));
+    UIImage *n = DualImageRemap(BlueImageRemap(IconRemapImage(img)));
     if (n && gMaster && gOn[AACIcon] && OnMain()) {
         CGSize s = n.size;
         if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
