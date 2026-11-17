@@ -613,6 +613,16 @@ static void KbImageFix(UIImageView *iv) {
     gInKbFix = NO;
 }
 
+// Chu/so ban phim bi dam hon accent: anh da duoc to accent, ma contentsMultiplyColor cung la accent
+// -> hai lop mau nhan voi nhau (accent x accent). Dua multiply ve trang de ra dung 1 lan accent.
+static void FixDoubleTint(CALayer *l) {
+    if (!l || !gCGWhite) return;
+    @try {
+        id m = [l valueForKey:@"contentsMultiplyColor"];
+        if (m && IsAccentCG((__bridge CGColorRef)m)) [l setContentsMultiplyColor:gCGWhite];
+    } @catch (NSException *e) {}
+}
+
 // Thu lai doi mau cho layer ban phim khi layer da gan vao cua so
 static void KbLate(CALayer *l) {
     if (!l || !gMaster || !gOn[AACIcon] || !OnMain()) return;
@@ -626,6 +636,7 @@ static void KbLate(CALayer *l) {
     gInContents = YES;
     l.contents = (__bridge id)k;
     gInContents = NO;
+    FixDoubleTint(l);
     CGImageRelease(k);
 }
 
@@ -674,6 +685,7 @@ static void ReapplyContents(CALayer *l) {
             gInContents = YES;
             l.contents = (__bridge id)t;
             gInContents = NO;
+            FixDoubleTint(l);
             CGImageRelease(t);
         }
         return;
@@ -685,6 +697,7 @@ static void ReapplyContents(CALayer *l) {
             gInContents = YES;
             l.contents = (__bridge id)t;
             gInContents = NO;
+            FixDoubleTint(l);
             CGImageRelease(t);
         }
     }
@@ -1856,6 +1869,8 @@ static void Setup(UIWindow *w) {
             if (s.width <= 64 && s.height <= 64) { n = IconShapeColor(self); inkSwap = YES; }
         }
     }
+    // anh cua layer nay da duoc to accent -> multiply de trang, tranh to 2 lan
+    if (n && (objc_getAssociatedObject(self, kKbSrc) || objc_getAssociatedObject(self, kContentsSrc))) n = gCGWhite;
     %orig(n ?: c);
     if (inkSwap) MarkInk(self);
 }
@@ -2174,6 +2189,7 @@ static void Setup(UIWindow *w) {
             if (k) {
                 objc_setAssociatedObject(self, kKbSrc, contents, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 %orig((__bridge id)k);
+                FixDoubleTint(self);
                 CGImageRelease(k);
                 return;
             }
@@ -2191,6 +2207,7 @@ static void Setup(UIWindow *w) {
     if (!t) { %orig; return; }
     objc_setAssociatedObject(self, kContentsSrc, contents, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     %orig((__bridge id)t);
+    FixDoubleTint(self);
     CGImageRelease(t);
     KillShadowUp(self, 2);
 }
