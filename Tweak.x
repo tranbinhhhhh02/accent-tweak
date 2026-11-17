@@ -33,7 +33,6 @@ KEY(kHidMark);     // layer bi tweak an (glow) -> neu hoa ra nam trong ban phim 
 @implementation AACWeak
 @end
 
-static BOOL gInMul;
 static BOOL gMaster = YES, gDark, gInTry, gInTabFix, gInContents, gInKbFix, gSafe;
 static UIColor   *gColor;
 static CGColorRef gCGLight, gCGDark, gCGSoftLight, gCGSoftDark, gCGWhite;
@@ -261,11 +260,6 @@ static BOOL IsWhiteCG(CGColorRef c) {
     CGFloat r, g, b, a;
     return CGRGBA(c, &r, &g, &b, &a) && WhiteRGBA(r, g, b, a);
 }
-// Mau toi (bat ke alpha) - dung cho multiply color cua icon ban phim (thuong la den co alpha < 1)
-static BOOL InkAnyAlphaCG(CGColorRef c) {
-    CGFloat r, g, b, a;
-    return CGRGBA(c, &r, &g, &b, &a) && a > 0.05 && r < 0.3 && g < 0.3 && b < 0.3;
-}
 #define IsBlackColor(c) DarkUI(c, 0.03)
 #define IsInkColor(c)   DarkUI(c, 0.16)
 #define IsBlackCG(c)    DarkCG(c, 0.03)
@@ -293,7 +287,17 @@ static BOOL LayerUnderFill(CALayer *l) {
     return NO;
 }
 
+static int KbTreeState(CALayer *l);
+static BOOL IsKeyboardLayer(CALayer *l);
+static BOOL UnderAccentKey(CALayer *l);
+
 static CGColorRef IconShapeColor(CALayer *l) {
+    // FIX: chu/so tren phim trang bi to TRANG (trung mau phim) -> mat chu.
+    // Trong ban phim chi dung trang khi that su nam duoi nut accent, con lai luon la accent.
+    if (OnMain() && (KbTreeState(l) == 1 || IsKeyboardLayer(l))) {
+        if (gCGWhite && UnderAccentKey(l)) return gCGWhite;
+        return CGFor(NO);
+    }
     if (gCGWhite && LayerUnderFill(l.superlayer)) return gCGWhite;
     return CGFor(NO);
 }
