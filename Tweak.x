@@ -615,11 +615,40 @@ static void KbImageFix(UIImageView *iv) {
 
 // Chu/so ban phim bi dam hon accent: anh da duoc to accent, ma contentsMultiplyColor cung la accent
 // -> hai lop mau nhan voi nhau (accent x accent). Dua multiply ve trang de ra dung 1 lan accent.
+static BOOL ContentsLooksAccent(CALayer *l) {
+    id c = l.contents;
+    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return NO;
+    enum { N = 16 };
+    uint8_t buf[N * N * 4];
+    memset(buf, 0, sizeof buf);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return NO;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), (__bridge CGImageRef)c);
+    CGContextRelease(ctx);
+    CGFloat sr = 0, sg = 0, sb = 0; int n = 0;
+    for (int i = 0; i < N * N; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 200) continue;
+        sr += px[0] / (CGFloat)px[3]; sg += px[1] / (CGFloat)px[3]; sb += px[2] / (CGFloat)px[3];
+        n++;
+    }
+    if (n < 3) return NO;
+    sr /= n; sg /= n; sb /= n;
+    for (int d = 0; d < 2; d++) {
+        const CGFloat *q = d ? gRGBD : gRGBL;
+        if (fabs(sr - q[0]) < 0.12 && fabs(sg - q[1]) < 0.12 && fabs(sb - q[2]) < 0.12) return YES;
+    }
+    return NO;
+}
+
 static void FixDoubleTint(CALayer *l) {
     if (!l || !gCGWhite) return;
     @try {
         id m = [l valueForKey:@"contentsMultiplyColor"];
-        if (m && IsAccentCG((__bridge CGColorRef)m)) [l setContentsMultiplyColor:gCGWhite];
+        if (m && IsAccentCG((__bridge CGColorRef)m) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
     } @catch (NSException *e) {}
 }
 
@@ -1870,7 +1899,7 @@ static void Setup(UIWindow *w) {
         }
     }
     // anh cua layer nay da duoc to accent -> multiply de trang, tranh to 2 lan
-    if (n && (objc_getAssociatedObject(self, kKbSrc) || objc_getAssociatedObject(self, kContentsSrc))) n = gCGWhite;
+    if (n && (objc_getAssociatedObject(self, kKbSrc) || objc_getAssociatedObject(self, kContentsSrc)) && ContentsLooksAccent(self)) n = gCGWhite;
     %orig(n ?: c);
     if (inkSwap) MarkInk(self);
 }
