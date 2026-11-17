@@ -26,9 +26,6 @@ KEY(kStripSrc);    KEY(kStripState);  KEY(kStripOut);
 KEY(kOrigMul);     KEY(kSweepPtr);    KEY(kSweepImg);
 KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh xanh (app thuong) / anh den (Facebook)
 KEY(kHidMark);     // layer bi tweak an (glow) -> neu hoa ra nam trong ban phim thi hien lai
-KEY(kForce);       // MOI: shape/layer thuoc menu chon ban phim / qua dia cau -> luon dung accent
-KEY(kForceSrc);    // MOI: anh goc truoc khi to accent (UIImage hoac CGImage)
-KEY(kForceStamp);  // MOI: phien ban mau da ap dung
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -36,7 +33,7 @@ KEY(kForceStamp);  // MOI: phien ban mau da ap dung
 @implementation AACWeak
 @end
 
-static BOOL gMaster = YES, gDark, gInTry, gInTabFix, gInContents, gInKbFix, gSafe, gForceTint;
+static BOOL gMaster = YES, gDark, gInTry, gInTabFix, gInContents, gInKbFix, gSafe;
 static UIColor   *gColor;
 static CGColorRef gCGLight, gCGDark, gCGSoftLight, gCGSoftDark, gCGWhite;
 static CGFloat    gRGBL[3], gRGBD[3];
@@ -295,8 +292,6 @@ static BOOL IsKeyboardLayer(CALayer *l);
 static BOOL UnderAccentKey(CALayer *l);
 
 static CGColorRef IconShapeColor(CALayer *l) {
-    // MOI: layer thuoc menu chon ban phim / qua dia cau -> luon accent
-    if (GET(l, kForce)) return CGFor(NO);
     // FIX: chu/so tren phim trang bi to TRANG (trung mau phim) -> mat chu.
     // Trong ban phim chi dung trang khi that su nam duoi nut accent, con lai luon la accent.
     if (OnMain() && (KbTreeState(l) == 1 || IsKeyboardLayer(l))) {
@@ -833,12 +828,6 @@ static void ReapplyContents(CALayer *l) {
     id src = GET(l, kContentsSrc);
     if (src) {
         CGImageRef t = CopyTintedCG((__bridge CGImageRef)src, IconShapeColor(l));
-        if (t) { PutContents(l, t); CGImageRelease(t); }
-        return;
-    }
-    id fs = GET(l, kForceSrc);   // MOI: icon menu chon ban phim / qua dia cau
-    if (fs && CFGetTypeID((__bridge CFTypeRef)fs) == CGImageGetTypeID()) {
-        CGImageRef t = CopyTintedCG((__bridge CGImageRef)fs, CGFor(NO));
         if (t) { PutContents(l, t); CGImageRelease(t); }
         return;
     }
@@ -1490,7 +1479,7 @@ static void SweepLayer(CALayer *l, int depth) {
         } else {
             id c = l.contents;
             if (c && CFGetTypeID((__bridge CFTypeRef)c) == CGImageGetTypeID() &&
-                !GET(l, kKbSrc) && !GET(l, kContentsSrc) && !GET(l, kForceSrc) && ![l.delegate isKindOfClass:UIImageView.class]) {
+                !GET(l, kKbSrc) && !GET(l, kContentsSrc) && ![l.delegate isKindOfClass:UIImageView.class]) {
                 NSNumber *np = GET(l, kSweepPtr);
                 uintptr_t p = (uintptr_t)(__bridge void *)c;
                 if (!np || (uintptr_t)np.unsignedLongValue != p) {
@@ -1572,222 +1561,12 @@ static void KbSweepAll(void) {
     gDark = oldDark;
 }
 
-// ================= MOI: To accent cho qua dia cau + menu chon ban phim (3 icon bo cuc trai/giua/phai) =================
-// Cach lam: khi mot view thuoc menu/dock ban phim gan vao cua so -> dang ky lam "goc" (weak).
-// Moi 0.3s (va ngay sau khi gan) quet CHI cay con cua cac goc nay: image view, button, layer contents, shape.
-// Khong dong vao nut Enter/Backspace/chu cai (khong nam trong cac goc nay) nen khong anh huong tinh nang cu.
-static NSHashTable *gForceRoots;
-static NSMapTable  *gForceCls;
-
-static BOOL ForceExcluded(NSString *cn) {
-    return [cn containsString:@"EditMenu"] || [cn containsString:@"Callout"] || [cn containsString:@"ContextMenu"];
-}
-
-// bit 1 = da tinh | bit 2 = ten chac chan cua UIKit (hop le ca khi nam ngoai cua so ban phim)
-// bit 4 = ten rong (chi hop le khi nam trong cua so ban phim)
-static int ForceClassFlags(Class c) {
-    if (!gForceCls)
-        gForceCls = [NSMapTable mapTableWithKeyOptions:(NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality)
-                                          valueOptions:NSPointerFunctionsStrongMemory];
-    NSNumber *n = [gForceCls objectForKey:c];
-    if (n) return n.intValue;
-    NSString *cn = NSStringFromClass(c);
-    int f = 1;
-    if (!ForceExcluded(cn)) {
-        BOOL apple = [cn hasPrefix:@"UI"] || [cn hasPrefix:@"_UI"];
-        if (apple && ([cn containsString:@"InputSwitcher"] || [cn containsString:@"KeyboardMenu"] ||
-                      [cn containsString:@"KBMenu"] || [cn containsString:@"OneHand"] || [cn containsString:@"KBDock"] ||
-                      [cn containsString:@"KeyboardDock"]))
-            f |= 2;
-        if (KbForceName(cn) || [cn containsString:@"Menu"] || [cn containsString:@"Handed"] || [cn containsString:@"Placement"])
-            f |= 4;
-    }
-    [gForceCls setObject:@(f) forKey:c];
-    return f;
-}
-
-// anh xam/trang/den (khong phai tranh mau): lay mau thu nho, tu choi anh nhieu mau hoac dac kin
-static BOOL ForceCandidateCG(CGImageRef cg) {
-    if (!cg) return NO;
-    uint8_t buf[SN * SN * 4];
-    if (!SampleCG(cg, buf)) return NO;
-    int opq = 0, col = 0;
-    for (int i = 0; i < SN * SN; i++) {
-        const uint8_t *px = buf + i * 4;
-        if (px[3] < 40) continue;
-        opq++;
-        CGFloat r, g, b;
-        Unpm(px, &r, &g, &b);
-        if (fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) > 0.35) col++;
-    }
-    if (opq < 4 || opq * 100 > 92 * SN * SN) return NO;
-    return col * 100 <= 35 * opq;
-}
-
-static inline int ForceWant(void) { return gVersion * 2 + (gDark ? 1 : 0); }
-
-// UIImage -> UIImage to accent (giu alpha). Tra nil neu khong can doi / khong doi duoc.
-static UIImage *ForceImage(UIImage *im) {
-    if (!im || im.images.count > 1) return nil;
-    int want = ForceWant();
-    NSNumber *st = GET(im, kForceStamp);
-    if (st && st.intValue == want) return nil;
-    UIImage *base = GET(im, kForceSrc) ?: im;
-    UIImage *out = nil;
-    if (base.isSymbolImage || base.renderingMode == UIImageRenderingModeAlwaysTemplate) {
-        gForceTint = YES;
-        out = [base imageWithTintColor:[UIColor colorWithCGColor:CGFor(NO)] renderingMode:UIImageRenderingModeAlwaysOriginal];
-        gForceTint = NO;
-    } else if (base.CGImage && base.size.width <= 96 && base.size.height <= 96 && ForceCandidateCG(base.CGImage)) {
-        CGImageRef k = CopyTintedCG(base.CGImage, CGFor(NO));
-        if (k) {
-            out = [UIImage imageWithCGImage:k scale:base.scale orientation:base.imageOrientation];
-            CGImageRelease(k);
-        }
-    }
-    if (!out) { SET(im, kForceStamp, @(want)); return nil; }
-    SET(out, kKbImg, @YES);
-    SET(out, kForceSrc, base);
-    SET(out, kForceStamp, @(want));
-    return out;
-}
-
-static BOOL ForceShapeColorOK(CGColorRef c) {
-    CGFloat r, g, b, a;
-    if (!CGRGBA(c, &r, &g, &b, &a) || a < 0.5) return NO;
-    return fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) <= 0.15;
-}
-
-static void ForceShape(CAShapeLayer *sh) {
-    if (gInTry) return;
-    CGRect b;
-    if (!PathBounds(sh, &b)) return;
-    CGFloat mx = fmax(b.size.width, b.size.height);
-    if (mx < 4 || mx > 64) return;
-    BOOL fill = ForceShapeColorOK(sh.fillColor), stroke = ForceShapeColorOK(sh.strokeColor);
-    if (!fill && !stroke) return;
-    CGColorRef c = CGFor(NO);
-    if (fill && CGColorEqualToColor(sh.fillColor, c)) fill = NO;
-    if (stroke && CGColorEqualToColor(sh.strokeColor, c)) stroke = NO;
-    if (!fill && !stroke) return;
-    int bits = 0;
-    SET(sh, kForce, @YES);
-    gInTry = YES;
-    if (fill)   { sh.fillColor   = c; bits |= 1; }
-    if (stroke) { sh.strokeColor = c; bits |= 2; }
-    gInTry = NO;
-    SET(sh, kIconShape, @(bits | [GET(sh, kIconShape) intValue]));
-}
-
-static void ForceContentsLayer(CALayer *l) {
-    id c = l.contents;
-    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
-    CGSize s = l.bounds.size;
-    if (s.width < 6 || s.height < 6 || s.width > 64 || s.height > 64) return;
-    if (l.masksToBounds && l.cornerRadius > 0) return;
-    if (GET(l, kContentsSrc) || GET(l, kKbSrc)) return;   // da duoc logic cu xu ly
-    id d = l.delegate;
-    if ([d isKindOfClass:UIImageView.class] && ((UIImageView *)d).image) return;   // image view xu ly o muc view
-    int want = ForceWant();
-    id src = GET(l, kForceSrc);
-    if (src) {
-        if ([GET(l, kForceStamp) intValue] == want) return;
-    } else {
-        src = c;
-        if (!ForceCandidateCG((__bridge CGImageRef)src)) return;
-    }
-    CGImageRef t = CopyTintedCG((__bridge CGImageRef)src, CGFor(NO));
-    if (!t) return;
-    SET(l, kForceSrc, src);
-    SET(l, kForceStamp, @(want));
-    PutContents(l, t);
-    CGImageRelease(t);
-    @try {   // anh da la accent -> multiply phai la trang (tranh to 2 lan / bi toi)
-        id mm = [l valueForKey:@"contentsMultiplyColor"];
-        if (mm && !IsWhiteCG((__bridge CGColorRef)mm)) [l setContentsMultiplyColor:gCGWhite];
-    } @catch (NSException *e) {}
-    if (l.compositingFilter) l.compositingFilter = nil;
-}
-
-static void ForceLayerTree(CALayer *l, int depth, int *budget) {
-    if (!l || depth > 20 || (*budget)-- <= 0) return;
-    if ([l isKindOfClass:CAShapeLayer.class]) ForceShape((CAShapeLayer *)l);
-    else if (![l isKindOfClass:CATextLayer.class]) ForceContentsLayer(l);
-    for (CALayer *sub in [l.sublayers copy]) ForceLayerTree(sub, depth + 1, budget);
-}
-
-static void ForceViewTree(UIView *v, int depth, int *budget) {
-    if (!v || depth > 14 || (*budget)-- <= 0) return;
-    CGSize s = v.bounds.size;
-    if ([v isKindOfClass:UIImageView.class]) {
-        UIImageView *iv = (UIImageView *)v;
-        if (s.width <= 64 && s.height <= 64 && iv.image && !LooksLikeAvatarView(iv)) {
-            UIImage *out = ForceImage(iv.image);
-            if (out) { gInKbFix = YES; iv.image = out; gInKbFix = NO; }
-        }
-    } else if ([v isKindOfClass:UIButton.class] && s.width <= 90 && s.height <= 90) {
-        UIButton *b = (UIButton *)v;
-        UIImage *bi = [b imageForState:UIControlStateNormal];
-        UIImage *out = bi ? ForceImage(bi) : nil;
-        if (out) { gInKbFix = YES; [b setImage:out forState:UIControlStateNormal]; gInKbFix = NO; }
-        UIButtonConfiguration *cfg = b.configuration;
-        if (cfg && cfg.image) {
-            UIImage *o2 = ForceImage(cfg.image);
-            if (o2) { cfg.image = o2; gInKbFix = YES; b.configuration = cfg; gInKbFix = NO; }
-        }
-    }
-    for (UIView *sv in [v.subviews copy]) ForceViewTree(sv, depth + 1, budget);
-}
-
-static void ForceSweepRoot(UIView *root) {
-    if (!root || !gMaster || gSafe || !OnMain()) return;
-    UIWindow *w = root.window;
-    if (!w) return;
-    BOOL old = gDark;
-    gDark = (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
-    int b1 = 500, b2 = 800;
-    ForceViewTree(root, 0, &b1);
-    ForceLayerTree(root.layer, 0, &b2);
-    gDark = old;
-}
-
-static void ForceSweepAll(void) {
-    if (!gMaster || gSafe || !OnMain() || !gForceRoots || !gForceRoots.count) return;
-    for (UIView *r in [gForceRoots allObjects]) {
-        if (!r.window) { [gForceRoots removeObject:r]; continue; }
-        if (r.hidden || r.alpha < 0.01) continue;
-        ForceSweepRoot(r);
-    }
-}
-
-static void ForceMaybeRegister(UIView *v) {
-    if (!gMaster || gSafe || !OnMain()) return;
-    UIWindow *w = v.window;
-    if (!w) return;
-    int f = ForceClassFlags([v class]);
-    if (!(f & 6)) return;
-    if (!((f & 2) || InputWindow(w))) return;
-    if (!gForceRoots) gForceRoots = [NSHashTable weakObjectsHashTable];
-    if ([gForceRoots containsObject:v] || gForceRoots.count > 40) return;
-    UIView *a = v.superview;
-    for (int i = 0; i < 14 && a; i++, a = a.superview)
-        if ([gForceRoots containsObject:a]) return;   // goc cha da duoc quet
-    [gForceRoots addObject:v];
-    __weak UIView *wv = v;
-    double ds[4] = { 0.0, 0.12, 0.4, 1.0 };
-    for (int i = 0; i < 4; i++)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ds[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIView *sv = wv;
-            if (sv) ForceSweepRoot(sv);
-        });
-}
-
 static void StartSweep(void) {
     static dispatch_source_t t;
     if (t) return;
     t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), (uint64_t)(0.3 * NSEC_PER_SEC), (uint64_t)(0.1 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(t, ^{ KbSweepAll(); ForceSweepAll(); });
+    dispatch_source_set_event_handler(t, ^{ KbSweepAll(); });
     dispatch_resume(t);
 }
 
@@ -1973,7 +1752,6 @@ static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUI
             CAShapeLayer *sh = (CAShapeLayer *)l;
             [out appendFormat:@" fill=%@ stroke=%@ lw=%.1f", HexCG(sh.fillColor), HexCG(sh.strokeColor), sh.lineWidth];
         }
-        if (GET(l, kForce) || GET(l, kForceSrc)) [out appendString:@" FORCED"];
         @try {
             id m = [l valueForKey:@"contentsMultiplyColor"];
             if (m) [out appendFormat:@" mult=%@", HexCG((__bridge CGColorRef)m)];
@@ -1981,20 +1759,6 @@ static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUI
         [out appendString:@"\n"];
     }
     for (CALayer *sub in [l.sublayers copy]) DumpLayer(sub, depth + 1, kb, out, limit);
-}
-
-// MOI: dump cay view cua cua so ban phim (de biet ten class that cua menu / qua dia cau)
-static void DumpViewTree(UIView *v, int depth, NSMutableString *out, NSUInteger limit) {
-    if (!v || depth > 14 || out.length > limit) return;
-    CGSize s = v.bounds.size;
-    [out appendFormat:@"%*s%@ %.0fx%.0f", depth, "", NSStringFromClass(v.class), s.width, s.height];
-    if ([v isKindOfClass:UIImageView.class]) {
-        UIImage *im = ((UIImageView *)v).image;
-        if (im) [out appendFormat:@" img=%.0fx%.0f%@%@", im.size.width, im.size.height, im.isSymbolImage ? @" sym" : @"",
-                 GET(im, kForceSrc) ? @" FORCED" : @""];
-    }
-    [out appendString:@"\n"];
-    for (UIView *sv in [v.subviews copy]) DumpViewTree(sv, depth + 1, out, limit);
 }
 
 static NSString *DumpAll(void) {
@@ -2006,15 +1770,8 @@ static NSString *DumpAll(void) {
             BOOL kb = KbName(cn) || [cn containsString:@"TextEffects"];
             [out appendFormat:@"== %@ level=%.0f kb=%d\n", cn, w.windowLevel, kb];
             DumpLayer(w.layer, 0, kb, out, out.length + 7000);
-            if (kb) {
-                [out appendString:@"-- views\n"];
-                DumpViewTree(w, 0, out, out.length + 6000);
-            }
         }
     }
-    [out appendString:@"== force roots\n"];
-    for (UIView *r in [gForceRoots allObjects])
-        [out appendFormat:@"%@ in %@\n", NSStringFromClass(r.class), r.window ? NSStringFromClass(r.window.class) : @"(none)"];
     return out;
 }
 
@@ -2149,12 +1906,6 @@ static void Setup(UIWindow *w) {
     if (n && cls == 1) MarkFill(self.layer, self);
     else if (!n && IsFillCandidateColor(c)) { SetOwner(self); ScheduleCheck(self.layer, NO); }
 }
-// MOI: dang ky cac view thuoc menu chon ban phim / dock (qua dia cau) de quet to accent
-- (void)didMoveToWindow {
-    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
-    %orig;
-    if (self.window && gMaster && !gSafe && OnMain()) ForceMaybeRegister(self);
-}
 %end
 
 %hook CALayer
@@ -2190,7 +1941,7 @@ static void Setup(UIWindow *w) {
     }
     // anh cua layer nay da duoc to accent -> multiply de trang, tranh to 2 lan
     if (n && n != gCGWhite && OnMain()) {
-        BOOL marked = GET(self, kKbSrc) || GET(self, kContentsSrc) || GET(self, kForceSrc);
+        BOOL marked = GET(self, kKbSrc) || GET(self, kContentsSrc);
         if ((marked || IsKeyboardLayer(self)) && ContentsLooksAccent(self)) n = gCGWhite;
     }
     %orig(n ?: c);
@@ -2236,7 +1987,6 @@ static void Setup(UIWindow *w) {
     CLEAR(self, kContentsSrc);
     CLEAR(self, kKbSrc);
     CLEAR(self, kWhiteMark);
-    CLEAR(self, kForceSrc);
     if (!contents || !gMaster || !OnMain() || CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) { %orig; return; }
 
     CGImageRef cg = (__bridge CGImageRef)contents;
@@ -2402,14 +2152,14 @@ static void Setup(UIWindow *w) {
 
 %hook UIImage
 - (UIImage *)imageWithTintColor:(UIColor *)c renderingMode:(UIImageRenderingMode)m {
-    if (gDepth > AAC_MAXDEPTH || gForceTint) return %orig; AAC_DEPTH_SCOPE;
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
     UIColor *n = IconTintFix(c);
     UIImage *o = %orig(n, m);
     if (o && c && n != c && OnMain()) SET(o, kInkImg, @YES);
     return o;
 }
 - (UIImage *)imageWithTintColor:(UIColor *)c {
-    if (gDepth > AAC_MAXDEPTH || gForceTint) return %orig; AAC_DEPTH_SCOPE;
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
     UIColor *n = IconTintFix(c);
     UIImage *o = %orig(n);
     if (o && c && n != c && OnMain()) SET(o, kInkImg, @YES);
