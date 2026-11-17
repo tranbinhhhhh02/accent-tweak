@@ -40,6 +40,7 @@ static const void *kStripOut    = &kStripOut;
 static const void *kKbImg       = &kKbImg;     // anh ban phim da doi mau
 static const void *kInkTint     = &kInkTint;   // layer/anh den da bi doi sang accent
 static const void *kInkImg      = &kInkImg;
+static const void *kWhiteMark   = &kWhiteMark; // [MOI] icon trang ban phim (qua dia cau...) da doi sang accent
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -56,6 +57,7 @@ static CGFloat     gRGBL[3], gRGBD[3];
 static BOOL        gDark = NO;
 static int         gFillCount = 0;
 static int         gVersion = 0;
+static int         gLastKbMode = 0;   // [MOI] che do doi mau cua lan KbRecolor gan nhat
 static NSMutableArray *gKeep;
 static __thread BOOL gRaw;
 
@@ -393,9 +395,10 @@ static CGImageRef CopyTintedCG(CGImageRef src, CGColorRef color) {
     return out;
 }
 
-// ---- Ban phim: nut xanh -> accent, bieu tuong den (Enter/back) -> accent ----
+// ---- Ban phim: nut xanh -> accent, bieu tuong den (Enter/back) -> accent, icon trang (qua dia cau...) -> accent ----
 static BOOL KbName(NSString *cn) {
-    return [cn hasPrefix:@"UIKB"] || [cn containsString:@"Keyboard"] || [cn containsString:@"UIInputWindow"];
+    return [cn hasPrefix:@"UIKB"] || [cn containsString:@"Keyboard"] || [cn containsString:@"UIInputWindow"] ||
+           [cn containsString:@"InputSwitcher"] || [cn containsString:@"InputMode"];
 }
 
 static BOOL ViewInKeyboard(UIView *v) {
@@ -423,7 +426,9 @@ static BOOL IsKeyboardLayer(CALayer *l) {
     return NO;
 }
 
-static CGImageRef KbRecolor(CGImageRef src) {
+// allowWhite: cho phep doi icon trang (qua dia cau, icon menu chon ban phim) sang accent
+static CGImageRef KbRecolor(CGImageRef src, BOOL allowWhite) {
+    gLastKbMode = 0;
     if (!src || !gMaster || !gOn[AACIcon]) return NULL;
     size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
     if (w < 8 || h < 8 || w > 400 || h > 400) return NULL;
@@ -442,7 +447,7 @@ static CGImageRef KbRecolor(CGImageRef src) {
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), src);
 
     size_t total = w * h;
-    int solid = 0, blue = 0, gray = 0, blk = 0, lt = 0, clear = 0;
+    int solid = 0, blue = 0, gray = 0, blk = 0, lt = 0, wt = 0, clear = 0;
     for (size_t i = 0; i < total; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) { clear++; continue; }
@@ -456,6 +461,7 @@ static CGImageRef KbRecolor(CGImageRef src) {
         CGFloat lum = (r + g + b) / 3.0;
         if (lum < 0.3) blk++;
         else if (lum > 0.75) lt++;
+        if (lum > 0.93) wt++;
     }
 
     int mode = 0;
@@ -463,6 +469,10 @@ static CGImageRef KbRecolor(CGImageRef src) {
     else if (solid >= 20 && gray * 100 >= 85 * solid && blk >= 6 &&
              (blk * 100 <= 45 * solid || (size_t)clear * 100 >= 40 * total) &&
              (lt * 100 >= 20 * solid || (size_t)clear * 100 >= 30 * total)) mode = 2;
+    // [MOI] icon trang tren nen sang (qua dia cau, icon menu chon ban phim): chi la hinh trang, nhieu vung trong suot
+    else if (allowWhite && !gDark && solid >= 20 && gray * 100 >= 92 * solid &&
+             wt * 100 >= 70 * solid && blk * 100 <= 8 * solid &&
+             (size_t)clear * 100 >= 35 * total) mode = 3;
     if (!mode) { CGContextRelease(ctx); free(buf); return NULL; }
 
     CGFloat ar = gDark ? gRGBD[0] : gRGBL[0];
@@ -479,18 +489,27 @@ static CGImageRef KbRecolor(CGImageRef src) {
             px[0] = (uint8_t)lround(fmax(0, fmin(1, ar)) * al * 255);
             px[1] = (uint8_t)lround(fmax(0, fmin(1, ag)) * al * 255);
             px[2] = (uint8_t)lround(fmax(0, fmin(1, ab)) * al * 255);
-        } else {
+        } else if (mode == 2) {
             CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
             if (mx - mn > 0.12) continue;
             CGFloat t = fmax(0, fmin(1, (r + g + b) / 3.0));
             px[0] = (uint8_t)lround((ar * (1 - t) + t) * a);
             px[1] = (uint8_t)lround((ag * (1 - t) + t) * a);
             px[2] = (uint8_t)lround((ab * (1 - t) + t) * a);
+        } else {
+            // mode 3: toan bo hinh -> dung 1 lan mau accent (giu alpha)
+            CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+            if (mx - mn > 0.12) continue;
+            CGFloat al = a / 255.0;
+            px[0] = (uint8_t)lround(fmax(0, fmin(1, ar)) * al * 255);
+            px[1] = (uint8_t)lround(fmax(0, fmin(1, ag)) * al * 255);
+            px[2] = (uint8_t)lround(fmax(0, fmin(1, ab)) * al * 255);
         }
     }
     CGImageRef out = CGBitmapContextCreateImage(ctx);
     CGContextRelease(ctx);
     free(buf);
+    if (out) gLastKbMode = mode;
     return out;
 }
 
@@ -507,6 +526,33 @@ static BOOL HasAccentMark(CALayer *l) {
     return objc_getAssociatedObject(l, kFill) || objc_getAssociatedObject(l, kIconShape) ||
            objc_getAssociatedObject(l, kContentsSrc) || objc_getAssociatedObject(l, kKbSrc) ||
            IsAccentCG(l.backgroundColor);
+}
+
+// [MOI] Icon trang nam tren nut accent (vd kinh lup trang tren nut Search hong) -> phai giu trang
+static BOOL UnderAccentKey(CALayer *l) {
+    if (!l) return NO;
+    CALayer *c = l;
+    for (int i = 0; i < 4 && c; i++, c = c.superlayer) {
+        if (c != l && HasAccentMark(c) && !objc_getAssociatedObject(c, kWhiteMark)) return YES;
+        CALayer *p = c.superlayer;
+        if (!p) break;
+        CGRect cf = c.frame;
+        CGPoint ctr = CGPointMake(CGRectGetMidX(cf), CGRectGetMidY(cf));
+        int n = 0;
+        for (CALayer *o in p.sublayers) {
+            if (++n > 20) break;
+            if (o == c || o.hidden) continue;
+            if (objc_getAssociatedObject(o, kWhiteMark)) continue;
+            if (!HasAccentMark(o)) continue;
+            CGRect of = o.frame;
+            if (CGRectContainsPoint(of, ctr) && of.size.width >= cf.size.width) return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL WhiteOK(CALayer *l) {
+    return !gDark && !UnderAccentKey(l);
 }
 
 static void KillShadowDown(CALayer *l, int depth) {
@@ -602,7 +648,7 @@ static void KbImageFix(UIImageView *iv) {
     if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate || im.images.count > 1) return;
     if (im.size.width > 96 || im.size.height > 96) return;
     if (!ViewInKeyboard(iv)) return;
-    CGImageRef k = KbRecolor(im.CGImage);
+    CGImageRef k = KbRecolor(im.CGImage, WhiteOK(iv.layer));
     if (!k) return;
     UIImage *out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
     CGImageRelease(k);
@@ -631,7 +677,7 @@ static BOOL ContentsLooksAccent(CALayer *l) {
     CGFloat sr = 0, sg = 0, sb = 0; int n = 0;
     for (int i = 0; i < N * N; i++) {
         const uint8_t *px = buf + i * 4;
-        if (px[3] < 200) continue;
+        if (px[3] < 160) continue;
         sr += px[0] / (CGFloat)px[3]; sg += px[1] / (CGFloat)px[3]; sb += px[2] / (CGFloat)px[3];
         n++;
     }
@@ -639,7 +685,19 @@ static BOOL ContentsLooksAccent(CALayer *l) {
     sr /= n; sg /= n; sb /= n;
     for (int d = 0; d < 2; d++) {
         const CGFloat *q = d ? gRGBD : gRGBL;
-        if (fabs(sr - q[0]) < 0.12 && fabs(sg - q[1]) < 0.12 && fabs(sb - q[2]) < 0.12) return YES;
+        if (fabs(sr - q[0]) < 0.15 && fabs(sg - q[1]) < 0.15 && fabs(sb - q[2]) < 0.15) return YES;
+    }
+    return NO;
+}
+
+// [MOI] mau multiply gan giong accent (dung sai rong hon IsAccentCG)
+static BOOL NearAccentCG(CGColorRef c, CGFloat tol) {
+    if (!c) return NO;
+    CGFloat r, g, b, a;
+    if (!CGRGBA(c, &r, &g, &b, &a) || a < 0.9) return NO;
+    for (int d = 0; d < 2; d++) {
+        const CGFloat *q = d ? gRGBD : gRGBL;
+        if (fabs(r - q[0]) < tol && fabs(g - q[1]) < tol && fabs(b - q[2]) < tol) return YES;
     }
     return NO;
 }
@@ -648,20 +706,43 @@ static void FixDoubleTint(CALayer *l) {
     if (!l || !gCGWhite) return;
     @try {
         id m = [l valueForKey:@"contentsMultiplyColor"];
-        if (m && IsAccentCG((__bridge CGColorRef)m) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
+        if (!m) return;
+        CGColorRef mc = (__bridge CGColorRef)m;
+        if (IsWhiteCG(mc)) return;
+        if (NearAccentCG(mc, 0.1) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
     } @catch (NSException *e) {}
+}
+
+// [MOI] Icon trang da doi accent nhung hoa ra nam duoi nut accent (kinh lup tren nut Search) -> tra ve anh goc
+static void KbWhiteVerify(CALayer *l) {
+    if (!l || !objc_getAssociatedObject(l, kWhiteMark)) return;
+    if (!UnderAccentKey(l)) return;
+    id src = objc_getAssociatedObject(l, kKbSrc);
+    objc_setAssociatedObject(l, kWhiteMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(l, kKbSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (src) {
+        gInContents = YES;
+        l.contents = src;
+        gInContents = NO;
+    }
 }
 
 // Thu lai doi mau cho layer ban phim khi layer da gan vao cua so
 static void KbLate(CALayer *l) {
     if (!l || !gMaster || !gOn[AACIcon] || !OnMain()) return;
-    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) return;
+    KbWhiteVerify(l);
     id c = l.contents;
     if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
     if (!IsKeyboardLayer(l)) return;
-    CGImageRef k = KbRecolor((__bridge CGImageRef)c);
-    if (!k) return;
+    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) {
+        FixDoubleTint(l);
+        return;
+    }
+    CGImageRef k = KbRecolor((__bridge CGImageRef)c, WhiteOK(l));
+    if (!k) { FixDoubleTint(l); return; }
+    int km = gLastKbMode;
     objc_setAssociatedObject(l, kKbSrc, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (km == 3) objc_setAssociatedObject(l, kWhiteMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     gInContents = YES;
     l.contents = (__bridge id)k;
     gInContents = NO;
@@ -721,7 +802,7 @@ static void ReapplyContents(CALayer *l) {
     }
     id ks = objc_getAssociatedObject(l, kKbSrc);
     if (ks) {
-        CGImageRef t = KbRecolor((__bridge CGImageRef)ks);
+        CGImageRef t = KbRecolor((__bridge CGImageRef)ks, WhiteOK(l));
         if (t) {
             gInContents = YES;
             l.contents = (__bridge id)t;
@@ -1899,7 +1980,10 @@ static void Setup(UIWindow *w) {
         }
     }
     // anh cua layer nay da duoc to accent -> multiply de trang, tranh to 2 lan
-    if (n && (objc_getAssociatedObject(self, kKbSrc) || objc_getAssociatedObject(self, kContentsSrc)) && ContentsLooksAccent(self)) n = gCGWhite;
+    if (n && n != gCGWhite && OnMain()) {
+        BOOL marked = objc_getAssociatedObject(self, kKbSrc) || objc_getAssociatedObject(self, kContentsSrc);
+        if ((marked || IsKeyboardLayer(self)) && ContentsLooksAccent(self)) n = gCGWhite;
+    }
     %orig(n ?: c);
     if (inkSwap) MarkInk(self);
 }
@@ -2197,6 +2281,8 @@ static void Setup(UIWindow *w) {
         objc_setAssociatedObject(self, kContentsSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (objc_getAssociatedObject(self, kKbSrc))
         objc_setAssociatedObject(self, kKbSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(self, kWhiteMark))
+        objc_setAssociatedObject(self, kWhiteMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (!contents || !gMaster || !gOn[AACIcon] || !OnMain() ||
         CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) { %orig; return; }
 
@@ -2210,16 +2296,24 @@ static void Setup(UIWindow *w) {
                 (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
     BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
     if (!monoOK) {
-        // [MOI] Phim ban phim: nut xanh -> accent, bieu tuong den (Enter) -> accent
+        // [MOI] Phim ban phim: nut xanh -> accent, bieu tuong den (Enter) -> accent, icon trang (qua dia cau) -> accent
         if (w >= 8 && h >= 8 && w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160 &&
             !objc_getAssociatedObject(self, kImgView) && ![self isKindOfClass:CAShapeLayer.class] &&
             IsKeyboardLayer(self)) {
-            CGImageRef k = KbRecolor(cg);
+            CGImageRef k = KbRecolor(cg, WhiteOK(self));
             if (k) {
+                int km = gLastKbMode;
                 objc_setAssociatedObject(self, kKbSrc, contents, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (km == 3) objc_setAssociatedObject(self, kWhiteMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 %orig((__bridge id)k);
                 FixDoubleTint(self);
                 CGImageRelease(k);
+                if (km == 3) {
+                    // icon trang co the nam duoi nut accent (kinh lup tren nut Search) -> kiem tra lai sau khi layout xong
+                    __weak CALayer *wl = self;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
+                }
                 return;
             }
         }
@@ -2262,6 +2356,11 @@ static void Setup(UIWindow *w) {
     AAC_DEPTH_SCOPE;
     %orig;
     if (gMaster && self.shadowOpacity > 0 && OnMain() && ShadowEligible(self)) self.shadowOpacity = 0;
+    // [MOI] Ban phim: layer anh da to accent ma van con multiply accent -> dua ve trang (accent chi 1 lan)
+    if (gMaster && gOn[AACIcon] && self.contents && OnMain()) {
+        CGSize z = self.bounds.size;
+        if (z.width <= 220 && z.height <= 160 && IsKeyboardLayer(self)) FixDoubleTint(self);
+    }
 }
 %end
 %end
