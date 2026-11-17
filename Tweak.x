@@ -25,7 +25,7 @@ KEY(kInkImg);      KEY(kWhiteMark);   KEY(kArrowDone);  KEY(kAttempts);   KEY(kP
 KEY(kStripSrc);    KEY(kStripState);  KEY(kStripOut);
 KEY(kOrigMul);     KEY(kSweepPtr);    KEY(kSweepImg);
 KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh xanh (app thuong) / anh den (Facebook)
-KEY(kHidMark);     // layer bi tweak an (glow) -> neu hoa ra nam  trong ban phim thi hien lai
+KEY(kHidMark);     // layer bi tweak an (glow) -> neu hoa ra nam trong ban phim thi hien lai
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
