@@ -1838,7 +1838,11 @@ static void Setup(UIWindow *w) {
 - (UIColor *)tintColor {
     if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
     if (!gMaster || !gColor) return %orig;
-    if (gFillCount > 0 && OnMain() && UnderFill(self) && !InControlView(self)) return UIColor.whiteColor;
+    if (gFillCount > 0 && OnMain() && UnderFill(self) && !InControlView(self)) {
+        // FIX: icon tren ban phim (qua dia cau, menu chon ban phim) khong nam duoi nut accent -> giu accent, khong de trang
+        if (ViewInKeyboard(self) && !UnderAccentKey(self.layer)) return gColor;
+        return UIColor.whiteColor;
+    }
     return gColor;
 }
 - (void)setTintColor:(UIColor *)c {
