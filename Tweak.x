@@ -27,9 +27,7 @@ KEY(kOrigMul);     KEY(kSweepPtr);    KEY(kSweepImg);
 KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh xanh (app thuong) / anh den (Facebook)
 KEY(kHidMark);     // layer bi tweak an (glow) -> neu hoa ra nam trong ban phim thi hien lai
 KEY(kGlbSrc);      KEY(kGlbPtr);      KEY(kGlbVer);      KEY(kGlbMul);   // qua dia cau / icon dock
-KEY(kBigWatch);    // layer vua duoc to accent -> neu hoa ra la vung lon (giao dien toi) thi go bo
-KEY(kOrigTint);    // mau tint goc cua UIImageView (de anh lon o giao dien toi khong bi to accent)
-KEY(kDkPtr);       KEY(kDkKind);      KEY(kDkKey);      KEY(kDkMul);     // ban phim giao dien toi
+KEY(kDbSrc);       KEY(kDbPtr);       KEY(kDbVer);                       // ban phim toi: nut xanh -> accent
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -37,7 +35,7 @@ KEY(kDkPtr);       KEY(kDkKind);      KEY(kDkKey);      KEY(kDkMul);     // ban 
 @implementation AACWeak
 @end
 
-static BOOL gMaster = YES, gDark, gInTry, gInTabFix, gInContents, gInKbFix, gSafe, gInAttach, gInBig, gDkActive;
+static BOOL gMaster = YES, gDark, gInTry, gInTabFix, gInContents, gInKbFix, gSafe, gInAttach;
 static UIColor   *gColor;
 static CGColorRef gCGLight, gCGDark, gCGSoftLight, gCGSoftDark, gCGWhite;
 static CGFloat    gRGBL[3], gRGBD[3];
@@ -58,19 +56,8 @@ static inline void AACDepthLeave(int *p) { gDepth--; }
 
 static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
 
-static inline BOOL BigSize(CGSize s) { return s.width >= 140.0 && s.height >= 140.0; }
-
-// Giao dien cua app dang hien thi (cua so thuong dau tien) la toi?
-static BOOL AppIsDark(void) {
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
-            if (w.hidden || w.alpha < 0.01 || w.windowLevel > UIWindowLevelNormal) continue;
-            return w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
-        }
-    }
-    return gDark;
-}
+// [NEW] Facebook (gSafe): khong gui message toi delegate cua layer (co the la con tro treo) -> tra ve nil
+static inline id LDel(CALayer *l) { return gSafe ? nil : l.delegate; }
 
 static BOOL RateOK(CFAbsoluteTime *ws, int *wc, int max) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -299,12 +286,6 @@ static BOOL NearAccentCG(CGColorRef c, CGFloat tol, CGFloat amin) {
 }
 #define IsAccentCG(c) NearAccentCG(c, 0.02, 0.99)
 
-static BOOL UIColorIsAccent(UIColor *c, CGFloat amin) {
-    if (!c || !gColor) return NO;
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    return [c getRed:&r green:&g blue:&b alpha:&a] && a >= amin && NearAccentRGB(r, g, b, 0.03);
-}
-
 static BOOL LayerUnderFill(CALayer *l) {
     for (int i = 0; i < 4 && l; i++, l = l.superlayer)
         if (GET(l, kFill) || IsAccentCG(l.backgroundColor)) return YES;
@@ -314,9 +295,6 @@ static BOOL LayerUnderFill(CALayer *l) {
 static int KbTreeState(CALayer *l);
 static BOOL IsKeyboardLayer(CALayer *l);
 static BOOL UnderAccentKey(CALayer *l);
-static BOOL KbForceLayer(CALayer *l);
-static BOOL KbForceView(UIView *v);
-static BOOL InputWindow(UIWindow *w);
 
 static CGColorRef IconShapeColor(CALayer *l) {
     // FIX: chu/so tren phim trang bi to TRANG (trung mau phim) -> mat chu.
@@ -560,6 +538,7 @@ static BOOL IsKeyboardLayer(CALayer *l) {
 
 // Kiem tra chat che: layer co nam trong cay layer cua mot cua so ban phim khong.
 // Tra ve 1 = trong ban phim, 0 = trong cua so thuong, -1 = chua gan vao cua so nao (khong ket luan duoc)
+static BOOL InputWindow(UIWindow *w);
 static int KbTreeState(CALayer *l) {
     if (!l || !OnMain()) return -1;
     CALayer *root = l;
@@ -575,10 +554,7 @@ static int KbTreeState(CALayer *l) {
 
 // mode 1: nut xanh -> accent | mode 2: icon den (Enter/back) -> accent, giu chi tiet trang
 // mode 3: icon trang (qua dia cau, icon menu chon ban phim) -> accent (chi khi allowWhite)
-// [FIX] blueOnly = chi xu ly nut xanh (mode 1). Dung cho vung qua dia cau / dock / menu chon ban phim:
-// truoc day mode 2 (icon den -> accent, giu trang) bien icon qua dia cau thanh "trang vien accent" nen
-// xung dot voi module doi mau qua dia cau (icon van trang). Nut back/Enter van giu mode 2 binh thuong.
-static CGImageRef KbRecolorEx(CGImageRef src, BOOL allowWhite, BOOL blueOnly) {
+static CGImageRef KbRecolor(CGImageRef src, BOOL allowWhite) {
     gLastKbMode = 0;
     if (!src || !gMaster) return NULL;
     size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
@@ -605,10 +581,10 @@ static CGImageRef KbRecolorEx(CGImageRef src, BOOL allowWhite, BOOL blueOnly) {
     BOOL mostlyClear40 = (size_t)clear * 100 >= 40 * total, mostlyClear35 = (size_t)clear * 100 >= 35 * total;
     int mode = 0;
     if (solid >= 30 && blue * 100 >= 35 * solid) mode = 1;
-    else if (!blueOnly && solid >= 20 && gray * 100 >= 85 * solid && blk >= 6 &&
+    else if (solid >= 20 && gray * 100 >= 85 * solid && blk >= 6 &&
              (blk * 100 <= 45 * solid || mostlyClear40) &&
              (lt * 100 >= 20 * solid || (size_t)clear * 100 >= 30 * total)) mode = 2;
-    else if (!blueOnly && allowWhite && !gDark && solid >= 20 && gray * 100 >= 92 * solid &&
+    else if (allowWhite && !gDark && solid >= 20 && gray * 100 >= 92 * solid &&
              wt * 100 >= 70 * solid && blk * 100 <= 8 * solid && mostlyClear35) mode = 3;
     if (!mode) { FreeBuf(buf, ctx); return NULL; }
 
@@ -642,14 +618,12 @@ static BOOL NearControl(CALayer *l) {
 }
 
 static BOOL HasAccentMark(CALayer *l) {
-    return GET(l, kFill) || GET(l, kIconShape) || GET(l, kContentsSrc) || GET(l, kKbSrc) || GET(l, kDkKey) || IsAccentCG(l.backgroundColor);
+    return GET(l, kFill) || GET(l, kIconShape) || GET(l, kContentsSrc) || GET(l, kKbSrc) || IsAccentCG(l.backgroundColor);
 }
 
 // Icon trang nam tren nut accent (vd kinh lup tren nut Search) -> phai giu trang
 static BOOL UnderAccentKey(CALayer *l) {
     if (!l) return NO;
-    // [FIX] qua dia cau / dock / menu chon ban phim khong bao gio nam duoi nut accent
-    if (KbForceLayer(l)) return NO;
     CALayer *c = l;
     for (int i = 0; i < 4 && c; i++, c = c.superlayer) {
         if (c != l && HasAccentMark(c) && !GET(c, kWhiteMark)) return YES;
@@ -669,17 +643,6 @@ static BOOL UnderAccentKey(CALayer *l) {
 }
 
 static BOOL WhiteOK(CALayer *l) { return !gDark && !UnderAccentKey(l); }
-
-// [FIX] Vung qua dia cau / dock / menu chon ban phim: chi doi nut xanh, KHONG dung mode 2/3 (xung dot voi module qua dia cau)
-static CGImageRef KbRecolorL(CALayer *l, CGImageRef src) {
-    if (KbForceLayer(l)) return KbRecolorEx(src, NO, YES);
-    return KbRecolorEx(src, WhiteOK(l), NO);
-}
-
-static CGImageRef KbRecolorV(UIImageView *iv, CGImageRef src) {
-    if (KbForceView(iv)) return KbRecolorEx(src, NO, YES);
-    return KbRecolorEx(src, WhiteOK(iv.layer), NO);
-}
 
 static void KillShadowDown(CALayer *l, int depth) {
     if (!l || depth > 4 || !OnMain() || IsKeyboardLayer(l)) return;
@@ -762,7 +725,7 @@ static void KbImageFix(UIImageView *iv) {
     if (!im || !im.CGImage || GET(im, kKbImg)) return;
     if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate || im.images.count > 1) return;
     if (im.size.width > 96 || im.size.height > 96 || !ViewInKeyboard(iv)) return;
-    CGImageRef k = KbRecolorV(iv, im.CGImage);
+    CGImageRef k = KbRecolor(im.CGImage, WhiteOK(iv.layer));
     if (!k) return;
     UIImage *out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
     CGImageRelease(k);
@@ -886,7 +849,7 @@ static void KbLate(CALayer *l) {
     id c = l.contents;
     if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID() || !IsKeyboardLayer(l)) return;
     if (GET(l, kKbSrc) || GET(l, kContentsSrc)) { FixDoubleTint(l); return; }
-    CGImageRef k = KbRecolorL(l, (__bridge CGImageRef)c);
+    CGImageRef k = KbRecolor((__bridge CGImageRef)c, WhiteOK(l));
     if (!k) { FixDoubleTint(l); return; }
     SET(l, kKbSrc, c);
     if (gLastKbMode == 3) SET(l, kWhiteMark, @YES);
@@ -977,7 +940,7 @@ static void ReapplyContents(CALayer *l) {
     }
     id ks = GET(l, kKbSrc);
     if (ks) {
-        CGImageRef t = KbRecolorL(l, (__bridge CGImageRef)ks);
+        CGImageRef t = KbRecolor((__bridge CGImageRef)ks, WhiteOK(l));
         if (t) { PutContents(l, t); CGImageRelease(t); }
     }
 }
@@ -1199,73 +1162,6 @@ static BOOL PathBounds(CAShapeLayer *sh, CGRect *out) {
     if (CGRectIsNull(b) || CGRectIsInfinite(b) || isnan(b.size.width) || isnan(b.size.height)) return NO;
     *out = b;
     return YES;
-}
-
-// ---------------- Vung accent lon (giao dien toi) ----------------
-// Mot vung accent cao/rong >= 140pt khong bao gio la nut/icon (vd lop phu hinh bau duc che bai Threads trong Facebook).
-// Khi layer vua duoc to accent (nen / gradient / shape / multiply) ma hoa ra la vung lon o giao dien toi -> go bo.
-static BOOL ColorsHaveAccent(NSArray *cols) {
-    for (id o in cols) {
-        if (!o || CFGetTypeID((__bridge CFTypeRef)o) != CGColorGetTypeID()) continue;
-        if (NearAccentCG((__bridge CGColorRef)o, 0.03, 0.01)) return YES;
-    }
-    return NO;
-}
-
-static BOOL BigLayer(CALayer *l) {
-    if (BigSize(l.bounds.size)) return YES;
-    if ([l isKindOfClass:CAShapeLayer.class]) {
-        CGRect b;
-        if (PathBounds((CAShapeLayer *)l, &b) && BigSize(b.size)) return YES;
-    }
-    return NO;
-}
-
-static void BigAccentFix(CALayer *l) {
-    if (!l || gInBig || !gMaster || !OnMain() || !BigLayer(l) || !AppIsDark()) return;
-    if (InGlassLayer(l) || IsKeyboardLayer(l)) return;
-    gInBig = YES;
-    @try {
-        if ([l isKindOfClass:CAGradientLayer.class]) {
-            CAGradientLayer *g = (CAGradientLayer *)l;
-            if (ColorsHaveAccent(g.colors)) g.colors = nil;
-        }
-        if ([l isKindOfClass:CAShapeLayer.class]) {
-            CAShapeLayer *sh = (CAShapeLayer *)l;
-            gInTry = YES;
-            if (NearAccentCG(sh.fillColor, 0.03, 0.5)) sh.fillColor = NULL;
-            if (NearAccentCG(sh.strokeColor, 0.03, 0.5)) sh.strokeColor = NULL;
-            gInTry = NO;
-        }
-        if (NearAccentCG(l.backgroundColor, 0.03, 0.5)) l.backgroundColor = NULL;
-        if (l.contents) {
-            id m = [l valueForKey:@"contentsMultiplyColor"];
-            if (m && NearAccentCG((__bridge CGColorRef)m, 0.03, 0.5)) {
-                gInContents = YES;
-                l.contents = nil;
-                gInContents = NO;
-            }
-        }
-    } @catch (NSException *e) {
-        gInTry = NO;
-        gInContents = NO;
-    }
-    gInBig = NO;
-}
-
-static void BigWatch(CALayer *l) {
-    if (!l || gInBig || !gMaster || !OnMain()) return;
-    CGSize s = l.bounds.size;
-    if (s.width > 0 && s.height > 0 && !BigSize(s)) return;   // da biet la nho -> bo qua
-    if ([l isKindOfClass:CAShapeLayer.class]) {
-        CGRect b;
-        if (PathBounds((CAShapeLayer *)l, &b) && !BigSize(b.size)) return;
-    }
-    SET(l, kBigWatch, @YES);
-    BigAccentFix(l);
-    __weak CALayer *wl = l;
-    dispatch_async(dispatch_get_main_queue(), ^{ BigAccentFix(wl); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ BigAccentFix(wl); });
 }
 
 static void TryBlackShape(CAShapeLayer *sh) {
@@ -1639,8 +1535,7 @@ static BOOL KbForceView(UIView *v) {
 static BOOL KbForceLayer(CALayer *l) {
     for (int i = 0; i < 8 && l; i++, l = l.superlayer) {
         if (KbForceName(NSStringFromClass(l.class))) return YES;
-        if (gSafe) continue;   // Facebook: khong gui message toi delegate (co the la con tro treo)
-        id d = l.delegate;
+        id d = LDel(l);   // [NEW] Facebook: bo qua delegate (an toan)
         if (d && KbForceName(NSStringFromClass([d class]))) return YES;
     }
     return NO;
@@ -1754,8 +1649,9 @@ static void SweepView(UIView *v, int depth) {
 }
 
 // Hook-level: icon qua dia cau / menu chon ban phim doi accent ngay khi duoc gan anh (khong cho den dot quet 0.3s)
+// [NEW] Bo dieu kien gSafe: chay ca tren Facebook (chi dung view/class name, khong dung delegate cua layer)
 static void KbForceImageFix(UIImageView *iv) {
-    if (gInKbFix || gSafe || !gMaster || !OnMain() || !iv) return;
+    if (gInKbFix || !gMaster || !OnMain() || !iv) return;
     UIWindow *w = iv.window;
     if (!w || !InputWindow(w) || w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) return;
     CGSize s = iv.bounds.size;
@@ -1819,23 +1715,20 @@ static void StartSweep(void) {
 // =====================================================================================
 // Qua dia cau + icon vung dock (mic, menu chon ban phim...) -> doi sang accent
 // Module doc lap, chay bang timer rieng, chi o cua so ban phim (che do sang).
+// [NEW] Chay tren MOI app (ke ca Facebook). Tren Facebook (gSafe) khong dung delegate cua layer (LDel).
 // - Vung "ten" = layer/view co class thuoc KbForceName (UIKeyboardDockItemButton...) -> luon xu ly, kg kiem tra "duoi nut accent"
 // - Vung "day" = ~76pt day cua so ban phim -> chi icon nho 12..40pt, khong nam duoi nut accent
 // - Cach 1: anh CGImage dang icon (xam/trang/den, nhieu vung trong) -> to accent theo hinh dang, multiply trang
 // - [FIX] Cach 1b: anh trang/xam nhat dang DIA DAC (qua dia cau: nen mo, it vung trong) -> cung to accent theo alpha
 // - Cach 2: contents khong phai CGImage (backing store / mask) -> dat contentsMultiplyColor = accent
 // - Layer cua UIImageView (iv.image nil hoac UIKit tu render lai) cung duoc xu ly truc tiep
-// - Go compositingFilter / filters (vibrancy/glass) cua icon va cac layer cha (nho, hoac rong neu o vung dock)
-// - [FIX] Cua so popup (menu chon ban phim) co the nam o cua so cap cao hon -> quet ca cua so do (chi vung "ten")
+// - Go compositingFilter (vibrancy/glass) cua icon va cac layer cha (nho, hoac rong neu o vung dock)
+// Khong dong vao nut back/Enter (icon den) nen khong xung dot voi phan do.
 // =====================================================================================
 static BOOL GlbNameZone(CALayer *l) { return l ? KbForceLayer(l) : NO; }
 
-static BOOL GlbWindowOK(UIWindow *w) {
-    return InputWindow(w) || w.windowLevel > UIWindowLevelNormal;
-}
-
 static BOOL GlbStripZone(CALayer *l, UIWindow *w) {
-    if (!l || !w || !InputWindow(w)) return NO;
+    if (!l || !w) return NO;
     CGRect r = [w.layer convertRect:l.bounds fromLayer:l];
     if (CGRectIsNull(r) || CGRectIsInfinite(r) || isnan(r.origin.x) || isnan(r.origin.y)) return NO;
     CGFloat H = CGRectGetHeight(w.bounds);
@@ -1863,8 +1756,7 @@ static BOOL GlbIconLike(CGImageRef cg, int minClear) {
 
 // [FIX] Qua dia cau la hinh tron dac/mo (nen trang mo + luoi trang) -> chiem >70% o vuong va it vung trong nen GlbIconLike
 // loai nham. Nhan dien theo: gan nhu chi xam/trang va do sang trung binh (co trong so alpha) cao.
-// thr: 0.8 cho vung thuong, 0.55 cho vung "ten" (icon trang co bong xam / vien xam)
-static BOOL GlbWhiteLikeT(CGImageRef cg, CGFloat thr) {
+static BOOL GlbWhiteLike(CGImageRef cg) {
     if (!cg) return NO;
     uint8_t buf[SN * SN * 4];
     if (!SampleCG(cg, buf)) return NO;
@@ -1882,9 +1774,8 @@ static BOOL GlbWhiteLikeT(CGImageRef cg, CGFloat thr) {
         sl += ((r + g + b) / 3.0) * wt;
         sw += wt;
     }
-    return solid >= 6 && gray * 100 >= 90 * solid && sw > 0 && (sl / sw) >= thr;
+    return solid >= 6 && gray * 100 >= 90 * solid && sw > 0 && (sl / sw) >= 0.8;
 }
-#define GlbWhiteLike(cg) GlbWhiteLikeT(cg, 0.8)
 
 static void GlbUnfilter(CALayer *l) {
     if (!l) return;
@@ -1896,8 +1787,6 @@ static void GlbUnfilter(CALayer *l) {
         CGSize s = c.bounds.size;
         if (s.height > 120 || (!wide && s.width > 120)) break;
         if (c.compositingFilter) c.compositingFilter = nil;
-        // [FIX] vung ten: bo loc mau (vibrancy/colorMatrix) o layer cha nho, neu khong icon van bi ep thanh trang
-        if (wide && c != l && c.filters.count) c.filters = nil;
     }
     if (l.filters.count) l.filters = nil;
 }
@@ -1936,7 +1825,7 @@ static void GlbView(UIImageView *iv, UIWindow *w) {
     UIImage *out = nil;
     if (base.isSymbolImage || base.renderingMode == UIImageRenderingModeAlwaysTemplate) {
         out = [base imageWithTintColor:[UIColor colorWithCGColor:CGFor(NO)] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    } else if (base.CGImage && (GlbIconLike(base.CGImage, 30) || GlbWhiteLike(base.CGImage) || (name && GlbWhiteLikeT(base.CGImage, 0.55)))) {
+    } else if (base.CGImage && (GlbIconLike(base.CGImage, 30) || GlbWhiteLike(base.CGImage))) {
         CGImageRef k = CopyTintedCG(base.CGImage, CGFor(NO));
         if (k) {
             out = [UIImage imageWithCGImage:k scale:base.scale orientation:base.imageOrientation];
@@ -1954,8 +1843,9 @@ static void GlbView(UIImageView *iv, UIWindow *w) {
 }
 
 // [FIX] Doi icon qua dia cau ngay khi UIImageView duoc gan anh / vao cua so (khong cho den dot quet)
+// [NEW] Bo dieu kien gSafe -> chay ca tren Facebook
 static void KbGlobeImageFix(UIImageView *iv) {
-    if (gInKbFix || gSafe || !gMaster || !OnMain() || !iv) return;
+    if (gInKbFix || !gMaster || !OnMain() || !iv) return;
     UIWindow *w = iv.window;
     if (!w || !InputWindow(w) || w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) return;
     BOOL oldDark = gDark;
@@ -1972,12 +1862,12 @@ static void GlbLayer(CALayer *l, UIWindow *w) {
     BOOL name = GlbNameZone(l);
     CGFloat lim = name ? 96 : 40;
     if (s.width < 12 || s.height < 12 || s.width > lim || s.height > lim) return;
-    BOOL ivLayer = GET(l, kImgView) || [l.delegate isKindOfClass:UIImageView.class];
+    id ldel = LDel(l);   // [NEW] Facebook: nil (khong gui message toi delegate)
+    BOOL ivLayer = GET(l, kImgView) || [ldel isKindOfClass:UIImageView.class];
     if (!name) {
         if (ivLayer) {
             // [FIX] layer cua UIImageView co anh -> GlbView xu ly; anh nil (UIKit tu ve vao layer) -> xu ly o day
-            id dl = l.delegate;
-            UIImageView *div = [dl isKindOfClass:UIImageView.class] ? (UIImageView *)dl : nil;
+            UIImageView *div = [ldel isKindOfClass:UIImageView.class] ? (UIImageView *)ldel : nil;
             if (!(div && !div.image)) return;
         }
         if (!GlbStripZone(l, w) || UnderAccentKey(l)) return;
@@ -2006,7 +1896,7 @@ static void GlbLayer(CALayer *l, UIWindow *w) {
     }
     if (CFGetTypeID((__bridge CFTypeRef)src) != CGImageGetTypeID()) return;
     CGImageRef sc = (__bridge CGImageRef)src;
-    BOOL like = GlbIconLike(sc, small ? 30 : 60) || (small && GlbWhiteLike(sc)) || (name && small && GlbWhiteLikeT(sc, 0.55));   // [FIX] them dang dia dac trang (qua dia cau)
+    BOOL like = GlbIconLike(sc, small ? 30 : 60) || (small && GlbWhiteLike(sc));   // [FIX] them dang dia dac trang (qua dia cau)
     if (!like) {
         // anh khong phai dang icon xam: neu la layer nho trong vung ten thi thu multiply
         if (name && small && !ContentsLooksAccent(l)) GlbMultiplyOnly(l);
@@ -2062,19 +1952,152 @@ static void GlbSweepView(UIView *v, UIWindow *w, int depth) {
     for (UIView *sv in [v.subviews copy]) GlbSweepView(sv, w, depth + 1);
 }
 
+// [NEW] Bo dieu kien gSafe -> quet ca tren Facebook
 static void GlobeSweepAll(void) {
     Crumb("GlobeSweepAll");
-    if (!gMaster || gSafe || !OnMain() || !gCGWhite) return;
+    if (!gMaster || !OnMain() || !gCGWhite) return;
     BOOL oldDark = gDark;
     @try {
         for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
             if (![sc isKindOfClass:UIWindowScene.class]) continue;
             for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
-                if (w.hidden || w.alpha < 0.01 || !GlbWindowOK(w)) continue;
+                if (w.hidden || w.alpha < 0.01 || !InputWindow(w)) continue;
                 if (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) continue;
                 gDark = NO;
                 GlbSweepView(w, w, 0);
                 GlbSweepLayer(w.layer, w, 0);
+            }
+        }
+    } @catch (NSException *e) {}
+    gDark = oldDark;
+}
+
+// =====================================================================================
+// [NEW] Giao dien TOI: nut xanh cua ban phim (Search / Go / Send / Done...) -> accent
+// Chi dong vao cua so ban phim o che do toi. Khong dong vao phan khac cua ban phim.
+// Khong dung delegate cua layer -> an toan tren Facebook.
+// Xu ly: backgroundColor xanh, contentsMultiplyColor xanh, anh CGImage chu yeu xanh (chi doi pixel xanh,
+// giu nguyen chi tiet trang nhu kinh lup), CAShapeLayer fill/stroke xanh.
+// =====================================================================================
+static BOOL BlueQuick(CGImageRef cg) {
+    if (!cg) return NO;
+    uint8_t buf[SN * SN * 4];
+    if (!SampleCG(cg, buf)) return NO;
+    int solid = 0, blue = 0;
+    for (int i = 0; i < SN * SN; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) continue;
+        solid++;
+        CGFloat r, g, b;
+        Unpm(px, &r, &g, &b);
+        if (BlueClass(r, g, b) == 1) blue++;
+    }
+    return solid >= 20 && blue * 100 >= 35 * solid;
+}
+
+static CGImageRef KbBlueOnly(CGImageRef src) {
+    if (!src || !gMaster) return NULL;
+    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
+    if (w < 8 || h < 8 || w > 600 || h > 400 || !RATE(300)) return NULL;
+    CGContextRef ctx;
+    uint8_t *buf = LoadBuf(src, w, h, &ctx);
+    if (!buf) return NULL;
+    const CGFloat *q = AccRGB();
+    int hit = 0;
+    for (size_t i = 0; i < w * h; i++) {
+        uint8_t *px = buf + i * 4;
+        if (px[3] < 24) continue;
+        CGFloat r, g, b;
+        Unpm(px, &r, &g, &b);
+        if (BlueClass(r, g, b) != 1) continue;
+        SetAcc(px, q, px[3] / 255.0);
+        hit++;
+    }
+    if (!hit) { FreeBuf(buf, ctx); return NULL; }
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    FreeBuf(buf, ctx);
+    return out;
+}
+
+static void DarkBlueLayer(CALayer *l, int depth) {
+    if (!l || depth > 30) return;
+    CGSize s = l.bounds.size;
+    if (s.width >= 8 && s.height >= 8 && s.width <= 400 && s.height <= 220) {
+        int cls = 0;
+
+        // 1) nen xanh
+        CGColorRef bg = l.backgroundColor;
+        if (bg) {
+            CGColorRef n = LayerRemap(bg, &cls);
+            if (n && cls == 1) l.backgroundColor = n;
+        }
+
+        // 2) shape xanh
+        if ([l isKindOfClass:CAShapeLayer.class]) {
+            CAShapeLayer *sh = (CAShapeLayer *)l;
+            cls = 0;
+            CGColorRef nf = LayerRemap(sh.fillColor, &cls);
+            if (nf && cls == 1) sh.fillColor = nf;
+            cls = 0;
+            CGColorRef ns = LayerRemap(sh.strokeColor, &cls);
+            if (ns && cls == 1) sh.strokeColor = ns;
+        }
+
+        // 3) anh chu yeu xanh -> chi doi pixel xanh sang accent
+        id c = l.contents;
+        if (c && CFGetTypeID((__bridge CFTypeRef)c) == CGImageGetTypeID() && !GET(l, kKbSrc) && !GET(l, kContentsSrc)) {
+            uintptr_t cp = (uintptr_t)(__bridge void *)c;
+            NSNumber *op = GET(l, kDbPtr);
+            id src = c;
+            BOOL skip = NO;
+            if (op && (uintptr_t)op.unsignedLongValue == cp) {
+                if ([GET(l, kDbVer) intValue] == gVersion) skip = YES;
+                else src = GET(l, kDbSrc) ?: c;
+            }
+            if (!skip) {
+                CGImageRef sc = (__bridge CGImageRef)src;
+                CGImageRef k = BlueQuick(sc) ? KbBlueOnly(sc) : NULL;
+                if (k) {
+                    SET(l, kDbSrc, src);
+                    PutContents(l, k);
+                    CGImageRelease(k);
+                } else {
+                    SET(l, kDbSrc, nil);
+                }
+                id nc = l.contents;
+                if (nc) SET(l, kDbPtr, @((unsigned long)(uintptr_t)(__bridge void *)nc));
+                SET(l, kDbVer, @(gVersion));
+            }
+        }
+
+        // 4) multiply xanh
+        @try {
+            id m = [l valueForKey:@"contentsMultiplyColor"];
+            if (m) {
+                cls = 0;
+                CGColorRef mn = LayerRemap((__bridge CGColorRef)m, &cls);
+                if (mn && cls == 1) {
+                    // anh da duoc to accent o buoc 3 -> multiply de trang, tranh to 2 lan
+                    [l setContentsMultiplyColor:(GET(l, kDbSrc) ? gCGWhite : mn)];
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    for (CALayer *sub in [l.sublayers copy]) DarkBlueLayer(sub, depth + 1);
+}
+
+static void DarkBlueSweepAll(void) {
+    Crumb("DarkBlueSweepAll");
+    if (!gMaster || !gColor || !gCGWhite || !OnMain()) return;
+    BOOL oldDark = gDark;
+    @try {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:UIWindowScene.class]) continue;
+            for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
+                if (w.hidden || w.alpha < 0.01 || !InputWindow(w)) continue;
+                if (w.traitCollection.userInterfaceStyle != UIUserInterfaceStyleDark) continue;
+                gDark = YES;
+                DarkBlueLayer(w.layer, 0);
             }
         }
     } @catch (NSException *e) {}
@@ -2086,189 +2109,7 @@ static void StartGlobeSweep(void) {
     if (t) return;
     t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC), (uint64_t)(0.05 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(t, ^{ GlobeSweepAll(); });
-    dispatch_resume(t);
-}
-
-// =====================================================================================
-// [NEW] Ban phim GIAO DIEN TOI -> doi sang accent (chu/so/icon trang -> accent, nut xanh Search/Go -> accent)
-// Module doc lap (timer rieng), chay ca trong Facebook (gSafe): chi so sanh class/con tro, KHONG gui message toi delegate.
-// - Nut xanh (nen / shape / anh / multiply xanh) -> accent (giu bieu tuong trang tren nut)
-// - Chu/so/icon trang (anh CGImage dang net, trong suot nhieu) -> contentsMultiplyColor = accent (khong sua anh goc)
-// - Glyph nam duoi nut accent (kinh lup tren nut Search) -> giu trang
-// =====================================================================================
-static BOOL DkGlyph(CGImageRef cg) {
-    if (!cg) return NO;
-    uint8_t buf[SN * SN * 4];
-    if (!SampleCG(cg, buf)) return NO;
-    int solid = 0, gray = 0, clear = 0;
-    CGFloat sl = 0, sw = 0;
-    for (int i = 0; i < SN * SN; i++) {
-        const uint8_t *px = buf + i * 4;
-        if (px[3] < 24) { clear++; continue; }
-        solid++;
-        CGFloat r, g, b;
-        Unpm(px, &r, &g, &b);
-        if (fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) > 0.12) continue;
-        gray++;
-        CGFloat wt = px[3] / 255.0;
-        sl += ((r + g + b) / 3.0) * wt;
-        sw += wt;
-    }
-    int total = SN * SN;
-    return solid >= 2 && gray * 100 >= 90 * solid && sw > 0 && (sl / sw) >= 0.6 &&
-           clear * 100 >= 20 * total && solid * 100 <= 78 * total;
-}
-
-static void DkLayer(CALayer *l) {
-    // 1) nen / shape xanh -> accent
-    CGColorRef bg = l.backgroundColor;
-    if (bg && !IsOurs(bg)) {
-        int bc = 0;
-        CGColorRef nb = LayerRemap(bg, &bc);
-        if (nb && bc == 1) {
-            l.backgroundColor = nb;
-            SET(l, kDkKey, @YES);
-            MarkFill(l, nil);
-        }
-    }
-    if ([l isKindOfClass:CAShapeLayer.class]) {
-        CAShapeLayer *sh = (CAShapeLayer *)l;
-        int fc = 0;
-        CGColorRef nf = LayerRemap(sh.fillColor, &fc);
-        if (nf && fc == 1) { gInTry = YES; sh.fillColor = nf; gInTry = NO; }
-        return;
-    }
-    // 2) layer co anh CGImage
-    id c = l.contents;
-    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
-    id m = nil;
-    @try { m = [l valueForKey:@"contentsMultiplyColor"]; } @catch (NSException *e) { return; }
-    CGColorRef mc = m ? (__bridge CGColorRef)m : NULL;
-    if (mc && !IsOurs(mc)) {
-        int mcls = 0;
-        CGColorRef nm = LayerRemap(mc, &mcls);
-        if (nm && mcls == 1) {   // anh trang x multiply xanh (nut Search) -> multiply accent
-            @try { [l setContentsMultiplyColor:nm]; } @catch (NSException *e) {}
-            SET(l, kDkKey, @YES);
-            return;
-        }
-    }
-    uintptr_t p = (uintptr_t)(__bridge void *)c;
-    NSNumber *op = GET(l, kDkPtr);
-    int kind = 0;   // 0 = khac, 1 = nut xanh da to accent, 2 = glyph trang
-    if (op && (uintptr_t)op.unsignedLongValue == p) {
-        kind = [GET(l, kDkKind) intValue];
-    } else {
-        if (!GET(l, kKbSrc) && !GET(l, kContentsSrc)) {
-            CGImageRef k = KbRecolorEx((__bridge CGImageRef)c, NO, YES);   // chi nut xanh
-            if (k) {
-                if (gLastKbMode == 1) {
-                    SET(l, kKbSrc, c);
-                    PutContents(l, k);
-                    SET(l, kDkKey, @YES);
-                    kind = 1;
-                }
-                CGImageRelease(k);
-            }
-            if (!kind && DkGlyph((__bridge CGImageRef)c)) kind = 2;
-        }
-        id nc = l.contents;
-        uintptr_t np = nc ? (uintptr_t)(__bridge void *)nc : p;
-        SET(l, kDkPtr, @((unsigned long)np));
-        SET(l, kDkKind, @(kind));
-    }
-    if (kind != 2) return;
-    // 3) glyph trang -> multiply accent (tru khi nam duoi nut accent)
-    BOOL under = UnderAccentKey(l);
-    CGFloat r = 0, g = 0, b = 0, a = 1;
-    BOOL have = mc && CGRGBA(mc, &r, &g, &b, &a);
-    BOOL isWhite = !mc || (have && r > 0.9 && g > 0.9 && b > 0.9);
-    BOOL isAcc = have && NearAccentCG(mc, 0.03, 0.01);
-    if (under) {
-        if (isAcc && GET(l, kDkMul)) {
-            SET(l, kDkMul, nil);
-            @try { [l setContentsMultiplyColor:gCGWhite]; } @catch (NSException *e) {}
-        }
-        return;
-    }
-    if (isWhite) {
-        CGColorRef na = (have && a < 0.99) ? CGColorCreateCopyWithAlpha(CGFor(NO), a) : NULL;
-        @try { [l setContentsMultiplyColor:(na ?: CGFor(NO))]; } @catch (NSException *e) {}
-        if (na) CGColorRelease(na);
-        SET(l, kDkMul, @YES);
-    }
-}
-
-static void DkSweepLayers(CALayer *l, int depth) {
-    if (!l || depth > 30) return;
-    CGSize s = l.bounds.size;
-    if (!l.hidden && s.width >= 4 && s.height >= 4 && s.width <= 220 && s.height <= 160) DkLayer(l);
-    for (CALayer *sub in [l.sublayers copy]) DkSweepLayers(sub, depth + 1);
-}
-
-static void DkSweepViews(UIView *v, int depth) {
-    if (!v || depth > 30) return;
-    if ([v isKindOfClass:UILabel.class]) {
-        UILabel *lb = (UILabel *)v;
-        NSString *t = lb.text ?: lb.attributedText.string;
-        if (t.length > 0 && t.length <= 3 && IsWhiteColor(lb.textColor) && !UnderAccentKey(lb.layer)) lb.textColor = gColor;
-    }
-    for (UIView *sv in [v.subviews copy]) DkSweepViews(sv, depth + 1);
-}
-
-static void DarkKbSweepAll(void) {
-    Crumb("DarkKbSweepAll");
-    if (!gMaster || !OnMain() || !gCGWhite) { gDkActive = NO; return; }
-    BOOL oldDark = gDark, active = NO;
-    @try {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (![sc isKindOfClass:UIWindowScene.class]) continue;
-            for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
-                if (w.hidden || w.alpha < 0.01 || !InputWindow(w)) continue;
-                if (w.traitCollection.userInterfaceStyle != UIUserInterfaceStyleDark) continue;
-                active = YES;
-                gDark = YES;
-                DkSweepLayers(w.layer, 0);
-                DkSweepLayers(w.layer, 0);   // luot 2: sau khi nut xanh da doi, glyph tren nut duoc giu trang
-                DkSweepViews(w, 0);
-            }
-        }
-    } @catch (NSException *e) {}
-    gDark = oldDark;
-    gDkActive = active;
-}
-
-static BOOL DkWindowDark(CALayer *l) {
-    CALayer *root = l;
-    for (int i = 0; i < 120 && root.superlayer; i++) root = root.superlayer;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
-            if (w.layer == root) return InputWindow(w) && w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
-        }
-    }
-    return NO;
-}
-
-// Hook-level: layer ban phim toi vua doi anh -> doi accent ngay (khong cho dot quet 0.25s)
-static void DkImmediate(CALayer *l) {
-    if (!gDkActive || !gMaster || !OnMain() || !l || !l.contents || !gCGWhite) return;
-    CGSize z = l.bounds.size;
-    if (z.width < 4 || z.height < 4 || z.width > 220 || z.height > 160) return;
-    if (!KbRootLayer(l) || !DkWindowDark(l)) return;
-    BOOL oldDark = gDark;
-    gDark = YES;
-    @try { DkLayer(l); } @catch (NSException *e) {}
-    gDark = oldDark;
-}
-
-static void StartDarkSweep(void) {
-    static dispatch_source_t t;
-    if (t) return;
-    t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), (uint64_t)(0.25 * NSEC_PER_SEC), (uint64_t)(0.1 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(t, ^{ DarkKbSweepAll(); });
+    dispatch_source_set_event_handler(t, ^{ GlobeSweepAll(); DarkBlueSweepAll(); });
     dispatch_resume(t);
 }
 
@@ -2310,6 +2151,7 @@ static void KbGuardRun(void) {
     } @catch (NSException *e) {}
     gDark = oldDark;
     GlobeSweepAll();
+    DarkBlueSweepAll();
 }
 
 static void ScheduleKbGuard(void) {
@@ -2484,11 +2326,8 @@ static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUI
     CGSize s = l.bounds.size;
     BOOL shp = [l isKindOfClass:CAShapeLayer.class];
     BOOL txt = [l isKindOfClass:CATextLayer.class];
-    BOOL grad = [l isKindOfClass:CAGradientLayer.class];
     BOOL small = s.width <= 64 && s.height <= 64;
-    // [NEW] vung lon (>=140pt) co nen accent / gradient / mask / da bi tweak theo doi -> in ra de chan doan vung accent che bai
-    BOOL big = BigSize(s) && (grad || l.mask || GET(l, kBigWatch) || IsAccentCG(l.backgroundColor));
-    BOOL show = kb ? (l.contents != nil || shp || txt) : (l.shadowOpacity > 0 || shp || (l.contents && small) || big);
+    BOOL show = kb ? (l.contents != nil || shp || txt) : (l.shadowOpacity > 0 || shp || (l.contents && small));
     if (show) {
         [out appendFormat:@"%d %@ %.0fx%.0f", depth, NSStringFromClass(l.class), s.width, s.height];
         id d = l.delegate;
@@ -2502,12 +2341,6 @@ static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUI
         if (l.filters.count) [out appendFormat:@" filters=%lu", (unsigned long)l.filters.count];
         if (l.hidden) [out appendString:@" HIDDEN"];
         if (l.opacity < 0.99) [out appendFormat:@" op=%.2f", l.opacity];
-        if (l.mask) [out appendString:@" HASMASK"];
-        if (GET(l, kBigWatch)) [out appendString:@" BIGWATCH"];
-        if (grad) {
-            NSArray *gc = ((CAGradientLayer *)l).colors;
-            [out appendFormat:@" gradient(n=%lu accent=%d)", (unsigned long)gc.count, ColorsHaveAccent(gc) ? 1 : 0];
-        }
         if (l.shadowOpacity > 0)
             [out appendFormat:@" shadow(op=%.2f r=%.1f col=%@)", l.shadowOpacity, l.shadowRadius, HexCG(l.shadowColor)];
         if (l.backgroundColor) [out appendFormat:@" bg=%@", HexCG(l.backgroundColor)];
@@ -2623,5 +2456,459 @@ static void Setup(UIWindow *w) {
     if (!tv || tv.intValue != gVersion) {
         SET(w, kTintVer, @(gVersion));
         w.tintColor = gMaster ? gColor : nil;
+    }
+}
+
+// ================= HOOKS =================
+%hook UIWindow
+- (void)makeKeyAndVisible { %orig; Setup(self); }
+- (void)becomeKeyWindow { %orig; Setup(self); }
+- (void)setRootViewController:(UIViewController *)vc { %orig; Setup(self); }
+- (void)traitCollectionDidChange:(UITraitCollection *)prev {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    gDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+}
+%end
+
+%hook UIView
+- (UIColor *)tintColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    if (!gMaster || !gColor) return %orig;
+    if (gFillCount > 0 && OnMain() && UnderFill(self) && !InControlView(self)) {
+        // FIX: icon tren ban phim (qua dia cau, menu chon ban phim) khong nam duoi nut accent -> giu accent, khong de trang
+        if (ViewInKeyboard(self) && !UnderAccentKey(self.layer)) return gColor;
+        return UIColor.whiteColor;
+    }
+    return gColor;
+}
+- (void)setTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (gMaster && c && OnMain() && IsInkColor(c)) {
+        %orig(gColor);
+        if ([self isKindOfClass:UIImageView.class]) MarkInk(self.layer);
+        return;
+    }
+    %orig;
+}
+- (void)setBackgroundColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (!gMaster || !c) { %orig; return; }
+    if (!OnMain()) { UIColor *m = ColorRemap(c, NULL); %orig(m ?: c); return; }
+    int cls = 0;
+    UIColor *n = ColorRemap(c, &cls);
+    if (n && cls == 2 && InGlassLayer(self.layer)) n = nil;
+    %orig(n ?: c);
+    if (n && cls == 1) MarkFill(self.layer, self);
+    else if (!n && IsFillCandidateColor(c)) { SetOwner(self); ScheduleCheck(self.layer, NO); }
+}
+%end
+
+%hook CALayer
+- (void)setBackgroundColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (!gMaster || !c) { %orig; return; }
+    int cls = 0;
+    CGColorRef n = LayerRemap(c, &cls);
+    if (n && cls == 2 && OnMain() && InGlassLayer(self)) n = NULL;
+    if (n) { %orig(n); if (cls == 1 && OnMain()) MarkFill(self, nil); return; }
+    %orig;
+    if (IsFillCandidateCG(c)) ScheduleCheck(self, NO);
+}
+- (void)setBorderColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    CGColorRef n = LayerRemap(c, NULL);
+    if (n) { %orig(n); return; }
+    %orig;
+    if (gMaster && IsBlackCG(c)) ScheduleCheck(self, NO);
+}
+- (void)setContentsMultiplyColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    CGColorRef n = NULL;
+    BOOL inkSwap = NO;
+    if (gMaster && c) {
+        int mcls = 0;
+        n = LayerRemap(c, &mcls);
+        if (n && mcls == 2 && OnMain() && InGlassLayer(self)) n = NULL;
+        if (!n && OnMain() && IsInkCG(c) && !InGlassLayer(self)) {
+            CGSize s = self.bounds.size;
+            if (s.width <= 64 && s.height <= 64) { n = IconShapeColor(self); inkSwap = YES; }
+            // [FIX] nhan chu rong hon 64pt tren ban phim (nhan ngon ngu cua nut space) -> cung doi, khong de den
+            else if (self.contents && s.width <= 220 && s.height <= 160 && IsKeyboardLayer(self)) {
+                n = (GET(self, kKbSrc) || GET(self, kContentsSrc)) ? gCGWhite : IconShapeColor(self);
+                inkSwap = YES;
+            }
+        }
+    }
+    // anh cua layer nay da duoc to accent -> multiply de trang, tranh to 2 lan
+    // FIX: layer da duoc tweak to accent (kKbSrc/kContentsSrc) trong ban phim -> luon dua ve trang, khong phu thuoc viec doan mau anh
+    if (n && n != gCGWhite && OnMain()) {
+        BOOL marked = GET(self, kKbSrc) || GET(self, kContentsSrc);
+        BOOL kbl = marked || IsKeyboardLayer(self);
+        if (kbl && ((marked && IsKeyboardLayer(self)) || ContentsLooksAccent(self))) n = gCGWhite;
+    }
+    %orig(n ?: c);
+    if (inkSwap) MarkInk(self);
+    if (n && n != gCGWhite) KbEnsureNotBlack(self);
+}
+- (void)setShadowOpacity:(float)v {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (v > 0 && ShadowEligible(self)) { %orig(0); return; }
+    %orig;
+}
+- (void)setShadowColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    KillShadowIfEligible(self);
+}
+- (void)setShadowRadius:(CGFloat)r {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    KillShadowIfEligible(self);
+}
+- (void)setShadowOffset:(CGSize)o {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    KillShadowIfEligible(self);
+}
+- (void)layoutSublayers {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    Crumb("hook:layoutSublayers");
+    %orig;
+    if (gHasPend && OnMain()) PendingRun(self);
+    if (!gMaster || !OnMain()) return;
+    KillShadowIfEligible(self);
+    // Ban phim: anh da to accent ma van con multiply accent -> dua ve trang (accent chi 1 lan)
+    if (self.contents) {
+        CGSize z = self.bounds.size;
+        if (z.width <= 220 && z.height <= 160 && IsKeyboardLayer(self)) { FixDoubleTint(self); KbEnsureNotBlack(self); }
+    }
+}
+// [FIX] layer moi gan vao cay ban phim -> doi mau dong bo ngay (khong chop den khi doi ngon ngu)
+- (void)addSublayer:(CALayer *)layer {
+    %orig;
+    KbAttachCheck(self, layer);
+}
+- (void)insertSublayer:(CALayer *)layer atIndex:(unsigned int)idx {
+    %orig;
+    KbAttachCheck(self, layer);
+}
+- (void)insertSublayer:(CALayer *)layer below:(CALayer *)sibling {
+    %orig;
+    KbAttachCheck(self, layer);
+}
+- (void)insertSublayer:(CALayer *)layer above:(CALayer *)sibling {
+    %orig;
+    KbAttachCheck(self, layer);
+}
+- (void)setContents:(id)contents {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    Crumb("hook:setContents");
+    if (gInContents) { %orig; return; }
+    CLEAR(self, kContentsSrc);
+    CLEAR(self, kKbSrc);
+    CLEAR(self, kWhiteMark);
+    if (!contents || !gMaster || !OnMain() || CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) { %orig; return; }
+
+    CGImageRef cg = (__bridge CGImageRef)contents;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    CGSize s = self.bounds.size;
+    BOOL isShape = [self isKindOfClass:CAShapeLayer.class];
+    BOOL skip = GET(self, kImgView) || isShape || (self.masksToBounds && self.cornerRadius > 0) ||
+                w < 8 || h < 8 || w > 192 || h > 192 || s.width > 48 || s.height > 48 ||
+                (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
+    BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
+    if (!monoOK) {
+        BOOL kbSize = w >= 8 && h >= 8 && w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160;
+        // Ban phim: nut xanh -> accent, bieu tuong den (Enter) -> accent, icon trang (qua dia cau) -> accent
+        if (kbSize && !GET(self, kImgView) && !isShape && IsKeyboardLayer(self)) {
+            CGImageRef k = KbRecolor(cg, WhiteOK(self));
+            if (k) {
+                int km = gLastKbMode;
+                SET(self, kKbSrc, contents);
+                if (km == 3) SET(self, kWhiteMark, @YES);
+                %orig((__bridge id)k);
+                FixDoubleTint(self);
+                CGImageRelease(k);
+                if (km == 3) {   // icon trang co the nam duoi nut accent (kinh lup tren nut Search) -> kiem tra lai
+                    __weak CALayer *wl = self;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
+                }
+                return;
+            }
+        }
+        %orig;
+        KbEnsureNotBlack(self);
+        if (w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160 && !isShape) {
+            __weak CALayer *wl = self;
+            dispatch_async(dispatch_get_main_queue(), ^{ KbLate(wl); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
+        }
+        return;
+    }
+
+    CGImageRef t = CopyTintedCG(cg, IconShapeColor(self));
+    if (!t) { %orig; return; }
+    SET(self, kContentsSrc, contents);
+    %orig((__bridge id)t);
+    FixDoubleTint(self);
+    CGImageRelease(t);
+    KillShadowUp(self, 2);
+}
+%end
+
+%hook CATextLayer
+- (void)setForegroundColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    CGColorRef n = LayerRemap(c, NULL);
+    if (!n && gMaster && c && OnMain() && IsInkCG(c) && IsKeyboardLayer(self)) n = CGFor(NO);
+    %orig(n ?: c);
+}
+%end
+
+%hook CAShapeLayer
+- (void)setFillColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (!gMaster || !c) { %orig; return; }
+    CGColorRef n = LayerRemap(c, NULL);
+    if (n) { %orig(n); return; }
+    %orig;
+    StripWhiteShapeOutline(self);
+    if (!gInTry && IsInkCG(c)) ScheduleCheck(self, YES);
+}
+- (void)setStrokeColor:(CGColorRef)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (!gMaster || !c) { %orig; return; }
+    CGColorRef n = LayerRemap(c, NULL);
+    if (n) { %orig(n); return; }
+    %orig;
+    StripWhiteShapeOutline(self);
+    if (!gInTry && IsInkCG(c)) ScheduleCheck(self, YES);
+}
+%end
+
+%hook UISegmentedControl
+- (void)setSelectedSegmentTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    UIColor *n = (gMaster && c && OnMain() && IsBlackColor(c)) ? gColor : nil;
+    %orig(n ?: c);
+}
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    if (gMaster && OnMain()) {
+        UIColor *cur = self.selectedSegmentTintColor;
+        if (cur && IsBlackColor(cur)) self.selectedSegmentTintColor = gColor;
+    }
+}
+%end
+
+%hook UILabel
+- (void)setTextColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    UIColor *n = ColorRemap(c, NULL);
+    %orig(n ?: c);
+}
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window) { FixLabelBG(self); TabLabelFix(self); KbLabelFix(self); }
+}
+- (void)layoutSubviews {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    FixLabelBG(self);
+    TabLabelFix(self);
+}
+%end
+
+%hook UIButton
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window && gMaster && OnMain() && ViewInKeyboard(self)) {
+        UIColor *tc = [self titleColorForState:UIControlStateNormal];
+        if (tc && IsInkColor(tc)) [self setTitleColor:gColor forState:UIControlStateNormal];
+    }
+}
+- (void)setTitleColor:(UIColor *)c forState:(UIControlState)st {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    UIColor *n = ColorRemap(c, NULL);
+    %orig(n ?: c, st);
+}
+- (void)setImage:(UIImage *)img forState:(UIControlState)st {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig(ImgChain(img), st);
+}
+%end
+
+%hook UIBarButtonItem
+- (void)setImage:(UIImage *)img {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig(ImgChain(img));
+}
+%end
+
+%hook UIImageView
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window) { KbImageFix(self); KbForceImageFix(self); KbGlobeImageFix(self); }
+}
+- (void)setImage:(UIImage *)img {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (OnMain() && !GET(self.layer, kImgView)) SET(self.layer, kImgView, @YES);
+    if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
+    UIImage *n = ImgChain(img);
+    if (n && gMaster && OnMain()) {
+        CGSize s = n.size;
+        if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
+    }
+    %orig(n);
+    if (n && n != img && gMaster && OnMain()) KillShadowUp(self.layer, 2);   // icon da doi accent -> bo bong do
+    if (self.window) { KbImageFix(self); KbForceImageFix(self); KbGlobeImageFix(self); }
+    if (n && GET(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
+}
+%end
+
+%hook UIImage
+- (UIImage *)imageWithTintColor:(UIColor *)c renderingMode:(UIImageRenderingMode)m {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    UIColor *n = IconTintFix(c);
+    UIImage *o = %orig(n, m);
+    if (o && c && n != c && OnMain()) SET(o, kInkImg, @YES);
+    return o;
+}
+- (UIImage *)imageWithTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    UIColor *n = IconTintFix(c);
+    UIImage *o = %orig(n);
+    if (o && c && n != c && OnMain()) SET(o, kInkImg, @YES);
+    return o;
+}
+%end
+
+%hook UITabBar
+- (void)layoutSubviews { %orig; TabBarFix(self); }
+- (void)didMoveToWindow { %orig; if (self.window) TabBarFixLater(self); }
+- (void)setSelectedItem:(UITabBarItem *)item { %orig; TabBarFixLater(self); }
+- (void)traitCollectionDidChange:(UITraitCollection *)prev { %orig; TabBarFixLater(self); }
+- (void)setUnselectedItemTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig((gMaster && c && OnMain() && IsInkColor(c)) ? gColor : c);
+}
+%end
+
+%hook UITabBarItemStateAppearance
+- (void)setIconColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig((gMaster && c && OnMain() && IsInkColor(c)) ? gColor : c);
+}
+- (void)setTitleTextAttributes:(NSDictionary<NSAttributedStringKey, id> *)attrs {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    if (gMaster && gColor && OnMain()) {
+        NSMutableDictionary *m = attrs ? [attrs mutableCopy] : [NSMutableDictionary new];
+        m[NSForegroundColorAttributeName] = gColor;
+        attrs = m;
+    }
+    %orig(attrs);
+}
+%end
+
+%hook UIImageSymbolConfiguration
++ (UIImageSymbolConfiguration *)configurationWithHierarchicalColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    return %orig(IconTintFix(c));
+}
++ (UIImageSymbolConfiguration *)configurationWithPaletteColors:(NSArray<UIColor *> *)colors {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    NSMutableArray *m = [NSMutableArray arrayWithCapacity:colors.count];
+    for (UIColor *c in colors) [m addObject:(c ? IconTintFix(c) : c) ?: (id)NSNull.null];
+    if ([m containsObject:NSNull.null]) return %orig(colors);
+    return %orig(m);
+}
+%end
+
+%hook UISlider
+- (void)didMoveToWindow { %orig; TagControl(self); }
+%end
+
+%hook UIVisualEffectView
+- (void)didMoveToWindow { %orig; TagControl(self); }
+%end
+
+%hook UISwitch
+- (void)layoutSubviews { %orig; TagControl(self); }
+- (void)setOnTintColor:(UIColor *)c {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig(gMaster ? gColor : c);
+}
+- (UIColor *)onTintColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    return gMaster ? gColor : %orig;
+}
+- (void)didMoveToWindow {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; } AAC_DEPTH_SCOPE;
+    %orig;
+    TagControl(self);
+    if (gMaster && OnMain()) self.onTintColor = gColor;
+}
+%end
+
+%hook UIColor
++ (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    return RemapRGBA(r, g, b, a) ?: %orig;
+}
++ (UIColor *)colorWithDisplayP3Red:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    return RemapRGBA(r, g, b, a) ?: %orig;
+}
+- (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    CGFloat nr = r, ng = g, nb = b, na = a;
+    if (RemapComps(&nr, &ng, &nb, &na)) return %orig(nr, ng, nb, na);
+    return %orig;
+}
++ (UIColor *)systemBlueColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    if (gMaster && gColor) return gColor;
+    return %orig;
+}
++ (UIColor *)linkColor {
+    if (gDepth > AAC_MAXDEPTH) return %orig; AAC_DEPTH_SCOPE;
+    if (gMaster && gColor) return gColor;
+    return %orig;
+}
+%end
+
+static BOOL IsFacebookFamily(void) {
+    NSBundle *b = NSBundle.mainBundle;
+    NSString *bid = [b.bundleIdentifier lowercaseString] ?: @"";
+    NSString *exe = [[b objectForInfoDictionaryKey:@"CFBundleExecutable"] lowercaseString] ?: @"";
+    return [bid containsString:@"facebook"] || [bid containsString:@"messenger"] ||
+           [exe isEqualToString:@"facebook"] || [exe isEqualToString:@"messenger"];
+}
+
+%ctor {
+    @autoreleasepool {
+        NSString *bp = NSBundle.mainBundle.bundlePath;
+        if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
+        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES }];
+        InstallSignals();
+        InstallEH(0);
+        gSafe = IsFacebookFamily();
+        RefreshCache();
+        %init;
+        StartSweep();
+        StartGlobeSweep();
+        if (!gSafe) {
+            // [FIX] doi ngon ngu / ban phim -> chay loat luot quet bao ve de khong con chop den
+            [[NSNotificationCenter defaultCenter] addObserverForName:UITextInputCurrentInputModeDidChangeNotification
+                                                              object:nil
+                                                               queue:NSOperationQueue.mainQueue
+                                                          usingBlock:^(NSNotification *note) { ScheduleKbGuard(); }];
+        }
     }
 }
