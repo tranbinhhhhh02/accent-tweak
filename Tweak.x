@@ -7,39 +7,28 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-#define AAC_CONTENTS_HOOK 1
-
-#define AAC_PANEL_OWN_WINDOW 0
 
 typedef NS_ENUM(int, AACCat) { AACFill = 0, AACText = 0, AACIcon = 0, AACCount = 1 };
 
 static NSString *const kMasterKey  = @"AccentColorAll_Enabled";
 static NSString *const kHexKey     = @"AccentColorAll_Hex";
 static NSString *const kDefaultHex = @"B8A8FF";
+static NSString *const kCrashKey   = @"AccentColorAll_LastCrash";
 
-static const void *kFill        = &kFill;
-static const void *kGestureFlag = &kGestureFlag;
-static const void *kTintVer     = &kTintVer;
-static const void *kIconShape   = &kIconShape;
-static const void *kMonoBlack   = &kMonoBlack;
-static const void *kAccentSrc   = &kAccentSrc;
-static const void *kAccentStamp = &kAccentStamp;
-static const void *kBlueState   = &kBlueState;
-static const void *kBlueOut     = &kBlueOut;
-static const void *kBlueStamp   = &kBlueStamp;
-static const void *kBlueSrc     = &kBlueSrc;
-static const void *kContentsSrc = &kContentsSrc;
-static const void *kCtl         = &kCtl;
-static const void *kImgView     = &kImgView;
-static const void *kOwner       = &kOwner;
-static const void *kKbSrc       = &kKbSrc;     // [MOI] contents ban phim da doi mau
-static const void *kNoShadow    = &kNoShadow;  // layer bi go bong do
-static const void *kStripSrc    = &kStripSrc;  // anh da go vien/bong den
-static const void *kStripState  = &kStripState;
-static const void *kStripOut    = &kStripOut;
-static const void *kKbImg       = &kKbImg;     // anh ban phim da doi mau
-static const void *kInkTint     = &kInkTint;   // layer/anh den da bi doi sang accent
-static const void *kInkImg      = &kInkImg;
+#define KEY(n) static const void *n = &n;
+KEY(kFill) KEY(kGestureFlag) KEY(kTintVer) KEY(kIconShape) KEY(kMonoBlack)
+KEY(kAccentSrc) KEY(kAccentStamp) KEY(kBlueState) KEY(kBlueOut) KEY(kBlueStamp) KEY(kBlueSrc)
+KEY(kDualSrc) KEY(kDualState) KEY(kDualOut) KEY(kDualStamp)
+KEY(kContentsSrc) KEY(kCtl) KEY(kImgView) KEY(kOwner) KEY(kNoShadow)
+KEY(kStripSrc) KEY(kStripState) KEY(kStripOut)
+KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
+KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
+
+// Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
+#define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
+    CFAbsoluteTime _n = CFAbsoluteTimeGetCurrent(); \
+    if (_n - _ws > 1.0) { _ws = _n; _wc = 0; } \
+    ++_wc <= (max); })
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -57,6 +46,7 @@ static BOOL        gDark = NO;
 static int         gFillCount = 0;
 static int         gVersion = 0;
 static NSMutableArray *gKeep;
+static NSCache    *gKbCache;
 static __thread BOOL gRaw;
 
 #define AAC_MAXDEPTH 12
@@ -67,6 +57,7 @@ static inline void AACDepthLeave(int *p)    { gDepth--; }
 static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
+static BOOL        gInKbFix;
 static volatile int32_t gPending;
 static BOOL        gSafe;
 
@@ -75,7 +66,9 @@ static BOOL        gSafe;
 @end
 
 static inline BOOL OnMain(void) { return [NSThread isMainThread]; }
+static inline const CGFloat *AccRGB(void) { return gDark ? gRGBD : gRGBL; }
 
+// ---- Ghi crash ----
 static char gSigPath[1024];
 static char gCrumb[160];
 static void Crumb(const char *s) { if (s) strlcpy(gCrumb, s, sizeof gCrumb); }
@@ -117,6 +110,7 @@ static void InstallSignals(void) {
 
 static void TabBarFix(UITabBar *bar);
 
+// ---- Mau ----
 static UIColor *ColorFromHex(NSString *s) {
     s = [[s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] uppercaseString];
     if ([s hasPrefix:@"#"]) s = [s substringFromIndex:1];
@@ -231,13 +225,15 @@ static BOOL IsDarkRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a, CGFloat thr) 
 
 static BOOL IsBlackColor(UIColor *c) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
-    return IsDarkRGBA(r, g, b, a, 0.03);
+    return [c getRed:&r green:&g blue:&b alpha:&a] && IsDarkRGBA(r, g, b, a, 0.03);
 }
 static BOOL IsInkColor(UIColor *c) {
     CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
-    return IsDarkRGBA(r, g, b, a, 0.16);
+    return [c getRed:&r green:&g blue:&b alpha:&a] && IsDarkRGBA(r, g, b, a, 0.16);
+}
+static BOOL IsWhiteColor(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    return [c getRed:&r green:&g blue:&b alpha:&a] && a >= 0.99 && r > 0.97 && g > 0.97 && b > 0.97;
 }
 
 static BOOL IsBlackCG(CGColorRef c) {
@@ -248,25 +244,13 @@ static BOOL IsInkCG(CGColorRef c) {
     CGFloat r, g, b, a;
     return CGRGBA(c, &r, &g, &b, &a) && IsDarkRGBA(r, g, b, a, 0.16);
 }
-
-static BOOL IsWhiteColor(UIColor *c) {
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
-    return a >= 0.99 && r > 0.97 && g > 0.97 && b > 0.97;
-}
-
 static BOOL IsWhiteCG(CGColorRef c) {
     CGFloat r, g, b, a;
     return CGRGBA(c, &r, &g, &b, &a) && a >= 0.99 && r > 0.97 && g > 0.97 && b > 0.97;
 }
 
-static BOOL IsFillCandidateCG(CGColorRef c) {
-    return IsBlackCG(c) || (gDark && IsWhiteCG(c));
-}
-
-static BOOL IsFillCandidateColor(UIColor *c) {
-    return IsBlackColor(c) || (gDark && IsWhiteColor(c));
-}
+static BOOL IsFillCandidateCG(CGColorRef c)    { return IsBlackCG(c) || (gDark && IsWhiteCG(c)); }
+static BOOL IsFillCandidateColor(UIColor *c)   { return IsBlackColor(c) || (gDark && IsWhiteColor(c)); }
 
 static BOOL IsAccentCG(CGColorRef c) {
     if (!c || !gColor[0]) return NO;
@@ -328,18 +312,56 @@ static BOOL RemapComps(CGFloat *r, CGFloat *g, CGFloat *b, CGFloat *a) {
     if (gRaw || !gMaster || !gOn[AACFill]) return NO;
     int cls = BlueClass(*r, *g, *b);
     if (!cls) return NO;
-    const CGFloat *q = gDark ? gRGBD : gRGBL;
+    const CGFloat *q = AccRGB();
     *a = *a * (cls == 2 ? 0.2 : 1.0);
     *r = q[0]; *g = q[1]; *b = q[2];
     return YES;
 }
 
+// ---- Xu ly pixel dung chung ----
+static inline void Unpre(const uint8_t *px, CGFloat *r, CGFloat *g, CGFloat *b) {
+    CGFloat a = px[3];
+    *r = fmin(1, px[0] / a); *g = fmin(1, px[1] / a); *b = fmin(1, px[2] / a);
+}
+
+// Ve anh ra bo dem RGBA premultiplied. Tra ve buffer (caller free) va context (caller release)
+static uint8_t *FlatBuf(UIImage *img, size_t *pw, size_t *ph, CGContextRef *pctx) {
+    CGSize sz = img.size;
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = img.scale > 0 ? img.scale : 1;
+    fmt.opaque = NO;
+    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
+        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
+        }];
+    CGImageRef cg = flat.CGImage;
+    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
+    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) return NULL;
+    uint8_t *buf = calloc(w * h, 4);
+    if (!buf) return NULL;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return NULL; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    *pw = w; *ph = h; *pctx = ctx;
+    return buf;
+}
+
+static UIImage *FlatFinish(CGContextRef ctx, uint8_t *buf, CGFloat scale) {
+    CGImageRef o = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    free(buf);
+    if (!o) return nil;
+    UIImage *out = [UIImage imageWithCGImage:o scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(o);
+    return out;
+}
+
 static int CGImageIsBlackMono(CGImageRef cg) {
     if (!cg) return 0;
-    static CFAbsoluteTime winStart; static int winCount;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-    if (++winCount > 120) return -1;
+    if (!RATE_LIMIT(120)) return -1;
     int res = 0;
     enum { N = 24 };
     uint8_t buf[N * N * 4];
@@ -393,7 +415,7 @@ static CGImageRef CopyTintedCG(CGImageRef src, CGColorRef color) {
     return out;
 }
 
-// ---- Ban phim: nut xanh -> accent, bieu tuong den (Enter/back) -> accent ----
+// ---- Ban phim ----
 static BOOL KbName(NSString *cn) {
     return [cn hasPrefix:@"UIKB"] || [cn containsString:@"Keyboard"] || [cn containsString:@"UIInputWindow"];
 }
@@ -423,15 +445,24 @@ static BOOL IsKeyboardLayer(CALayer *l) {
     return NO;
 }
 
-static CGImageRef KbRecolor(CGImageRef src) {
-    if (!src || !gMaster || !gOn[AACIcon]) return NULL;
-    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
-    if (w < 8 || h < 8 || w > 400 || h > 400) return NULL;
-    static CFAbsoluteTime winStart; static int winCount;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-    if (++winCount > 240) return NULL;
+// Phim nen xanh (da doi accent) nam duoi bieu tuong -> khong to accent bieu tuong trang (tranh mat chu)
+static BOOL OnAccentKey(CALayer *l) {
+    CGSize s = l.bounds.size;
+    CALayer *p = l.superlayer;
+    for (int i = 0; i < 2 && p; i++, p = p.superlayer) {
+        CGPoint c = [l convertPoint:CGPointMake(s.width / 2, s.height / 2) toLayer:p];
+        int n = 0;
+        for (CALayer *o in p.sublayers) {
+            if (++n > 24) break;
+            if (o != l && objc_getAssociatedObject(o, kKbBlue) && CGRectContainsPoint(o.frame, c)) return YES;
+        }
+    }
+    return NO;
+}
 
+// Phan tich anh ban phim. mode: 1 = nut xanh -> accent, 2 = bieu tuong den -> accent,
+// 3 = bieu tuong trang (dia cau, phim chu o Dark Mode...) -> accent. Tra ve +1 hoac NULL.
+static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
     uint8_t *buf = calloc(w * h, 4);
     if (!buf) return NULL;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -447,8 +478,8 @@ static CGImageRef KbRecolor(CGImageRef src) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) { clear++; continue; }
         solid++;
-        CGFloat a = px[3];
-        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
         if (BlueClass(r, g, b) == 1) { blue++; continue; }
         CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
         if (mx - mn > 0.12) continue;
@@ -458,40 +489,186 @@ static CGImageRef KbRecolor(CGImageRef src) {
         else if (lum > 0.75) lt++;
     }
 
+    BOOL glyph = (size_t)clear * 100 >= 30 * total;
     int mode = 0;
     if (solid >= 30 && blue * 100 >= 35 * solid) mode = 1;
+    else if (solid >= 20 && gray * 100 >= 85 * solid && glyph && lt * 100 >= 55 * solid && blk * 100 <= 20 * solid) mode = 3;
     else if (solid >= 20 && gray * 100 >= 85 * solid && blk >= 6 &&
              (blk * 100 <= 45 * solid || (size_t)clear * 100 >= 40 * total) &&
              (lt * 100 >= 20 * solid || (size_t)clear * 100 >= 30 * total)) mode = 2;
+    *pmode = mode;
     if (!mode) { CGContextRelease(ctx); free(buf); return NULL; }
 
-    CGFloat ar = gDark ? gRGBD[0] : gRGBL[0];
-    CGFloat ag = gDark ? gRGBD[1] : gRGBL[1];
-    CGFloat ab = gDark ? gRGBD[2] : gRGBL[2];
+    const CGFloat *q = AccRGB();
     for (size_t i = 0; i < total; i++) {
         uint8_t *px = buf + i * 4;
         if (px[3] == 0) continue;
-        CGFloat a = px[3];
-        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat a = px[3], r, g, b, n[3];
+        Unpre(px, &r, &g, &b);
         if (mode == 1) {
             if (BlueClass(r, g, b) != 1) continue;
-            CGFloat al = a / 255.0;
-            px[0] = (uint8_t)lround(fmax(0, fmin(1, ar)) * al * 255);
-            px[1] = (uint8_t)lround(fmax(0, fmin(1, ag)) * al * 255);
-            px[2] = (uint8_t)lround(fmax(0, fmin(1, ab)) * al * 255);
+            n[0] = q[0]; n[1] = q[1]; n[2] = q[2];
         } else {
             CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
             if (mx - mn > 0.12) continue;
             CGFloat t = fmax(0, fmin(1, (r + g + b) / 3.0));
-            px[0] = (uint8_t)lround((ar * (1 - t) + t) * a);
-            px[1] = (uint8_t)lround((ag * (1 - t) + t) * a);
-            px[2] = (uint8_t)lround((ab * (1 - t) + t) * a);
+            for (int k = 0; k < 3; k++) n[k] = mode == 2 ? q[k] * (1 - t) + t : q[k] * t;
         }
+        for (int k = 0; k < 3; k++) px[k] = (uint8_t)lround(fmax(0, fmin(1, n[k])) * a);
     }
     CGImageRef out = CGBitmapContextCreateImage(ctx);
     CGContextRelease(ctx);
     free(buf);
     return out;
+}
+
+// Co cache theo (anh goc, phien ban accent, dark/light) -> doi ngon ngu khong phai tinh lai, khong nhap nhay
+static CGImageRef KbRecolor(CGImageRef src, CALayer *l) {
+    if (!src || !gMaster || !gOn[AACIcon]) return NULL;
+    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
+    if (w < 8 || h < 8 || w > 400 || h > 400) return NULL;
+    if (!gKbCache) { gKbCache = [NSCache new]; gKbCache.countLimit = 400; }
+    NSString *key = [NSString stringWithFormat:@"%p:%d", src, gVersion * 2 + (gDark ? 1 : 0)];
+    NSArray *e = [gKbCache objectForKey:key];
+    if (!e) {
+        if (!RATE_LIMIT(400)) return NULL;
+        int mode = 0;
+        CGImageRef o = KbRender(src, w, h, &mode);
+        e = @[(__bridge id)src, o ? (__bridge id)o : (id)NSNull.null, @(mode)];   // giu src de dia chi khong bi tai su dung
+        if (o) CGImageRelease(o);
+        [gKbCache setObject:e forKey:key];
+    }
+    int mode = [e[2] intValue];
+    if (!mode) return NULL;
+    if (mode == 3 && l && OnAccentKey(l)) return NULL;
+    if (mode == 1 && l) objc_setAssociatedObject(l, kKbBlue, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return CGImageRetain((__bridge CGImageRef)e[1]);
+}
+
+// Chu/so ban phim bi dam hon accent: anh da to accent ma contentsMultiplyColor cung la accent
+// -> dua multiply ve trang de ra dung 1 lan accent.
+static BOOL ContentsLooksAccent(CALayer *l) {
+    id c = l.contents;
+    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return NO;
+    enum { N = 16 };
+    uint8_t buf[N * N * 4];
+    memset(buf, 0, sizeof buf);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return NO;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), (__bridge CGImageRef)c);
+    CGContextRelease(ctx);
+    CGFloat sr = 0, sg = 0, sb = 0; int n = 0;
+    for (int i = 0; i < N * N; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 200) continue;
+        sr += px[0] / (CGFloat)px[3]; sg += px[1] / (CGFloat)px[3]; sb += px[2] / (CGFloat)px[3];
+        n++;
+    }
+    if (n < 3) return NO;
+    sr /= n; sg /= n; sb /= n;
+    for (int d = 0; d < 2; d++) {
+        const CGFloat *q = d ? gRGBD : gRGBL;
+        if (fabs(sr - q[0]) < 0.12 && fabs(sg - q[1]) < 0.12 && fabs(sb - q[2]) < 0.12) return YES;
+    }
+    return NO;
+}
+
+static void FixDoubleTint(CALayer *l) {
+    if (!l || !gCGWhite) return;
+    @try {
+        id m = [l valueForKey:@"contentsMultiplyColor"];
+        if (m && IsAccentCG((__bridge CGColorRef)m) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
+    } @catch (NSException *e) {}
+}
+
+static void SetKbContents(CALayer *l, CGImageRef k) {
+    gInContents = YES;
+    l.contents = (__bridge id)k;
+    gInContents = NO;
+    FixDoubleTint(l);
+}
+
+// Thu lai doi mau cho layer ban phim khi layer da gan vao cay (goi tu layoutSublayers -> truoc khi hien len man hinh)
+static void KbLate(CALayer *l) {
+    if (!l || !gMaster || !gOn[AACIcon] || !OnMain() || !l.superlayer) return;
+    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc) || objc_getAssociatedObject(l, kImgView)) return;
+    id c = l.contents;
+    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID() || [l isKindOfClass:CAShapeLayer.class]) return;
+    CGSize s = l.bounds.size;
+    if (s.width > 220 || s.height > 160) return;
+    NSNumber *n = objc_getAssociatedObject(l, kKbTries);
+    if (objc_getAssociatedObject(l, kKbTried) != c) {
+        objc_setAssociatedObject(l, kKbTried, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        n = nil;
+    }
+    if (n.intValue >= 4) return;
+    objc_setAssociatedObject(l, kKbTries, @(n.intValue + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!IsKeyboardLayer(l)) return;
+    CGImageRef k = KbRecolor((__bridge CGImageRef)c, l);
+    if (!k) return;
+    objc_setAssociatedObject(l, kKbSrc, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    SetKbContents(l, k);
+    CGImageRelease(k);
+}
+
+// Chu tren ban phim (label / CATextLayer): chu den -> accent; Dark Mode: chu trang 1 ky tu -> accent
+static NSString *TextOf(id s) {
+    if ([s isKindOfClass:NSAttributedString.class]) return [(NSAttributedString *)s string];
+    return [s isKindOfClass:NSString.class] ? s : nil;
+}
+
+static BOOL KbCol(UIColor *c, BOOL one) { return c && (IsInkColor(c) || (one && IsWhiteColor(c))); }
+
+static CGColorRef KbTextColor(CGColorRef c, id str) {
+    NSString *t = TextOf(str);
+    if (!c || t.length == 0 || t.length > 3) return NULL;
+    if (IsInkCG(c) || (gDark && t.length == 1 && IsWhiteCG(c))) return CGFor(AACIcon, NO);
+    return NULL;
+}
+
+static void KbTextFix(CALayer *l) {
+    if (!gOn[AACIcon] || ![l isKindOfClass:CATextLayer.class]) return;
+    CATextLayer *t = (CATextLayer *)l;
+    CGColorRef n = KbTextColor(t.foregroundColor, t.string);
+    if (n && IsKeyboardLayer(l)) t.foregroundColor = n;
+}
+
+static void KbLabelFix(UILabel *lb) {
+    if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
+    NSString *t = lb.text ?: lb.attributedText.string;
+    if (t.length == 0 || t.length > 3 || !ViewInKeyboard(lb)) return;
+    BOOL one = gDark && t.length == 1;
+    if (KbCol(lb.textColor, one)) lb.textColor = gColor[AACIcon];
+    NSAttributedString *as = lb.attributedText;
+    if (as.length) {
+        UIColor *c = [as attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
+        if (KbCol(c, one)) {
+            NSMutableAttributedString *m = [as mutableCopy];
+            [m addAttribute:NSForegroundColorAttributeName value:gColor[AACIcon] range:NSMakeRange(0, m.length)];
+            lb.attributedText = m;
+        }
+    }
+}
+
+static void KbImageFix(UIImageView *iv) {
+    if (gInKbFix || !gMaster || !gOn[AACIcon] || !OnMain()) return;
+    UIImage *im = iv.image;
+    if (!im || !im.CGImage || objc_getAssociatedObject(im, kKbImg)) return;
+    if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate || im.images.count > 1) return;
+    if (im.size.width > 96 || im.size.height > 96) return;
+    if (!ViewInKeyboard(iv)) return;
+    CGImageRef k = KbRecolor(im.CGImage, iv.layer);
+    if (!k) return;
+    UIImage *out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
+    CGImageRelease(k);
+    if (!out) return;
+    objc_setAssociatedObject(out, kKbImg, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gInKbFix = YES;
+    iv.image = out;
+    gInKbFix = NO;
 }
 
 // ---- Go bong do (shadow) tren nut/icon accent ----
@@ -533,7 +710,6 @@ static void KillShadowUp(CALayer *l, int levels) {
     }
 }
 
-// [MOI] Tim accent trong cay con (toi da 3 cap, gioi han so node)
 static BOOL SubtreeAccent(CALayer *l, int depth, int *budget) {
     if (!l || depth > 5 || *budget <= 0) return NO;
     for (CALayer *sub in l.sublayers) {
@@ -564,7 +740,6 @@ static BOOL ShadowEligible(CALayer *l) {
     if (HasAccentMark(l)) return YES;
     CGColorRef sc = l.shadowColor;
     if (sc && (IsAccentCG(sc) || IsOurs(sc))) return YES;
-    // [MOI] bong nam o layer cha/con cua nut accent (vd nut tron + icon ben trong)
     CALayer *p = l.superlayer;
     for (int i = 0; i < 6 && p; i++, p = p.superlayer) {
         CGSize ps = p.bounds.size;
@@ -572,101 +747,7 @@ static BOOL ShadowEligible(CALayer *l) {
         if (HasAccentMark(p)) return YES;
     }
     int budget = 60;
-    if (SubtreeAccent(l, 0, &budget)) return YES;
-    return NO;
-}
-
-static BOOL gInKbFix;
-
-static void KbLabelFix(UILabel *lb) {
-    if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
-    NSString *t = lb.text ?: lb.attributedText.string;
-    if (t.length > 3) return;
-    if (!ViewInKeyboard(lb)) return;
-    if (IsInkColor(lb.textColor)) lb.textColor = gColor[AACIcon];
-    NSAttributedString *as = lb.attributedText;
-    if (as.length) {
-        UIColor *c = [as attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
-        if (c && IsInkColor(c)) {
-            NSMutableAttributedString *m = [as mutableCopy];
-            [m addAttribute:NSForegroundColorAttributeName value:gColor[AACIcon] range:NSMakeRange(0, m.length)];
-            lb.attributedText = m;
-        }
-    }
-}
-
-static void KbImageFix(UIImageView *iv) {
-    if (gInKbFix || !gMaster || !gOn[AACIcon] || !OnMain()) return;
-    UIImage *im = iv.image;
-    if (!im || !im.CGImage || objc_getAssociatedObject(im, kKbImg)) return;
-    if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate || im.images.count > 1) return;
-    if (im.size.width > 96 || im.size.height > 96) return;
-    if (!ViewInKeyboard(iv)) return;
-    CGImageRef k = KbRecolor(im.CGImage);
-    if (!k) return;
-    UIImage *out = [UIImage imageWithCGImage:k scale:im.scale orientation:im.imageOrientation];
-    CGImageRelease(k);
-    if (!out) return;
-    objc_setAssociatedObject(out, kKbImg, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    gInKbFix = YES;
-    iv.image = out;
-    gInKbFix = NO;
-}
-
-// Chu/so ban phim bi dam hon accent: anh da duoc to accent, ma contentsMultiplyColor cung la accent
-// -> hai lop mau nhan voi nhau (accent x accent). Dua multiply ve trang de ra dung 1 lan accent.
-static BOOL ContentsLooksAccent(CALayer *l) {
-    id c = l.contents;
-    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return NO;
-    enum { N = 16 };
-    uint8_t buf[N * N * 4];
-    memset(buf, 0, sizeof buf);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
-        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) return NO;
-    CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), (__bridge CGImageRef)c);
-    CGContextRelease(ctx);
-    CGFloat sr = 0, sg = 0, sb = 0; int n = 0;
-    for (int i = 0; i < N * N; i++) {
-        const uint8_t *px = buf + i * 4;
-        if (px[3] < 200) continue;
-        sr += px[0] / (CGFloat)px[3]; sg += px[1] / (CGFloat)px[3]; sb += px[2] / (CGFloat)px[3];
-        n++;
-    }
-    if (n < 3) return NO;
-    sr /= n; sg /= n; sb /= n;
-    for (int d = 0; d < 2; d++) {
-        const CGFloat *q = d ? gRGBD : gRGBL;
-        if (fabs(sr - q[0]) < 0.12 && fabs(sg - q[1]) < 0.12 && fabs(sb - q[2]) < 0.12) return YES;
-    }
-    return NO;
-}
-
-static void FixDoubleTint(CALayer *l) {
-    if (!l || !gCGWhite) return;
-    @try {
-        id m = [l valueForKey:@"contentsMultiplyColor"];
-        if (m && IsAccentCG((__bridge CGColorRef)m) && ContentsLooksAccent(l)) [l setContentsMultiplyColor:gCGWhite];
-    } @catch (NSException *e) {}
-}
-
-// Thu lai doi mau cho layer ban phim khi layer da gan vao cua so
-static void KbLate(CALayer *l) {
-    if (!l || !gMaster || !gOn[AACIcon] || !OnMain()) return;
-    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) return;
-    id c = l.contents;
-    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
-    if (!IsKeyboardLayer(l)) return;
-    CGImageRef k = KbRecolor((__bridge CGImageRef)c);
-    if (!k) return;
-    objc_setAssociatedObject(l, kKbSrc, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    gInContents = YES;
-    l.contents = (__bridge id)k;
-    gInContents = NO;
-    FixDoubleTint(l);
-    CGImageRelease(k);
+    return SubtreeAccent(l, 0, &budget);
 }
 
 // Glow/vien: lop "den" nam canh lop icon trang cung kich thuoc -> an di thay vi nhuom accent
@@ -688,8 +769,7 @@ static BOOL HasTwinSibling(CALayer *l) {
 
 static void GlowCheck(CALayer *l) {
     if (!l || !gMaster || !OnMain() || l.hidden) return;
-    if (!objc_getAssociatedObject(l, kInkTint)) return;
-    if (IsKeyboardLayer(l)) return;   // chu/so ban phim cung kich thuoc canh nhau -> khong duoc an
+    if (!objc_getAssociatedObject(l, kInkTint) || IsKeyboardLayer(l)) return;
     if (HasTwinSibling(l)) l.hidden = YES;
 }
 
@@ -710,41 +790,30 @@ static void ReapplyContents(CALayer *l) {
     id src = objc_getAssociatedObject(l, kContentsSrc);
     if (src) {
         CGImageRef t = CopyTintedCG((__bridge CGImageRef)src, IconShapeColor(l));
-        if (t) {
-            gInContents = YES;
-            l.contents = (__bridge id)t;
-            gInContents = NO;
-            FixDoubleTint(l);
-            CGImageRelease(t);
-        }
+        if (t) { SetKbContents(l, t); CGImageRelease(t); }
         return;
     }
     id ks = objc_getAssociatedObject(l, kKbSrc);
     if (ks) {
-        CGImageRef t = KbRecolor((__bridge CGImageRef)ks);
-        if (t) {
-            gInContents = YES;
-            l.contents = (__bridge id)t;
-            gInContents = NO;
-            FixDoubleTint(l);
-            CGImageRelease(t);
-        }
+        CGImageRef t = KbRecolor((__bridge CGImageRef)ks, l);
+        if (t) { SetKbContents(l, t); CGImageRelease(t); }
     }
+}
+
+static void ApplyShapeColor(CALayer *l) {
+    NSNumber *m = objc_getAssociatedObject(l, kIconShape);
+    if (!m || ![l isKindOfClass:CAShapeLayer.class]) return;
+    CAShapeLayer *sh = (CAShapeLayer *)l;
+    CGColorRef c = IconShapeColor(l);
+    gInTry = YES;
+    if (m.intValue & 1) sh.fillColor   = c;
+    if (m.intValue & 2) sh.strokeColor = c;
+    gInTry = NO;
 }
 
 static void RefreshLayerTree(CALayer *l, int depth) {
     if (depth > 40) return;
-    if ([l isKindOfClass:CAShapeLayer.class] && gOn[AACIcon]) {
-        NSNumber *m = objc_getAssociatedObject(l, kIconShape);
-        if (m) {
-            CAShapeLayer *sh = (CAShapeLayer *)l;
-            CGColorRef c = IconShapeColor(l);
-            gInTry = YES;
-            if (m.intValue & 1) sh.fillColor   = c;
-            if (m.intValue & 2) sh.strokeColor = c;
-            gInTry = NO;
-        }
-    }
+    if (gOn[AACIcon]) ApplyShapeColor(l);
     ReapplyContents(l);
     for (CALayer *sub in [l.sublayers copy]) RefreshLayerTree(sub, depth + 1);
 }
@@ -782,17 +851,7 @@ static void ApplyAll(void) {
 static void FixUnderFill(CALayer *l, int depth) {
     if (!l || depth > 6) return;
     for (CALayer *s in [l.sublayers copy]) {
-        if ([s isKindOfClass:CAShapeLayer.class]) {
-            NSNumber *m = objc_getAssociatedObject(s, kIconShape);
-            if (m) {
-                CAShapeLayer *sh = (CAShapeLayer *)s;
-                CGColorRef c = IconShapeColor(s);
-                gInTry = YES;
-                if (m.intValue & 1) sh.fillColor   = c;
-                if (m.intValue & 2) sh.strokeColor = c;
-                gInTry = NO;
-            }
-        }
+        ApplyShapeColor(s);
         ReapplyContents(s);
         FixUnderFill(s, depth + 1);
     }
@@ -808,27 +867,23 @@ static void FixUnderFillView(UIView *v, int depth) {
 }
 
 static void MarkFill(CALayer *l, UIView *v) {
-    if (!OnMain()) return;
-    if (l.bounds.size.height > 120) return;
-    if (!objc_getAssociatedObject(l, kFill)) {
-        objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        gFillCount++;
-        KillShadowUp(l, 5);
-        KillShadowDown(l, 0);
-        if (gSafe) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                FixUnderFill(l, 0);
-            });
-            return;
-        }
-        if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
-        __weak UIView *wv = v;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            FixUnderFill(l, 0);
-            UIView *sv = wv;
-            if (sv) FixUnderFillView(sv, 0);
-        });
+    if (!OnMain() || l.bounds.size.height > 120) return;
+    if (objc_getAssociatedObject(l, kFill)) return;
+    objc_setAssociatedObject(l, kFill, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gFillCount++;
+    KillShadowUp(l, 5);
+    KillShadowDown(l, 0);
+    if (gSafe) {
+        dispatch_async(dispatch_get_main_queue(), ^{ FixUnderFill(l, 0); });
+        return;
     }
+    if (!v) v = ((AACWeak *)objc_getAssociatedObject(l, kOwner)).obj;
+    __weak UIView *wv = v;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FixUnderFill(l, 0);
+        UIView *sv = wv;
+        if (sv) FixUnderFillView(sv, 0);
+    });
 }
 
 static BOOL UnderFill(UIView *v) {
@@ -899,9 +954,7 @@ static BOOL LooksLikeAvatarView(UIView *v) {
     return l.cornerRadius >= fmin(s.width, s.height) * 0.25;
 }
 
-// ---- Nut tron den co mui ten (nut gui + nut "Hien thi cau tra loi") ----
-static const void *kArrowDone = &kArrowDone;
-
+// ---- Nut tron den co mui ten (nut gui, nut "Hien thi cau tra loi"); KHONG ap dung tren ban phim ----
 static void ArrowFixView(UIView *v, int depth) {
     if (!v || depth > 3) return;
     for (UIView *sv in [v.subviews copy]) {
@@ -943,7 +996,9 @@ static void TryBlack(CALayer *l) {
     CGSize sz = l.bounds.size;
     if (l.contents || objc_getAssociatedObject(l, kImgView)) return;
     BOOL round = sz.width > 0 && fabs(sz.width - sz.height) < 2 && l.cornerRadius >= sz.width * 0.45;
-    BOOL arrowBtn = round && sz.width >= 10 && sz.width <= 56 && l.sublayers.count > 0 && IsBlackCG(l.backgroundColor);
+    // Uu tien icon dia cau: bo xu ly nut "back/mui ten" tron tren ban phim
+    BOOL arrowBtn = round && sz.width >= 10 && sz.width <= 56 && l.sublayers.count > 0 &&
+                    IsBlackCG(l.backgroundColor) && !IsKeyboardLayer(l);
     if (round && sz.width >= 40 && !arrowBtn) return;
     BOOL nested = LayerUnderFill(l.superlayer);
     CGColorRef bg = l.backgroundColor;
@@ -961,16 +1016,12 @@ static void TryBlack(CALayer *l) {
 static void FixLabelBG(UILabel *lb) {
     if (!gMaster || !gOn[AACFill] || !OnMain()) return;
     UIColor *bg = lb.backgroundColor;
-    if (!bg || !IsFillCandidateColor(bg)) return;
-    if (lb.bounds.size.height > 64) return;
-    if (UnderFill(lb.superview) || LayerUnderFill(lb.layer.superlayer)) {
-        lb.backgroundColor = UIColor.clearColor;
-    }
+    if (!bg || !IsFillCandidateColor(bg) || lb.bounds.size.height > 64) return;
+    if (UnderFill(lb.superview) || LayerUnderFill(lb.layer.superlayer)) lb.backgroundColor = UIColor.clearColor;
 }
 
 static void TryBlackShape(CAShapeLayer *sh) {
-    if (!gOn[AACFill] || !OnMain()) return;
-    if (!IsBlackCG(sh.fillColor)) return;
+    if (!gOn[AACFill] || !OnMain() || !IsBlackCG(sh.fillColor)) return;
     CGPathRef path = sh.path;
     if (!path || CGPathIsEmpty(path)) return;
     CGRect b = CGPathGetBoundingBox(path);
@@ -979,7 +1030,7 @@ static void TryBlackShape(CAShapeLayer *sh) {
     sh.fillColor = CGFor(AACFill, NO);
 }
 
-// Icon trang co vien/bong den (vd icon like, comment tren video): bo vien thay vi doi sang accent
+// Icon trang co vien/bong den: bo vien thay vi doi sang accent
 static void StripWhiteShapeOutline(CAShapeLayer *sh) {
     if (gInTry || !gMaster || !OnMain()) return;
     CGColorRef st = sh.strokeColor;
@@ -1002,8 +1053,7 @@ static void StripWhiteShapeOutline(CAShapeLayer *sh) {
 }
 
 static void TryBlackIconShape(CAShapeLayer *sh) {
-    if (!gOn[AACIcon] || gInTry || !OnMain()) return;
-    if (InGlassLayer(sh)) return;
+    if (!gOn[AACIcon] || gInTry || !OnMain() || InGlassLayer(sh)) return;
     StripWhiteShapeOutline(sh);
     BOOL fill = IsInkCG(sh.fillColor), stroke = IsInkCG(sh.strokeColor);
     if (!fill && !stroke) return;
@@ -1025,10 +1075,9 @@ static void TryBlackIconShape(CAShapeLayer *sh) {
     MarkInk(sh);
 }
 
+// ---- Hang doi kiem tra lai layer ----
 static NSHashTable *gPend;
 static volatile int32_t gHasPend;
-static const void *kAttempts  = &kAttempts;
-static const void *kPendShape = &kPendShape;
 #define PEND_LOCK @"AACPend"
 
 static void RunCheck(CALayer *l, BOOL shape) {
@@ -1090,6 +1139,7 @@ static void ScheduleCheck(CALayer *l, BOOL shape) {
     });
 }
 
+// ---- Bien doi anh icon (chay tren moi ung dung) ----
 // Icon trang co vien/bong den "nuong" trong anh -> xoa phan toi, giu phan trang
 static UIImage *ShadowStripImage(UIImage *img) {
     if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
@@ -1100,41 +1150,21 @@ static UIImage *ShadowStripImage(UIImage *img) {
     if (sz.width < 14 || sz.height < 14 || sz.width > 64 || sz.height > 64) return img;
     NSNumber *state = objc_getAssociatedObject(img, kStripState);
     if (state) return state.boolValue ? (objc_getAssociatedObject(img, kStripOut) ?: img) : img;
-    static CFAbsoluteTime winStart; static int winCount;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-    if (++winCount > 50) return img;
+    if (!RATE_LIMIT(50)) return img;
 
-    CGFloat scale = img.scale > 0 ? img.scale : 1;
-    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-    fmt.scale = scale;
-    fmt.opaque = NO;
-    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
-        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
-            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
-        }];
-    CGImageRef cg = flat.CGImage;
-    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
-    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) {
+    size_t w = 0, h = 0; CGContextRef ctx = NULL;
+    uint8_t *buf = FlatBuf(img, &w, &h, &ctx);
+    if (!buf) {
         objc_setAssociatedObject(img, kStripState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return img;
     }
-    uint8_t *buf = calloc(w * h, 4);
-    if (!buf) return img;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
-        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) { free(buf); return img; }
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
-
     int solid = 0, light = 0, dark = 0, darkOpq = 0, colored = 0, clear = 0;
     for (size_t i = 0; i < w * h; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) { clear++; continue; }
         solid++;
-        CGFloat a = px[3];
-        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
         CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
         if (mx - mn > 0.15) { colored++; continue; }
         CGFloat lum = (r + g + b) / 3.0;
@@ -1143,7 +1173,7 @@ static UIImage *ShadowStripImage(UIImage *img) {
     }
     BOOL ok = solid >= 20 && colored * 10 <= solid && light * 100 >= 20 * solid &&
               dark * 100 >= 5 * solid && darkOpq <= light &&
-              (size_t)clear * 100 >= 25 * w * h;   // icon that su co nhieu vung trong suot; anh mask/gradient dac thi bo qua
+              (size_t)clear * 100 >= 25 * w * h;
     if (!ok) {
         CGContextRelease(ctx);
         free(buf);
@@ -1153,18 +1183,14 @@ static UIImage *ShadowStripImage(UIImage *img) {
     for (size_t i = 0; i < w * h; i++) {
         uint8_t *px = buf + i * 4;
         if (px[3] == 0) continue;
-        CGFloat a = px[3];
-        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
         CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
         if (mx - mn > 0.15) continue;
-        if ((r + g + b) / 3.0 < 0.4) { px[0] = px[1] = px[2] = px[3] = 0; }
+        if ((r + g + b) / 3.0 < 0.4) px[0] = px[1] = px[2] = px[3] = 0;
     }
-    CGImageRef outCG = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    free(buf);
-    if (!outCG) return img;
-    UIImage *out = [UIImage imageWithCGImage:outCG scale:scale orientation:UIImageOrientationUp];
-    CGImageRelease(outCG);
+    UIImage *out = FlatFinish(ctx, buf, img.scale > 0 ? img.scale : 1);
+    if (!out) return img;
     objc_setAssociatedObject(out, kStripSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kStripState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kStripOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1181,7 +1207,7 @@ static UIImage *IconRemapImage(UIImage *img) {
 }
 
 static UIImage *BlueImageRemap(UIImage *img) {
-    if (!img || gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (objc_getAssociatedObject(img, kBlueSrc) || objc_getAssociatedObject(img, kAccentSrc)) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate) return img;
     CGSize sz = img.size;
@@ -1193,79 +1219,45 @@ static UIImage *BlueImageRemap(UIImage *img) {
     if (state) {
         UIImage *cached = objc_getAssociatedObject(img, kBlueOut);
         if (cached && [objc_getAssociatedObject(img, kBlueStamp) intValue] == want) return cached;
-    } else {
-        static CFAbsoluteTime winStart; static int winCount;
-        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-        if (++winCount > 60) return img;
+    } else if (!RATE_LIMIT(60)) {
+        return img;
     }
 
-    CGFloat scale = img.scale > 0 ? img.scale : 1;
-    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-    fmt.scale = scale;
-    fmt.opaque = NO;
-    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
-        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
-            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
-        }];
-    CGImageRef cg = flat.CGImage;
-    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
-    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) {
+    size_t w = 0, h = 0; CGContextRef ctx = NULL;
+    uint8_t *buf = FlatBuf(img, &w, &h, &ctx);
+    if (!buf) {
         objc_setAssociatedObject(img, kBlueState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return img;
     }
-
-    uint8_t *buf = calloc(w * h, 4);
-    if (!buf) return img;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
-        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) {
-        free(buf);
-        return img;
-    }
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
-
     int solid = 0, blue = 0, other = 0;
     for (size_t i = 0; i < w * h; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) continue;
         solid++;
-        CGFloat a = px[3];
-        if (BlueClass(fmin(1, px[0] / a), fmin(1, px[1] / a), fmin(1, px[2] / a))) blue++;
-        else other++;
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
+        if (BlueClass(r, g, b)) blue++; else other++;
     }
-    BOOL ok = solid >= 6 && blue > 0 && other * 40 <= solid;
-    if (!ok) {
+    if (!(solid >= 6 && blue > 0 && other * 40 <= solid)) {
         CGContextRelease(ctx);
         free(buf);
         objc_setAssociatedObject(img, kBlueState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return img;
     }
-
-    CGFloat ar = gDark ? gRGBD[0] : gRGBL[0];
-    CGFloat ag = gDark ? gRGBD[1] : gRGBL[1];
-    CGFloat ab = gDark ? gRGBD[2] : gRGBL[2];
+    const CGFloat *q = AccRGB();
     for (size_t i = 0; i < w * h; i++) {
         uint8_t *px = buf + i * 4;
         if (px[3] < 24) continue;
-        CGFloat a = px[3];
-        int cls = BlueClass(fmin(1, px[0] / a), fmin(1, px[1] / a), fmin(1, px[2] / a));
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
+        int cls = BlueClass(r, g, b);
         if (!cls) continue;
-        CGFloat al = (a / 255.0) * (cls == 2 ? 0.2 : 1.0);
-        px[0] = (uint8_t)lround(fmax(0, fmin(1, ar)) * al * 255);
-        px[1] = (uint8_t)lround(fmax(0, fmin(1, ag)) * al * 255);
-        px[2] = (uint8_t)lround(fmax(0, fmin(1, ab)) * al * 255);
+        CGFloat al = (px[3] / 255.0) * (cls == 2 ? 0.2 : 1.0);
+        for (int k = 0; k < 3; k++) px[k] = (uint8_t)lround(fmax(0, fmin(1, q[k])) * al * 255);
         px[3] = (uint8_t)lround(al * 255);
     }
-    CGImageRef outCG = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    free(buf);
-    if (!outCG) return img;
-    UIImage *out = [UIImage imageWithCGImage:outCG scale:scale orientation:UIImageOrientationUp];
-    CGImageRelease(outCG);
-
+    UIImage *out = FlatFinish(ctx, buf, img.scale > 0 ? img.scale : 1);
+    if (!out) return img;
     objc_setAssociatedObject(out, kBlueSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kBlueState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kBlueOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1273,15 +1265,9 @@ static UIImage *BlueImageRemap(UIImage *img) {
     return out;
 }
 
-
-// ---- Icon den (kem chi tiet trang, vd icon Messenger tren Facebook) -> doi den thanh accent, giu trang ----
-static const void *kDualSrc   = &kDualSrc;
-static const void *kDualState = &kDualState;
-static const void *kDualOut   = &kDualOut;
-static const void *kDualStamp = &kDualStamp;
-
+// Icon den kem chi tiet trang (vd icon Messenger) -> doi den thanh accent, giu trang
 static UIImage *DualImageRemap(UIImage *img) {
-    if (!img || !gSafe || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
+    if (!img || !gMaster || !gOn[AACIcon] || !OnMain()) return img;
     if (objc_getAssociatedObject(img, kDualSrc) || objc_getAssociatedObject(img, kBlueSrc) || objc_getAssociatedObject(img, kAccentSrc)) return img;
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
     CGSize sz = img.size;
@@ -1293,43 +1279,23 @@ static UIImage *DualImageRemap(UIImage *img) {
     if (state) {
         UIImage *cached = objc_getAssociatedObject(img, kDualOut);
         if (cached && [objc_getAssociatedObject(img, kDualStamp) intValue] == want) return cached;
-    } else {
-        static CFAbsoluteTime winStart; static int winCount;
-        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (now - winStart > 1.0) { winStart = now; winCount = 0; }
-        if (++winCount > 40) return img;
+    } else if (!RATE_LIMIT(40)) {
+        return img;
     }
 
-    CGFloat scale = img.scale > 0 ? img.scale : 1;
-    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-    fmt.scale = scale;
-    fmt.opaque = NO;
-    UIImage *flat = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt]
-        imageWithActions:^(UIGraphicsImageRendererContext *rc) {
-            [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
-        }];
-    CGImageRef cg = flat.CGImage;
-    size_t w = cg ? CGImageGetWidth(cg) : 0, h = cg ? CGImageGetHeight(cg) : 0;
-    if (!cg || w == 0 || h == 0 || w > 256 || h > 256) {
+    size_t w = 0, h = 0; CGContextRef ctx = NULL;
+    uint8_t *buf = FlatBuf(img, &w, &h, &ctx);
+    if (!buf) {
         objc_setAssociatedObject(img, kDualState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return img;
     }
-    uint8_t *buf = calloc(w * h, 4);
-    if (!buf) return img;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
-        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) { free(buf); return img; }
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
-
     int solid = 0, blk = 0, mid = 0, other = 0, opq = 0, opqBlk = 0;
     for (size_t i = 0; i < w * h; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) continue;
         solid++;
-        CGFloat a = px[3];
-        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
         CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
         if (mx - mn > 0.12) { other++; continue; }
         CGFloat lum = (r + g + b) / 3.0;
@@ -1345,35 +1311,28 @@ static UIImage *DualImageRemap(UIImage *img) {
         objc_setAssociatedObject(img, kDualState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return img;
     }
-
-    CGFloat ar = gDark ? gRGBD[0] : gRGBL[0];
-    CGFloat ag = gDark ? gRGBD[1] : gRGBL[1];
-    CGFloat ab = gDark ? gRGBD[2] : gRGBL[2];
+    const CGFloat *q = AccRGB();
     for (size_t i = 0; i < w * h; i++) {
         uint8_t *px = buf + i * 4;
         if (px[3] == 0) continue;
-        CGFloat a = px[3];
-        CGFloat r = fmin(1, px[0] / a), g = fmin(1, px[1] / a), b = fmin(1, px[2] / a);
+        CGFloat a = px[3], r, g, b;
+        Unpre(px, &r, &g, &b);
         CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
         if (mx - mn > 0.12) continue;
         CGFloat t = fmax(0, fmin(1, (r + g + b) / 3.0));
-        CGFloat nr = ar * (1 - t) + t, ng = ag * (1 - t) + t, nb = ab * (1 - t) + t;
-        px[0] = (uint8_t)lround(nr * a);
-        px[1] = (uint8_t)lround(ng * a);
-        px[2] = (uint8_t)lround(nb * a);
+        for (int k = 0; k < 3; k++) px[k] = (uint8_t)lround((q[k] * (1 - t) + t) * a);
     }
-    CGImageRef outCG = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    free(buf);
-    if (!outCG) return img;
-    UIImage *out = [UIImage imageWithCGImage:outCG scale:scale orientation:UIImageOrientationUp];
-    CGImageRelease(outCG);
-
+    UIImage *out = FlatFinish(ctx, buf, img.scale > 0 ? img.scale : 1);
+    if (!out) return img;
     objc_setAssociatedObject(out, kDualSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kDualState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kDualOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(img, kDualStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return out;
+}
+
+static UIImage *IconFix(UIImage *img) {
+    return DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img))));
 }
 
 static UIColor *IconTintFix(UIColor *c) {
@@ -1385,6 +1344,7 @@ static UIColor *IconTintFix(UIColor *c) {
     return c;
 }
 
+// ---- Tab bar ----
 static BOOL InTabBar(UIView *v) {
     for (int i = 0; i < 10 && v; i++, v = v.superview)
         if ([v isKindOfClass:UITabBar.class]) return YES;
@@ -1436,33 +1396,24 @@ static void TabBarFixLater(UITabBar *bar) {
 
 static void TabLabelFix(UILabel *lb) {
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
-    if (lb.textColor == gColor[AACIcon]) return;
-    if (!InTabBar(lb)) return;
+    if (lb.textColor == gColor[AACIcon] || !InTabBar(lb)) return;
     lb.textColor = gColor[AACIcon];
 }
 
-static UIWindow *gPanelWin;
-static BOOL      gPanelShown;
-static BOOL      gPanelPending;
+// ---- Bang cai dat ----
+static BOOL gPanelShown;
+static BOOL gPanelPending;
 
 static void ClosePanelWindow(void) {
     gPanelShown = NO;
     gPanelPending = NO;
-    UIWindow *w = gPanelWin;
-    gPanelWin = nil;
-    if (w) {
-        w.hidden = YES;
-        w.rootViewController = nil;
-    }
 }
 
 static BOOL VCBusy(UIViewController *vc) {
-    if (!vc) return YES;
-    if (!vc.viewIfLoaded.window) return YES;
+    if (!vc || !vc.viewIfLoaded.window) return YES;
     if (vc.isBeingPresented || vc.isBeingDismissed || vc.isMovingToParentViewController || vc.isMovingFromParentViewController) return YES;
     if (vc.transitionCoordinator != nil) return YES;
-    if ([vc isKindOfClass:UIAlertController.class]) return YES;
-    return NO;
+    return [vc isKindOfClass:UIAlertController.class];
 }
 
 static UIViewController *TopVC(void) {
@@ -1471,7 +1422,7 @@ static UIViewController *TopVC(void) {
         if (![sc isKindOfClass:UIWindowScene.class]) continue;
         if (sc.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
-            if (w == gPanelWin || w.hidden || w.windowLevel != UIWindowLevelNormal || !w.rootViewController) continue;
+            if (w.hidden || w.windowLevel != UIWindowLevelNormal || !w.rootViewController) continue;
             if (w.isKeyWindow) { best = w; break; }
             if (!best) best = w;
         }
@@ -1494,18 +1445,6 @@ static UIViewController *TopVC(void) {
     }
     return vc;
 }
-
-#if AAC_PANEL_OWN_WINDOW
-static UIWindowScene *ActiveScene(void) {
-    UIWindowScene *fallback = nil;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:UIWindowScene.class]) continue;
-        if (sc.activationState == UISceneActivationStateForegroundActive) return (UIWindowScene *)sc;
-        if (!fallback && sc.activationState == UISceneActivationStateForegroundInactive) fallback = (UIWindowScene *)sc;
-    }
-    return fallback;
-}
-#endif
 
 static NSString *PeekCrash(void);
 static void ClearCrash(void);
@@ -1685,33 +1624,6 @@ static NSString *DumpAll(void) {
 + (instancetype)shared;
 @end
 
-#if AAC_PANEL_OWN_WINDOW
-static void ShowPanelOwnWindow(UIWindowScene *scene) {
-    gPanelPending = NO;
-    if (gPanelWin || !scene) return;
-    @try {
-        UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-        w.windowLevel = UIWindowLevelAlert + 1;
-        w.backgroundColor = UIColor.clearColor;
-        UIViewController *host = [UIViewController new];
-        host.view.backgroundColor = UIColor.clearColor;
-        w.rootViewController = host;
-        gPanelWin = w;
-        gPanelShown = YES;
-        if (gSafe) w.hidden = NO; else [w makeKeyAndVisible];
-        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AACSettingsVC new]];
-        nav.modalPresentationStyle = UIModalPresentationPageSheet;
-        nav.presentationController.delegate = [AACHelper shared];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (gPanelWin != w) return;
-            @try { [host presentViewController:nav animated:YES completion:nil]; }
-            @catch (NSException *e) { ClosePanelWindow(); }
-        });
-    } @catch (NSException *e) {
-        ClosePanelWindow();
-    }
-}
-#else
 static void ShowPanel(int attempt) {
     if (gPanelShown) { gPanelPending = NO; return; }
     Crumb("ShowPanel:begin");
@@ -1739,7 +1651,6 @@ static void ShowPanel(int attempt) {
         ClosePanelWindow();
     }
 }
-#endif
 
 @implementation AACHelper
 + (instancetype)shared {
@@ -1764,23 +1675,12 @@ static void ShowPanel(int attempt) {
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    if (gPanelShown || gPanelWin || gPanelPending) return;
+    if (gPanelShown || gPanelPending) return;
     Crumb("onLongPress");
     gPanelPending = YES;
-#if AAC_PANEL_OWN_WINDOW
-    UIWindowScene *scene = nil;
-    UIView *gv = g.view;
-    if ([gv isKindOfClass:UIWindow.class]) scene = ((UIWindow *)gv).windowScene;
-    if (!scene) scene = ActiveScene();
-    if (!scene) { gPanelPending = NO; return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ShowPanelOwnWindow(scene);
-    });
-#else
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ShowPanel(0);
     });
-#endif
 }
 @end
 
@@ -1820,6 +1720,7 @@ static void Setup(UIWindow *w) {
     }
 }
 
+// ================= HOOKS =================
 %hook UIWindow
 - (void)makeKeyAndVisible { %orig; Setup(self); }
 - (void)becomeKeyWindow { %orig; Setup(self); }
@@ -1828,7 +1729,14 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
-    gDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    BOOL d = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    if (d == gDark) return;
+    gDark = d;
+    // Doi Light/Dark: ve lai ban phim & icon ngay voi mau tuong ung
+    static BOOL pending;
+    if (pending) return;
+    pending = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{ pending = NO; ApplyAll(); });
 }
 %end
 
@@ -1903,7 +1811,7 @@ static void Setup(UIWindow *w) {
     %orig(n ?: c);
     if (inkSwap) MarkInk(self);
 }
-// [MOI] Go bong do tren nut/icon da doi sang accent
+// Go bong do tren nut/icon da doi sang accent
 - (void)setShadowOpacity:(float)v {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
@@ -1928,6 +1836,17 @@ static void Setup(UIWindow *w) {
     %orig;
     if (self.shadowOpacity > 0 && ShadowEligible(self)) self.shadowOpacity = 0;
 }
+// Mot hook layout duy nhat: hang doi kiem tra, go bong, doi mau ban phim (chay truoc khi len man hinh -> khong nhap nhay)
+- (void)layoutSublayers {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (!gMaster || !OnMain()) return;
+    if (gHasPend) PendingRun(self);
+    if (self.shadowOpacity > 0 && ShadowEligible(self)) self.shadowOpacity = 0;
+    if (self.contents) KbLate(self);
+    KbTextFix(self);
+}
 %end
 
 %hook CATextLayer
@@ -1935,7 +1854,7 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     CGColorRef n = (gMaster && c) ? LayerRemap(c, AACIcon, NULL) : NULL;
-    if (!n && gMaster && gOn[AACIcon] && c && OnMain() && IsInkCG(c) && IsKeyboardLayer(self)) n = CGFor(AACIcon, NO);
+    if (!n && gMaster && gOn[AACIcon] && c && OnMain() && IsKeyboardLayer(self)) n = KbTextColor(c, self.string);
     %orig(n ?: c);
 }
 %end
@@ -1987,6 +1906,19 @@ static void Setup(UIWindow *w) {
     AAC_DEPTH_SCOPE;
     UIColor *n = gMaster ? ColorRemap(c, AACText, NULL) : nil;
     %orig(n ?: c);
+    if (self.window) KbLabelFix(self);     // nhan phim (vd. nhan phim Space) doi mau ngay, khong cho layout
+}
+- (void)setText:(NSString *)t {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window) KbLabelFix(self);
+}
+- (void)setAttributedText:(NSAttributedString *)t {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.window) KbLabelFix(self);
 }
 - (void)didMoveToWindow {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
@@ -2000,6 +1932,7 @@ static void Setup(UIWindow *w) {
     %orig;
     FixLabelBG(self);
     TabLabelFix(self);
+    KbLabelFix(self);
 }
 %end
 
@@ -2022,7 +1955,7 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img)))), st);
+    %orig(IconFix(img), st);
 }
 %end
 
@@ -2030,7 +1963,7 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    %orig(DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img)))));
+    %orig(IconFix(img));
 }
 %end
 
@@ -2047,13 +1980,12 @@ static void Setup(UIWindow *w) {
     if (OnMain() && !objc_getAssociatedObject(self.layer, kImgView))
         objc_setAssociatedObject(self.layer, kImgView, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
-    UIImage *n = DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img))));
+    UIImage *n = IconFix(img);
     if (n && gMaster && gOn[AACIcon] && OnMain()) {
         CGSize s = n.size;
         if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
     }
     %orig(n);
-    // [MOI] icon da doi sang accent -> bo bong do
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
     if (self.window) KbImageFix(self);
     if (n && objc_getAssociatedObject(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
@@ -2193,28 +2125,27 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     if (gInContents) { %orig; return; }
-    if (objc_getAssociatedObject(self, kContentsSrc))
-        objc_setAssociatedObject(self, kContentsSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (objc_getAssociatedObject(self, kKbSrc))
-        objc_setAssociatedObject(self, kKbSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(self, kContentsSrc)) objc_setAssociatedObject(self, kContentsSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(self, kKbSrc))       objc_setAssociatedObject(self, kKbSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(self, kKbBlue))      objc_setAssociatedObject(self, kKbBlue, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (!contents || !gMaster || !gOn[AACIcon] || !OnMain() ||
         CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) { %orig; return; }
 
     CGImageRef cg = (__bridge CGImageRef)contents;
     size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
     CGSize s = self.bounds.size;
-    BOOL skip = objc_getAssociatedObject(self, kImgView) || [self isKindOfClass:CAShapeLayer.class] ||
+    BOOL notShape = ![self isKindOfClass:CAShapeLayer.class];
+    BOOL skip = objc_getAssociatedObject(self, kImgView) || !notShape ||
                 (self.masksToBounds && self.cornerRadius > 0) ||
                 w < 8 || h < 8 || w > 192 || h > 192 ||
                 s.width > 48 || s.height > 48 ||
                 (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
     BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
     if (!monoOK) {
-        // [MOI] Phim ban phim: nut xanh -> accent, bieu tuong den (Enter) -> accent
-        if (w >= 8 && h >= 8 && w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160 &&
-            !objc_getAssociatedObject(self, kImgView) && ![self isKindOfClass:CAShapeLayer.class] &&
-            IsKeyboardLayer(self)) {
-            CGImageRef k = KbRecolor(cg);
+        // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
+        BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160;
+        if (kbSize && !objc_getAssociatedObject(self, kImgView) && IsKeyboardLayer(self)) {
+            CGImageRef k = KbRecolor(cg, self);
             if (k) {
                 objc_setAssociatedObject(self, kKbSrc, contents, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 %orig((__bridge id)k);
@@ -2224,10 +2155,9 @@ static void Setup(UIWindow *w) {
             }
         }
         %orig;
-        if (w <= 400 && h <= 400 && s.width <= 220 && s.height <= 160 && ![self isKindOfClass:CAShapeLayer.class]) {
+        if (kbSize) {
             __weak CALayer *wl = self;
             dispatch_async(dispatch_get_main_queue(), ^{ KbLate(wl); });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ KbLate(wl); });
         }
         return;
     }
@@ -2243,29 +2173,7 @@ static void Setup(UIWindow *w) {
 %end
 %end
 
-%group AACPending
-%hook CALayer
-- (void)layoutSublayers {
-    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
-    AAC_DEPTH_SCOPE;
-    %orig;
-    if (gHasPend && OnMain()) PendingRun(self);
-}
-%end
-%end
-
-// [MOI] Quet go bong do khi layout (ke ca app thuoc nhom Facebook/gSafe va nut do plugin khac them vao)
-%group AACShadow
-%hook CALayer
-- (void)layoutSublayers {
-    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
-    AAC_DEPTH_SCOPE;
-    %orig;
-    if (gMaster && self.shadowOpacity > 0 && OnMain() && ShadowEligible(self)) self.shadowOpacity = 0;
-}
-%end
-%end
-
+// ---- Khoi tao ----
 static BOOL IsFacebookFamily(void) {
     NSBundle *b = NSBundle.mainBundle;
     NSString *bid = [b.bundleIdentifier lowercaseString] ?: @"";
@@ -2274,7 +2182,6 @@ static BOOL IsFacebookFamily(void) {
            [exe isEqualToString:@"facebook"] || [exe isEqualToString:@"messenger"];
 }
 
-static NSString *const kCrashKey = @"AccentColorAll_LastCrash";
 static NSUncaughtExceptionHandler *gPrevEH;
 
 static void AACExceptionHandler(NSException *e) {
@@ -2329,8 +2236,6 @@ static void ClearCrash(void) {
         gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
-        if (!gSafe) { %init(AACPending); }
-        %init(AACShadow);
-        if (AAC_CONTENTS_HOOK) { %init(AACContents); }
+        %init(AACContents);
     }
 }
