@@ -24,7 +24,7 @@ KEY(kStripSrc) KEY(kStripState) KEY(kStripOut)
 KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
 KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
 
-// Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
+//  Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
 #define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
     CFAbsoluteTime _n = CFAbsoluteTimeGetCurrent(); \
     if (_n - _ws > 1.0) { _ws = _n; _wc = 0; } \
