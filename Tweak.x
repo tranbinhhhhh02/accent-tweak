@@ -26,6 +26,7 @@ KEY(kStripSrc);    KEY(kStripState);  KEY(kStripOut);
 KEY(kOrigMul);     KEY(kSweepPtr);    KEY(kSweepImg);
 KEY(kRemSrc);      KEY(kRemState);    KEY(kRemOut);     KEY(kRemStamp);   // anh xanh (app thuong) / anh den (Facebook)
 KEY(kHidMark);     // layer bi tweak an (glow) -> neu hoa ra nam trong ban phim thi hien lai
+KEY(kGlbSrc);      KEY(kGlbPtr);      KEY(kGlbVer);   // [MOI] qua dia cau / icon dock
 
 @interface AACWeak : NSObject
 @property (nonatomic, weak) id obj;
@@ -1609,6 +1610,186 @@ static void StartSweep(void) {
     dispatch_resume(t);
 }
 
+// =====================================================================================
+// [MOI] Qua dia cau + icon vung dock (mic, menu chon ban phim...) -> doi sang accent
+// Module doc lap, chi them moi: khong sua logic cu. Chay bang timer rieng, chi o cua so ban phim (che do sang).
+// - Vung dock = (ten class thuoc KbForceName) hoac (nam trong ~76pt day cua so ban phim)
+// - Chi dong vao icon nho 12..36pt, mau xam/trang/den (khong mau), khong dac (<=70% pixel) -> khong dung vao nen nut glass
+// - Khong dong vao icon nam duoi nut accent (kinh lup tren nut Search van giu trang)
+// - Go compositingFilter (vibrancy/glass) cua icon va cac layer cha nho de mau accent hien dung
+// =====================================================================================
+static BOOL GlbZone(CALayer *l, UIWindow *w) {
+    if (!l || !w) return NO;
+    if (KbForceLayer(l)) return YES;
+    CGRect r = [w.layer convertRect:l.bounds fromLayer:l];
+    if (CGRectIsNull(r) || CGRectIsInfinite(r) || isnan(r.origin.x) || isnan(r.origin.y)) return NO;
+    CGFloat H = CGRectGetHeight(w.bounds);
+    CGFloat my = CGRectGetMidY(r);
+    return my > H - 76.0 && my < H + 8.0;
+}
+
+// Anh dang icon: gan nhu chi xam/trang/den, co nhieu vung trong suot, khong phai hinh dac
+static BOOL GlbIconLike(CGImageRef cg) {
+    if (!cg) return NO;
+    uint8_t buf[SN * SN * 4];
+    if (!SampleCG(cg, buf)) return NO;
+    int solid = 0, gray = 0, clear = 0;
+    for (int i = 0; i < SN * SN; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) { clear++; continue; }
+        solid++;
+        CGFloat r, g, b;
+        Unpm(px, &r, &g, &b);
+        if (fmax(r, fmax(g, b)) - fmin(r, fmin(g, b)) <= 0.12) gray++;
+    }
+    int total = SN * SN;
+    return solid >= 6 && gray * 100 >= 90 * solid && solid * 100 <= 70 * total && clear * 100 >= 30 * total;
+}
+
+static void GlbUnfilter(CALayer *l) {
+    if (!l) return;
+    int n = 0;
+    for (CALayer *c = l; c && n < 4; c = c.superlayer, n++) {
+        NSString *cn = NSStringFromClass(c.class);
+        if ([cn containsString:@"Backdrop"] || [cn containsString:@"Window"]) break;
+        CGSize s = c.bounds.size;
+        if (s.width > 120 || s.height > 120) break;
+        if (c.compositingFilter) c.compositingFilter = nil;
+    }
+    if (l.filters.count) l.filters = nil;
+}
+
+static void GlbView(UIImageView *iv, UIWindow *w) {
+    CGSize s = iv.bounds.size;
+    if (iv.hidden || s.width < 12 || s.width > 36 || s.height < 12 || s.height > 36) return;
+    UIImage *im = iv.image;
+    if (!im || im.images.count > 1) return;
+    if (!GlbZone(iv.layer, w) || UnderAccentKey(iv.layer)) return;
+    NSNumber *ver = GET(im, kGlbVer);
+    if (GET(im, kKbImg) && !ver) { GlbUnfilter(iv.layer); return; }   // da duoc logic san co to accent -> chi go bo loc
+    UIImage *base = im;
+    if (ver) {
+        if (ver.intValue == gVersion) { GlbUnfilter(iv.layer); return; }
+        base = GET(im, kGlbSrc) ?: im;
+    }
+    UIImage *out = nil;
+    if (base.isSymbolImage || base.renderingMode == UIImageRenderingModeAlwaysTemplate) {
+        out = [base imageWithTintColor:[UIColor colorWithCGColor:CGFor(NO)] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    } else if (base.CGImage && GlbIconLike(base.CGImage)) {
+        CGImageRef k = CopyTintedCG(base.CGImage, CGFor(NO));
+        if (k) {
+            out = [UIImage imageWithCGImage:k scale:base.scale orientation:base.imageOrientation];
+            CGImageRelease(k);
+        }
+    }
+    if (!out) return;
+    SET(out, kKbImg, @YES);
+    SET(out, kGlbVer, @(gVersion));
+    SET(out, kGlbSrc, base);
+    gInKbFix = YES;
+    iv.image = out;
+    gInKbFix = NO;
+    GlbUnfilter(iv.layer);
+}
+
+static void GlbLayer(CALayer *l, UIWindow *w) {
+    CGSize s = l.bounds.size;
+    if (l.hidden || s.width < 12 || s.width > 36 || s.height < 12 || s.height > 36) return;
+    id c = l.contents;
+    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
+    if (GET(l, kImgView) || [l.delegate isKindOfClass:UIImageView.class]) return;   // layer cua UIImageView: GlbView xu ly
+    if (!GlbZone(l, w) || UnderAccentKey(l)) return;
+    uintptr_t cp = (uintptr_t)(__bridge void *)c;
+    NSNumber *op = GET(l, kGlbPtr);
+    NSNumber *ov = GET(l, kGlbVer);
+    id src = c;
+    if (op && (uintptr_t)op.unsignedLongValue == cp) {
+        if (ov.intValue == gVersion) { GlbUnfilter(l); return; }
+        src = GET(l, kGlbSrc) ?: c;
+    } else if (GET(l, kKbSrc) || GET(l, kContentsSrc)) {
+        GlbUnfilter(l);   // da duoc logic san co to accent -> chi go bo loc
+        return;
+    }
+    if (CFGetTypeID((__bridge CFTypeRef)src) != CGImageGetTypeID()) return;
+    CGImageRef sc = (__bridge CGImageRef)src;
+    if (!GlbIconLike(sc)) return;
+    CGImageRef k = CopyTintedCG(sc, CGFor(NO));
+    if (!k) return;
+    SET(l, kGlbSrc, src);
+    PutContents(l, k);
+    CGImageRelease(k);
+    id nc = l.contents;
+    if (nc) SET(l, kGlbPtr, @((unsigned long)(uintptr_t)(__bridge void *)nc));
+    SET(l, kGlbVer, @(gVersion));
+    if (gCGWhite) {
+        @try { [l setContentsMultiplyColor:gCGWhite]; } @catch (NSException *e) {}
+    }
+    GlbUnfilter(l);
+}
+
+static void GlbShape(CAShapeLayer *sh, UIWindow *w) {
+    if (gInTry || sh.hidden) return;
+    CGRect b;
+    if (!PathBounds(sh, &b)) return;
+    CGFloat mx = fmax(b.size.width, b.size.height);
+    if (mx < 8 || mx > 36) return;
+    if (!GlbZone(sh, w) || UnderAccentKey(sh)) return;
+    BOOL fill = IsWhiteCG(sh.fillColor), stroke = IsWhiteCG(sh.strokeColor);
+    if (!fill && !stroke) {
+        if (GET(sh, kIconShape)) GlbUnfilter(sh);
+        return;
+    }
+    int bits = 0;
+    CGColorRef c = CGFor(NO);
+    gInTry = YES;
+    if (fill)   { sh.fillColor   = c; bits |= 1; }
+    if (stroke) { sh.strokeColor = c; bits |= 2; }
+    gInTry = NO;
+    SET(sh, kIconShape, @(bits | [GET(sh, kIconShape) intValue]));
+    GlbUnfilter(sh);
+}
+
+static void GlbSweepLayer(CALayer *l, UIWindow *w, int depth) {
+    if (!l || depth > 30) return;
+    if ([l isKindOfClass:CAShapeLayer.class]) GlbShape((CAShapeLayer *)l, w);
+    else GlbLayer(l, w);
+    for (CALayer *sub in [l.sublayers copy]) GlbSweepLayer(sub, w, depth + 1);
+}
+
+static void GlbSweepView(UIView *v, UIWindow *w, int depth) {
+    if (!v || depth > 30) return;
+    if ([v isKindOfClass:UIImageView.class]) GlbView((UIImageView *)v, w);
+    for (UIView *sv in [v.subviews copy]) GlbSweepView(sv, w, depth + 1);
+}
+
+static void GlobeSweepAll(void) {
+    Crumb("GlobeSweepAll");
+    if (!gMaster || gSafe || !OnMain() || !gCGWhite) return;
+    BOOL oldDark = gDark;
+    @try {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:UIWindowScene.class]) continue;
+            for (UIWindow *w in [((UIWindowScene *)sc).windows copy]) {
+                if (w.hidden || w.alpha < 0.01 || !InputWindow(w)) continue;
+                if (w.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) continue;
+                gDark = NO;
+                GlbSweepView(w, w, 0);
+                GlbSweepLayer(w.layer, w, 0);
+            }
+        }
+    } @catch (NSException *e) {}
+    gDark = oldDark;
+}
+
+static void StartGlobeSweep(void) {
+    static dispatch_source_t t;
+    if (t) return;
+    t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), (uint64_t)(0.25 * NSEC_PER_SEC), (uint64_t)(0.05 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(t, ^{ GlobeSweepAll(); });
+    dispatch_resume(t);
+}
+
 // ---------------- Bang cai dat ----------------
 static BOOL gPanelShown, gPanelPending;
 
@@ -2321,5 +2502,6 @@ static BOOL IsFacebookFamily(void) {
         RefreshCache();
         %init;
         StartSweep();
+        StartGlobeSweep();   // [MOI]
     }
 }
