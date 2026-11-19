@@ -24,7 +24,7 @@ KEY(kStripSrc) KEY(kStripState) KEY(kStripOut)
 KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
 KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
 KEY(kTintWhite)
-KEY(kSymView)
+KEY(kMonoWhite) KEY(kWhiteSrc) KEY(kWhiteStamp)
 
 // Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
 #define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
@@ -60,7 +60,7 @@ static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
 static BOOL        gInKbFix;
-static BOOL        gInSym;
+static BOOL        gInWhite;
 static volatile int32_t gPending;
 static BOOL        gSafe;
 
@@ -273,8 +273,6 @@ static BOOL FillValid(CALayer *a) {
     if (!a || !IsAccentCG(a.backgroundColor)) return NO;
     CGSize sz = a.bounds.size;
     if (sz.width < 1 || sz.height < 1) return NO;
-    // Nen accent that su sau icon (nut, chip...) luon nho; nen rong nhu ca hang/cell khong tinh -> icon van theo accent
-    if (sz.width > 220 || sz.height > 120) return NO;
     CALayer *p = a;
     for (int i = 0; i < 6 && p; i++, p = p.superlayer) {
         if (p.hidden || p.opacity < 0.5f) return NO;
@@ -416,7 +414,17 @@ static int CGImageIsBlackMono(CGImageRef cg) {
     return res;
 }
 
-// Icon trang (glyph don sac, nen trong suot) - vd. SF Symbol ve truc tiep vao layer (SwiftUI)
+static BOOL ImageIsBlackMono(UIImage *img) {
+    NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
+    if (cached) return cached.boolValue;
+    if (!img.CGImage || img.images.count > 1) return NO;
+    int r = CGImageIsBlackMono(img.CGImage);
+    if (r < 0) return NO;
+    objc_setAssociatedObject(img, kMonoBlack, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return r == 1;
+}
+
+// Anh trang don sac (icon trang tren nen trong suot): moi diem dac deu gan trang
 static int CGImageIsWhiteMono(CGImageRef cg) {
     if (!cg) return 0;
     if (!RATE_LIMIT(120)) return -1;
@@ -444,13 +452,13 @@ static int CGImageIsWhiteMono(CGImageRef cg) {
     return res;
 }
 
-static BOOL ImageIsBlackMono(UIImage *img) {
-    NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
+static BOOL ImageIsWhiteMono(UIImage *img) {
+    NSNumber *cached = objc_getAssociatedObject(img, kMonoWhite);
     if (cached) return cached.boolValue;
     if (!img.CGImage || img.images.count > 1) return NO;
-    int r = CGImageIsBlackMono(img.CGImage);
+    int r = CGImageIsWhiteMono(img.CGImage);
     if (r < 0) return NO;
-    objc_setAssociatedObject(img, kMonoBlack, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kMonoWhite, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return r == 1;
 }
 
@@ -1530,6 +1538,7 @@ static UIImage *DualImageRemap(UIImage *img) {
 }
 
 static UIImage *IconFix(UIImage *img) {
+    if (img && objc_getAssociatedObject(img, kWhiteSrc)) return img;
     return DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img))));
 }
 
@@ -1542,37 +1551,11 @@ static UIColor *IconTintFix(UIColor *c) {
     return c;
 }
 
-// ---- SF Symbols: icon he thong (da bi to mau co dinh: trang, den, xam...) -> chuyen sang template
-// de theo mau accent (tintColor). Khi nam tren nen accent thi tintColor getter tu tra ve trang. ----
-static UIImage *SymbolTemplate(UIImage *im) {
-    if (!im || !gMaster || !gOn[AACIcon] || !OnMain()) return im;
-    if (!im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate) return im;
-    if (objc_getAssociatedObject(im, kAccentSrc) || objc_getAssociatedObject(im, kKbImg)) return im;
-    UIImage *t = [im imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    return t ?: im;
-}
-
 // ---- Tab bar ----
 static BOOL InTabBar(UIView *v) {
     for (int i = 0; i < 10 && v; i++, v = v.superview)
         if ([v isKindOfClass:UITabBar.class]) return YES;
     return NO;
-}
-
-// Ap dung cho UIImageView chua SF Symbol (tru ban phim, tab bar - da co xu ly rieng, avatar)
-static void SymbolFix(UIImageView *iv) {
-    if (gInSym || !iv || !gMaster || !gOn[AACIcon] || !OnMain()) return;
-    UIImage *im = iv.image;
-    if (!im || !im.isSymbolImage) return;
-    if (LooksLikeAvatarView(iv) || InTabBar(iv) || ViewInKeyboard(iv)) return;
-    if (!objc_getAssociatedObject(iv.layer, kSymView))
-        objc_setAssociatedObject(iv.layer, kSymView, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    UIImage *t = SymbolTemplate(im);
-    if (t && t != im) {
-        gInSym = YES;
-        iv.image = t;
-        gInSym = NO;
-    }
 }
 
 static UIImage *TabColorize(UIImage *im) {
@@ -1622,6 +1605,94 @@ static void TabLabelFix(UILabel *lb) {
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
     if (lb.textColor == gColor[AACIcon] || !InTabBar(lb)) return;
     lb.textColor = gColor[AACIcon];
+}
+
+// ---- Icon trang (anh bitmap trang don sac) -> accent ----
+// Giu nguyen mau trang khi icon nam tren nen accent (nut gui, nut tron...), tren ban phim, avatar, switch/slider/kinh mo.
+static BOOL SaturatedBGAbove(UIView *v) {
+    UIView *p = v.superview;
+    for (int i = 0; i < 4 && p; i++, p = p.superview) {
+        UIColor *bg = p.backgroundColor;
+        if (bg) {
+            UIColor *rc = [bg resolvedColorWithTraitCollection:p.traitCollection];
+            CGFloat r = 0, g = 0, b = 0, a = 0;
+            if ([rc getRed:&r green:&g blue:&b alpha:&a] && a >= 0.9) {
+                CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+                if (mx - mn > 0.2) return YES;
+            }
+        }
+        CGColorRef lc = p.layer.backgroundColor;
+        CGFloat r, g, b, a;
+        if (lc && CGRGBA(lc, &r, &g, &b, &a) && a >= 0.9) {
+            CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+            if (mx - mn > 0.2) return YES;
+        }
+    }
+    return NO;
+}
+
+static UIImage *WhiteTinted(UIImage *im) {
+    if (!im || !gMaster || !gOn[AACIcon] || !OnMain() || !gCGWhite) return im;
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    UIImage *src = objc_getAssociatedObject(im, kWhiteSrc);
+    NSNumber *stamp = objc_getAssociatedObject(im, kWhiteStamp);
+    if (src && stamp.intValue == want) return im;
+    UIImage *base = src ?: im;
+    if (base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || base.images.count > 1) return im;
+    CGSize sz = base.size;
+    if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return im;
+    if (!ImageIsWhiteMono(base)) return im;
+    UIColor *c = [UIColor colorWithCGColor:CGFor(AACIcon, NO)];
+    UIImage *out = [base imageWithTintColor:c renderingMode:UIImageRenderingModeAlwaysOriginal];
+    if (!out) return im;
+    objc_setAssociatedObject(out, kWhiteSrc, base, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(out, kWhiteStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
+static void WhiteIconView(UIImageView *iv) {
+    if (!iv || gInWhite || gInKbFix || gInTabFix || !gMaster || !gOn[AACIcon] || !OnMain()) return;
+    UIImage *im = iv.image;
+    if (!im) return;
+    UIImage *src = objc_getAssociatedObject(im, kWhiteSrc);
+    if (!src) {
+        // Chi xet anh nho (icon); bo qua anh khac de tiet kiem
+        CGSize sz = im.size;
+        if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return;
+    }
+    BOOL skip = ViewInKeyboard(iv) || LooksLikeAvatarView(iv) || InControlView(iv) ||
+                (gFillCount > 0 && TintOnFill(iv)) || SaturatedBGAbove(iv);
+    UIImage *target = nil;
+    if (src) target = skip ? src : WhiteTinted(im);
+    else if (!skip) target = WhiteTinted(im);
+    if (!target || target == im) return;
+    gInWhite = YES;
+    iv.image = target;
+    gInWhite = NO;
+}
+
+// ---- Icon template (SF Symbol / anh template) bi tint TRANG sai ----
+// UIKit to icon template bang contentsMultiplyColor. Neu gia tri nay dang la trang trong khi view
+// KHONG nam tren nen accent that su -> dat lai thanh accent (giong icon goc dung mau xanh cua app).
+static void TemplateTintFix(CALayer *l) {
+    if (!l || !gMaster || !gOn[AACIcon] || !gCGWhite || !OnMain()) return;
+    id d = l.delegate;
+    if (![d isKindOfClass:UIImageView.class]) return;
+    UIImageView *iv = (UIImageView *)d;
+    if (iv.layer != l) return;
+    CGSize s = l.bounds.size;
+    if (s.width < 4 || s.height < 4 || s.width > 64 || s.height > 64) return;
+    UIImage *im = iv.image;
+    if (!im || !(im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate)) return;
+    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) return;
+    if (ViewInKeyboard(iv) || InControlView(iv) || LooksLikeAvatarView(iv)) return;
+    id m = nil;
+    @try { m = [l valueForKey:@"contentsMultiplyColor"]; } @catch (NSException *e) { return; }
+    if (!m || CFGetTypeID((__bridge CFTypeRef)m) != CGColorGetTypeID()) return;
+    if (!IsWhiteCG((__bridge CGColorRef)m)) return;
+    // Nam tren nen accent (nut tron, huy hieu...) hoac nen mau khac -> giu trang
+    if (LayerInsideFill(l) || (gFillCount > 0 && TintOnFill(iv)) || SaturatedBGAbove(iv)) return;
+    [l setContentsMultiplyColor:CGFor(AACIcon, NO)];
 }
 
 // ---- Bang cai dat ----
@@ -2029,11 +2100,6 @@ static void Setup(UIWindow *w) {
             CGSize s = self.bounds.size;
             if (s.width <= 64 && s.height <= 64) { n = IconShapeColor(self); inkSwap = YES; }
         }
-        // SF Symbol bi to trang/co dinh -> accent (tru khi nam tren nen accent, ban phim, switch/slider)
-        if (!n && gOn[AACIcon] && OnMain() && IsWhiteCG(c) && objc_getAssociatedObject(self, kSymView) &&
-            !LayerInsideFill(self) && !NearControl(self) && !IsKeyboardLayer(self)) {
-            n = CGFor(AACIcon, NO);
-        }
         // Anh cua layer nay da duoc to accent san -> multiply luon la trang (khong to 2 lan, moi phim cung 1 mau)
         if (gCGWhite && !IsWhiteCG(c) &&
             (objc_getAssociatedObject(self, kKbSrc) || objc_getAssociatedObject(self, kContentsSrc))) {
@@ -2079,6 +2145,7 @@ static void Setup(UIWindow *w) {
     if (objc_getAssociatedObject(self, kContentsSrc)) RecheckContents(self);
     if (self.contents) KbLate(self);
     KbTextFix(self);
+    if (self.contents) TemplateTintFix(self);
 }
 %end
 
@@ -2188,10 +2255,7 @@ static void Setup(UIWindow *w) {
 - (void)setImage:(UIImage *)img forState:(UIControlState)st {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    UIImage *n = IconFix(img);
-    if (n && gMaster && gOn[AACIcon] && OnMain() && n.isSymbolImage && !ViewInKeyboard(self) && !InTabBar(self))
-        n = SymbolTemplate(n);
-    %orig(n, st);
+    %orig(IconFix(img), st);
 }
 %end
 
@@ -2208,8 +2272,13 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
-    if (self.window) KbImageFix(self);
-    SymbolFix(self);
+    if (self.window) { KbImageFix(self); WhiteIconView(self); }
+}
+- (void)tintColorDidChange {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    if (self.image && !gInWhite) WhiteIconView(self);
 }
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
@@ -2225,8 +2294,8 @@ static void Setup(UIWindow *w) {
     %orig(n);
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
     if (self.window) KbImageFix(self);
-    SymbolFix(self);
     if (n && objc_getAssociatedObject(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
+    if (!gInWhite && n) WhiteIconView(self);
 }
 %end
 
@@ -2378,12 +2447,7 @@ static void Setup(UIWindow *w) {
                 w < 8 || h < 8 || w > 192 || h > 192 ||
                 s.width > 48 || s.height > 48 ||
                 (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
-    BOOL monoOK = NO;
-    if (!skip && !InBackdropLayer(self)) {
-        monoOK = (CGImageIsBlackMono(cg) == 1);
-        // Icon trang (SF Symbol ve truc tiep): to accent; tren nen accent IconShapeColor tu giu trang
-        if (!monoOK && !IsKeyboardLayer(self) && !NearControl(self)) monoOK = (CGImageIsWhiteMono(cg) == 1);
-    }
+    BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
     if (!monoOK) {
         // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
         BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 1600 && h <= 500 && s.width <= 800 && s.height <= 240;
