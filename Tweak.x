@@ -414,6 +414,34 @@ static int CGImageIsBlackMono(CGImageRef cg) {
     return res;
 }
 
+// Icon trang (glyph don sac, nen trong suot) - vd. SF Symbol ve truc tiep vao layer (SwiftUI)
+static int CGImageIsWhiteMono(CGImageRef cg) {
+    if (!cg) return 0;
+    if (!RATE_LIMIT(120)) return -1;
+    int res = 0;
+    enum { N = 24 };
+    uint8_t buf[N * N * 4];
+    memset(buf, 0, sizeof buf);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), cg);
+        CGContextRelease(ctx);
+        int solid = 0, clear = 0, bad = 0;
+        for (int i = 0; i < N * N; i++) {
+            const uint8_t *px = buf + i * 4;
+            if (px[3] < 40) { clear++; continue; }
+            solid++;
+            int mnc = MIN(px[0], MIN(px[1], px[2]));
+            if (mnc * 100 < 85 * px[3]) { bad++; break; }
+        }
+        res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62) ? 1 : 0;
+    }
+    return res;
+}
+
 static BOOL ImageIsBlackMono(UIImage *img) {
     NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
     if (cached) return cached.boolValue;
@@ -2348,7 +2376,12 @@ static void Setup(UIWindow *w) {
                 w < 8 || h < 8 || w > 192 || h > 192 ||
                 s.width > 48 || s.height > 48 ||
                 (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
-    BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
+    BOOL monoOK = NO;
+    if (!skip && !InBackdropLayer(self)) {
+        monoOK = (CGImageIsBlackMono(cg) == 1);
+        // Icon trang (SF Symbol ve truc tiep): to accent; tren nen accent IconShapeColor tu giu trang
+        if (!monoOK && !IsKeyboardLayer(self) && !NearControl(self)) monoOK = (CGImageIsWhiteMono(cg) == 1);
+    }
     if (!monoOK) {
         // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
         BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 1600 && h <= 500 && s.width <= 800 && s.height <= 240;
