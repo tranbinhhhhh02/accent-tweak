@@ -23,6 +23,7 @@ KEY(kContentsSrc) KEY(kCtl) KEY(kImgView) KEY(kOwner) KEY(kNoShadow)
 KEY(kStripSrc) KEY(kStripState) KEY(kStripOut)
 KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
 KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
+KEY(kTintWhite)
 
 // Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
 #define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
@@ -263,14 +264,39 @@ static BOOL IsAccentCG(CGColorRef c) {
     return NO;
 }
 
+// Lop "nen accent" hop le: mau nen hien tai that su la accent (khong tin vao co danh dau cu,
+// vi lop co the bi tai su dung / doi mau sau khi da danh dau -> icon bi tra thanh trang).
+// Them: nen phai THAT SU HIEN THI (khong an, khong trong suot, khong rong) -> neu khong icon se bi to trang tren nen sang/trang
+static BOOL FillValid(CALayer *a) {
+    if (!a || !IsAccentCG(a.backgroundColor)) return NO;
+    CGSize sz = a.bounds.size;
+    if (sz.width < 1 || sz.height < 1) return NO;
+    CALayer *p = a;
+    for (int i = 0; i < 6 && p; i++, p = p.superlayer) {
+        if (p.hidden || p.opacity < 0.5f) return NO;
+    }
+    return YES;
+}
+
 static BOOL LayerUnderFill(CALayer *l) {
     for (int i = 0; i < 4 && l; i++, l = l.superlayer)
-        if (objc_getAssociatedObject(l, kFill) || IsAccentCG(l.backgroundColor)) return YES;
+        if (FillValid(l)) return YES;
+    return NO;
+}
+
+// Icon nam BEN TRONG mot nen accent (chu khong chi cung cay lop) -> moi ve trang
+static BOOL LayerInsideFill(CALayer *l) {
+    CALayer *p = l.superlayer;
+    for (int i = 0; i < 4 && p; i++, p = p.superlayer) {
+        if (!FillValid(p)) continue;
+        CGRect r = [l convertRect:l.bounds toLayer:p];
+        if (CGRectContainsRect(CGRectInset(p.bounds, -6, -6), r)) return YES;
+    }
     return NO;
 }
 
 static CGColorRef IconShapeColor(CALayer *l) {
-    if (gCGWhite && LayerUnderFill(l.superlayer)) return gCGWhite;
+    if (gCGWhite && LayerInsideFill(l)) return gCGWhite;
     return CGFor(AACIcon, NO);
 }
 
@@ -460,9 +486,54 @@ static BOOL OnAccentKey(CALayer *l) {
     return NO;
 }
 
+// ---- Nhan dien chu tren phim Space (ten ban phim, vd. "Tieng Viet Telex") ----
+// Dua vao VI TRI: nam giua man hinh theo chieu ngang, o phan duoi cua man hinh (hang phim cuoi)
+// -> khong phu thuoc cau truc view cua ban phim.
+static BOOL KbBadName(NSString *cn) {
+    return [cn containsString:@"Candidate"] || [cn containsString:@"Prediction"] ||
+           [cn containsString:@"Suggestion"] || [cn containsString:@"Autocorrect"] ||
+           [cn containsString:@"QuickType"];
+}
+
+static BOOL SpaceGeom(CGPoint c, CGFloat lw) {
+    CGSize ss = UIScreen.mainScreen.bounds.size;
+    if (ss.width <= 0 || lw < 24 || lw > ss.width * 0.8) return NO;
+    return fabs(c.x - ss.width / 2) <= ss.width * 0.22 && c.y >= ss.height * 0.6;
+}
+
+static BOOL SpaceKeyLabel(UIView *lb) {
+    UIWindow *w = lb.window;
+    if (!w) return NO;
+    UIView *p = lb;
+    for (int i = 0; i < 8 && p; i++, p = p.superview)
+        if (KbBadName(NSStringFromClass(p.class))) return NO;
+    CGSize b = lb.bounds.size;
+    CGPoint c = [lb convertPoint:CGPointMake(b.width / 2, b.height / 2) toView:nil];
+    c = [w convertPoint:c toCoordinateSpace:UIScreen.mainScreen.coordinateSpace];
+    return SpaceGeom(c, b.width);
+}
+
+static BOOL SpaceKeyLayer(CALayer *l) {
+    CGSize b = l.bounds.size;
+    CGPoint pt = CGPointMake(b.width / 2, b.height / 2);
+    CALayer *p = l;
+    for (int i = 0; i < 30 && p; i++) {
+        if (KbBadName(NSStringFromClass(p.class))) return NO;
+        id d = p.delegate;
+        if (d && KbBadName(NSStringFromClass([d class]))) return NO;
+        CALayer *sup = p.superlayer;
+        if (!sup) break;
+        pt = [p convertPoint:pt toLayer:sup];
+        p = sup;
+    }
+    return SpaceGeom(pt, b.width);
+}
+
 // Phan tich anh ban phim. mode: 1 = nut xanh -> accent, 2 = bieu tuong den -> accent,
-// 3 = bieu tuong trang (dia cau, phim chu o Dark Mode...) -> accent. Tra ve +1 hoac NULL.
-static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
+// 3 = bieu tuong trang (dia cau, phim chu o Dark Mode...) -> accent,
+// 4 = (chi phim Space) chu trang tren nen toi/xam o Dark Mode -> chi doi phan chu sang accent, giu nguyen nen.
+// Tra ve anh moi hoac NULL.
+static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, BOOL spaceOK, int *pmode) {
     uint8_t *buf = calloc(w * h, 4);
     if (!buf) return NULL;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -473,7 +544,7 @@ static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), src);
 
     size_t total = w * h;
-    int solid = 0, blue = 0, gray = 0, blk = 0, lt = 0, clear = 0;
+    int solid = 0, blue = 0, gray = 0, blk = 0, lt = 0, clear = 0, lo = 0, hi = 0;
     for (size_t i = 0; i < total; i++) {
         const uint8_t *px = buf + i * 4;
         if (px[3] < 24) { clear++; continue; }
@@ -487,6 +558,8 @@ static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
         CGFloat lum = (r + g + b) / 3.0;
         if (lum < 0.3) blk++;
         else if (lum > 0.75) lt++;
+        if (lum < 0.6) lo++;
+        if (lum > 0.8) hi++;
     }
 
     BOOL glyph = (size_t)clear * 100 >= 30 * total;
@@ -496,6 +569,8 @@ static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
     else if (solid >= 20 && gray * 100 >= 85 * solid && blk >= 6 &&
              (blk * 100 <= 45 * solid || (size_t)clear * 100 >= 40 * total) &&
              (lt * 100 >= 20 * solid || (size_t)clear * 100 >= 30 * total)) mode = 2;
+    else if (spaceOK && solid >= 200 && gray * 100 >= 85 * solid && hi >= 8 && hi * 100 <= 30 * solid &&
+             lo * 100 >= 60 * solid) mode = 4;
     *pmode = mode;
     if (!mode) { CGContextRelease(ctx); free(buf); return NULL; }
 
@@ -508,6 +583,14 @@ static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
         if (mode == 1) {
             if (BlueClass(r, g, b) != 1) continue;
             n[0] = q[0]; n[1] = q[1]; n[2] = q[2];
+        } else if (mode == 4) {
+            CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+            if (mx - mn > 0.12) continue;
+            CGFloat lum = (r + g + b) / 3.0;
+            if (lum < 0.55) continue;
+            CGFloat t = fmin(1, (lum - 0.55) / 0.3);
+            CGFloat o[3] = { r, g, b };
+            for (int k = 0; k < 3; k++) n[k] = o[k] * (1 - t) + q[k] * t;
         } else {
             CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
             if (mx - mn > 0.12) continue;
@@ -522,35 +605,36 @@ static CGImageRef KbRender(CGImageRef src, size_t w, size_t h, int *pmode) {
     return out;
 }
 
-// Co cache theo (anh goc, phien ban accent, dark/light) -> doi ngon ngu khong phai tinh lai, khong nhap nhay
-// Anh rong (> 400px, vd. chu tren phim space) chi nhan dien che do 2 (chu den) -> tranh dung nham nen phim
+// Co cache theo (anh goc, phien ban accent, dark/light, co phai phim space) -> doi ngon ngu khong phai tinh lai, khong nhap nhay
+// Anh rong (> 400px, vd. chu tren phim space): chi nhan dien che do 2 (chu den); rieng phim Space (theo vi tri) con nhan 3 va 4 (chu trang)
 static CGImageRef KbRecolor(CGImageRef src, CALayer *l) {
     if (!src || !gMaster || !gOn[AACIcon]) return NULL;
     size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
-    if (w < 8 || h < 8 || w > 900 || h > 400) return NULL;
+    if (w < 8 || h < 8 || w > 1600 || h > 500) return NULL;
     BOOL big = w > 400;
+    BOOL spaceOK = big && l && SpaceKeyLayer(l);
     if (!gKbCache) { gKbCache = [NSCache new]; gKbCache.countLimit = 400; }
-    NSString *key = [NSString stringWithFormat:@"%p:%d", src, gVersion * 2 + (gDark ? 1 : 0)];
+    NSString *key = [NSString stringWithFormat:@"%p:%d:%d", src, gVersion * 2 + (gDark ? 1 : 0), spaceOK ? 1 : 0];
     NSArray *e = [gKbCache objectForKey:key];
     if (!e) {
-        if (!RATE_LIMIT(400)) return NULL;
+        if (big) { if (!RATE_LIMIT(30)) return NULL; }
+        else     { if (!RATE_LIMIT(400)) return NULL; }
         int mode = 0;
-        CGImageRef o = KbRender(src, w, h, &mode);
+        CGImageRef o = KbRender(src, w, h, spaceOK, &mode);
         e = @[(__bridge id)src, o ? (__bridge id)o : (id)NSNull.null, @(mode)];   // giu src de dia chi khong bi tai su dung
         if (o) CGImageRelease(o);
         [gKbCache setObject:e forKey:key];
     }
     int mode = [e[2] intValue];
     if (!mode) return NULL;
-    if (big && mode != 2) return NULL;
+    if (big && !(mode == 2 || (spaceOK && (mode == 3 || mode == 4)))) return NULL;
     if (mode == 3 && l && OnAccentKey(l)) return NULL;
     if (mode == 1 && l) objc_setAssociatedObject(l, kKbBlue, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return CGImageRetain((__bridge CGImageRef)e[1]);
 }
 
-// Chu/so ban phim bi dam hon accent (to 2 lan): anh da duoc to accent ma contentsMultiplyColor
-// van khac trang -> dua multiply ve trang de ra dung 1 lan accent (dong deu mau tren moi phim).
-// Chi goi cho layer da duoc tweak to accent (co kKbSrc / kContentsSrc).
+// Chu/so ban phim bi dam hon accent (to 2 lan) hoac bi den (nhan voi mau den): anh da duoc to accent
+// nen contentsMultiplyColor phai la trang. Chi goi cho layer da duoc tweak to accent (kKbSrc / kContentsSrc).
 static void FixDoubleTint(CALayer *l) {
     if (!l || !gCGWhite) return;
     @try {
@@ -576,7 +660,7 @@ static void KbLate(CALayer *l) {
     id c = l.contents;
     if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID() || [l isKindOfClass:CAShapeLayer.class]) return;
     CGSize s = l.bounds.size;
-    if (s.width > 400 || s.height > 160) return;
+    if (s.width > 800 || s.height > 240) return;
     NSNumber *n = objc_getAssociatedObject(l, kKbTries);
     if (objc_getAssociatedObject(l, kKbTried) != c) {
         objc_setAssociatedObject(l, kKbTried, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -598,45 +682,53 @@ static NSString *TextOf(id s) {
     return [s isKindOfClass:NSString.class] ? s : nil;
 }
 
-// ---- Nhan dien chu tren phim Space (ten ban phim, vd. "Tieng Viet Telex") ----
-static BOOL KbBadName(NSString *cn) {
-    return [cn containsString:@"Candidate"] || [cn containsString:@"Prediction"] ||
-           [cn containsString:@"Suggestion"] || [cn containsString:@"Autocorrect"] ||
-           [cn containsString:@"QuickType"];
-}
-
-// Label nam trong 1 "phim" rong (>= 30% be rong man hinh, cao <= 90pt) -> la phim Space
-static BOOL SpaceKeyLabel(UIView *lb) {
-    UIWindow *w = lb.window;
-    if (!w) return NO;
-    CGFloat ww = w.bounds.size.width, lw = lb.bounds.size.width;
-    if (ww <= 0 || lw < 40) return NO;
-    UIView *p = lb.superview;
-    for (int i = 0; i < 4 && p; i++, p = p.superview) {
-        if (KbBadName(NSStringFromClass(p.class))) return NO;
-        CGSize ps = p.bounds.size;
-        if (ps.height > 90) return NO;
-        if (ps.width >= ww * 0.3 && ps.width >= lw) return YES;
-    }
-    return NO;
-}
-
-static BOOL SpaceKeyLayer(CALayer *l) {
-    CGFloat ww = UIScreen.mainScreen.bounds.size.width, lw = l.bounds.size.width;
-    if (ww <= 0 || lw < 40) return NO;
-    CALayer *p = l.superlayer;
-    for (int i = 0; i < 4 && p; i++, p = p.superlayer) {
-        if (KbBadName(NSStringFromClass(p.class))) return NO;
-        id d = p.delegate;
-        if (d && KbBadName(NSStringFromClass([d class]))) return NO;
-        CGSize ps = p.bounds.size;
-        if (ps.height > 90) return NO;
-        if (ps.width >= ww * 0.3 && ps.width >= lw) return YES;
-    }
-    return NO;
-}
-
 static BOOL KbCol(UIColor *c, BOOL one) { return c && (IsInkColor(c) || (one && IsWhiteColor(c))); }
+
+// Mau chu tren phim Space: xam/den (hoac trang o Dark Mode), CHO PHEP trong suot mot phan (alpha >= 0.3)
+static BOOL KbGrayLum(CGFloat r, CGFloat g, CGFloat b, CGFloat a, BOOL allowLight) {
+    if (a < 0.3) return NO;
+    CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+    if (mx - mn > 0.12) return NO;
+    CGFloat lum = (r + g + b) / 3.0;
+    return lum < 0.4 || (allowLight && lum > 0.7);
+}
+
+static BOOL KbColSpace(UIColor *c, UITraitCollection *tc, BOOL allowLight) {
+    if (!c) return NO;
+    UIColor *rc = tc ? [c resolvedColorWithTraitCollection:tc] : c;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![rc getRed:&r green:&g blue:&b alpha:&a]) return NO;
+    return KbGrayLum(r, g, b, a, allowLight);
+}
+
+static BOOL KbCGSpaceCol(CGColorRef c, BOOL allowLight) {
+    if (!c || IsOurs(c)) return NO;
+    CGFloat r, g, b, a;
+    if (!CGRGBA(c, &r, &g, &b, &a)) return NO;
+    return KbGrayLum(r, g, b, a, allowLight);
+}
+
+static BOOL KbColAny(UIColor *c, BOOL space, BOOL one, UITraitCollection *tc) {
+    if (!c || c == gColor[AACIcon]) return NO;
+    if (space) return KbColSpace(c, tc, one);
+    return KbCol(c, one);
+}
+
+// Doi mau chu trong NSAttributedString (toan bo cac doan) -> tra ve ban sao da sua hoac nil neu khong can doi
+static NSMutableAttributedString *KbAttrFix(NSAttributedString *as, BOOL space, BOOL one, UITraitCollection *tc) {
+    if (!as || as.length == 0 || !gColor[AACIcon]) return nil;
+    __block NSMutableAttributedString *m = nil;
+    [as enumerateAttribute:NSForegroundColorAttributeName
+                   inRange:NSMakeRange(0, as.length)
+                   options:0
+                usingBlock:^(id v, NSRange r, BOOL *stop) {
+        if ([v isKindOfClass:UIColor.class] && KbColAny((UIColor *)v, space, one, tc)) {
+            if (!m) m = [as mutableCopy];
+            [m addAttribute:NSForegroundColorAttributeName value:gColor[AACIcon] range:r];
+        }
+    }];
+    return m;
+}
 
 static CGColorRef KbTextColor(CGColorRef c, id str, CALayer *l) {
     NSString *t = TextOf(str);
@@ -644,18 +736,37 @@ static CGColorRef KbTextColor(CGColorRef c, id str, CALayer *l) {
     BOOL space = NO;
     if (t.length > 3) {
         // Chu dai: chi doi khi la chu tren phim Space
-        if (!l || !(IsInkCG(c) || (gDark && IsWhiteCG(c))) || !SpaceKeyLayer(l)) return NULL;
+        if (!l || !(IsInkCG(c) || (gDark && IsWhiteCG(c)) || KbCGSpaceCol(c, gDark)) || !SpaceKeyLayer(l)) return NULL;
         space = YES;
     }
-    if (IsInkCG(c) || (gDark && (t.length == 1 || space) && IsWhiteCG(c))) return CGFor(AACIcon, NO);
+    if (IsInkCG(c) || (gDark && (t.length == 1 || space) && IsWhiteCG(c)) || (space && KbCGSpaceCol(c, gDark)))
+        return CGFor(AACIcon, NO);
     return NULL;
 }
 
 static void KbTextFix(CALayer *l) {
     if (!gOn[AACIcon] || ![l isKindOfClass:CATextLayer.class]) return;
     CATextLayer *t = (CATextLayer *)l;
-    CGColorRef n = KbTextColor(t.foregroundColor, t.string, l);
-    if (n && IsKeyboardLayer(l)) t.foregroundColor = n;
+    id str = t.string;
+    NSString *s = TextOf(str);
+    if (s.length == 0 || s.length > 40) return;
+    CGColorRef fg = t.foregroundColor;
+    BOOL isAttr = [str isKindOfClass:NSAttributedString.class];
+    BOOL longTxt = s.length > 3;
+    BOOL fgHit = fg && (IsInkCG(fg) || (gDark && IsWhiteCG(fg)) || (longTxt && KbCGSpaceCol(fg, gDark)));
+    if (!fgHit && !isAttr) return;
+    if (!IsKeyboardLayer(l)) return;
+    BOOL space = NO;
+    if (longTxt) {
+        if (!SpaceKeyLayer(l)) return;
+        space = YES;
+    }
+    BOOL one = gDark && (s.length == 1 || space);
+    if (fg && (IsInkCG(fg) || (one && IsWhiteCG(fg)) || (space && KbCGSpaceCol(fg, gDark)))) t.foregroundColor = CGFor(AACIcon, NO);
+    if (isAttr && gColor[AACIcon]) {
+        NSMutableAttributedString *m = KbAttrFix((NSAttributedString *)str, space, one, nil);
+        if (m) t.string = m;
+    }
 }
 
 static void KbLabelFix(UILabel *lb) {
@@ -668,17 +779,12 @@ static void KbLabelFix(UILabel *lb) {
         if (!SpaceKeyLabel(lb)) return;
         space = YES;
     }
-    BOOL one = gDark && (t.length == 1 || space);
-    if (KbCol(lb.textColor, one)) lb.textColor = gColor[AACIcon];
-    NSAttributedString *as = lb.attributedText;
-    if (as.length) {
-        UIColor *c = [as attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
-        if (KbCol(c, one)) {
-            NSMutableAttributedString *m = [as mutableCopy];
-            [m addAttribute:NSForegroundColorAttributeName value:gColor[AACIcon] range:NSMakeRange(0, m.length)];
-            lb.attributedText = m;
-        }
-    }
+    UITraitCollection *tc = lb.traitCollection;
+    BOOL dk = gDark || tc.userInterfaceStyle == UIUserInterfaceStyleDark;
+    BOOL one = dk && (t.length == 1 || space);
+    if (KbColAny(lb.textColor, space, one, tc)) lb.textColor = gColor[AACIcon];
+    NSMutableAttributedString *m = KbAttrFix(lb.attributedText, space, one, tc);
+    if (m) lb.attributedText = m;
 }
 
 static void KbImageFix(UIImageView *iv) {
@@ -686,7 +792,10 @@ static void KbImageFix(UIImageView *iv) {
     UIImage *im = iv.image;
     if (!im || !im.CGImage || objc_getAssociatedObject(im, kKbImg)) return;
     if (im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate || im.images.count > 1) return;
-    if (im.size.width > 96 || im.size.height > 96) return;
+    if (im.size.width > 96 || im.size.height > 96) {
+        // Anh rong: chi xu ly neu la chu tren phim Space
+        if (im.size.width > 600 || im.size.height > 120 || !SpaceKeyLayer(iv.layer)) return;
+    }
     if (!ViewInKeyboard(iv)) return;
     CGImageRef k = KbRecolor(im.CGImage, iv.layer);
     if (!k) return;
@@ -813,12 +922,18 @@ static void MarkInk(CALayer *l) {
     }
 }
 
+// Ghi nho layer nay dang duoc to trang hay to accent (de kiem tra lai khi nen thay doi)
+static void NoteTint(CALayer *l, CGColorRef c) {
+    objc_setAssociatedObject(l, kTintWhite, @(c == gCGWhite), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static void ReapplyContents(CALayer *l) {
     if (!OnMain()) return;
     id src = objc_getAssociatedObject(l, kContentsSrc);
     if (src) {
-        CGImageRef t = CopyTintedCG((__bridge CGImageRef)src, IconShapeColor(l));
-        if (t) { SetKbContents(l, t); CGImageRelease(t); }
+        CGColorRef ic = IconShapeColor(l);
+        CGImageRef t = CopyTintedCG((__bridge CGImageRef)src, ic);
+        if (t) { NoteTint(l, ic); SetKbContents(l, t); CGImageRelease(t); }
         return;
     }
     id ks = objc_getAssociatedObject(l, kKbSrc);
@@ -826,6 +941,14 @@ static void ReapplyContents(CALayer *l) {
         CGImageRef t = KbRecolor((__bridge CGImageRef)ks, l);
         if (t) { SetKbContents(l, t); CGImageRelease(t); }
     }
+}
+
+// Icon dang bi to trang nhung nen accent da mat (hoac nguoc lai) -> to lai cho dung
+static void RecheckContents(CALayer *l) {
+    NSNumber *w = objc_getAssociatedObject(l, kTintWhite);
+    if (!w || !objc_getAssociatedObject(l, kContentsSrc)) return;
+    BOOL want = (IconShapeColor(l) == gCGWhite);
+    if (want != w.boolValue) ReapplyContents(l);
 }
 
 static void ApplyShapeColor(CALayer *l) {
@@ -914,10 +1037,25 @@ static void MarkFill(CALayer *l, UIView *v) {
     });
 }
 
+// Co danh dau VA nen hien tai that su la accent (tranh co danh dau cu khi lop bi tai su dung)
 static BOOL UnderFill(UIView *v) {
     for (int i = 0; i < 4 && v; i++) {
-        if (objc_getAssociatedObject(v.layer, kFill)) return YES;
+        CALayer *l = v.layer;
+        if (objc_getAssociatedObject(l, kFill) && FillValid(l)) return YES;
         v = v.superview;
+    }
+    return NO;
+}
+
+// Dung cho getter tintColor: view phai nam BEN TRONG nen accent (dang hien thi) thi moi tra ve trang
+static BOOL TintOnFill(UIView *v) {
+    UIView *p = v;
+    for (int i = 0; i < 4 && p; i++, p = p.superview) {
+        CALayer *pl = p.layer;
+        if (!objc_getAssociatedObject(pl, kFill) || !FillValid(pl)) continue;
+        if (p == v) return YES;
+        CGRect r = [v convertRect:v.bounds toView:p];
+        if (CGRectContainsRect(CGRectInset(p.bounds, -6, -6), r)) return YES;
     }
     return NO;
 }
@@ -1773,7 +1911,7 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon]) return %orig;
-    if (gFillCount > 0 && gOn[AACFill] && OnMain() && UnderFill(self) && !InControlView(self)) return UIColor.whiteColor;
+    if (gFillCount > 0 && gOn[AACFill] && OnMain() && TintOnFill(self) && !InControlView(self)) return UIColor.whiteColor;
     return gColor[AACIcon];
 }
 - (void)setTintColor:(UIColor *)c {
@@ -1875,6 +2013,7 @@ static void Setup(UIWindow *w) {
     if (!gMaster || !OnMain()) return;
     if (gHasPend) PendingRun(self);
     if (self.shadowOpacity > 0 && ShadowEligible(self)) self.shadowOpacity = 0;
+    if (objc_getAssociatedObject(self, kContentsSrc)) RecheckContents(self);
     if (self.contents) KbLate(self);
     KbTextFix(self);
 }
@@ -2174,7 +2313,7 @@ static void Setup(UIWindow *w) {
     BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
     if (!monoOK) {
         // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
-        BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 900 && h <= 400 && s.width <= 400 && s.height <= 160;
+        BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 1600 && h <= 500 && s.width <= 800 && s.height <= 240;
         if (kbSize && !objc_getAssociatedObject(self, kImgView) && IsKeyboardLayer(self)) {
             CGImageRef k = KbRecolor(cg, self);
             if (k) {
@@ -2193,9 +2332,11 @@ static void Setup(UIWindow *w) {
         return;
     }
 
-    CGImageRef t = CopyTintedCG(cg, IconShapeColor(self));
+    CGColorRef ic = IconShapeColor(self);
+    CGImageRef t = CopyTintedCG(cg, ic);
     if (!t) { %orig; return; }
     objc_setAssociatedObject(self, kContentsSrc, contents, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NoteTint(self, ic);
     %orig((__bridge id)t);
     FixDoubleTint(self);
     CGImageRelease(t);
