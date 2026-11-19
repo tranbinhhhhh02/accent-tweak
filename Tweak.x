@@ -273,6 +273,8 @@ static BOOL FillValid(CALayer *a) {
     if (!a || !IsAccentCG(a.backgroundColor)) return NO;
     CGSize sz = a.bounds.size;
     if (sz.width < 1 || sz.height < 1) return NO;
+    // Nen accent that su sau icon (nut, chip...) luon nho; nen rong nhu ca hang/cell khong tinh -> icon van theo accent
+    if (sz.width > 220 || sz.height > 120) return NO;
     CALayer *p = a;
     for (int i = 0; i < 6 && p; i++, p = p.superlayer) {
         if (p.hidden || p.opacity < 0.5f) return NO;
