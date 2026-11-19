@@ -24,8 +24,7 @@ KEY(kStripSrc) KEY(kStripState) KEY(kStripOut)
 KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
 KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
 KEY(kTintWhite)
-KEY(kMonoWhite) KEY(kWhiteSrc) KEY(kWhiteStamp)
-KEY(kWLTried) KEY(kWLYes) KEY(kWLApplied)
+KEY(kWhiteSrc) KEY(kWhiteState) KEY(kWhiteOut) KEY(kWhiteStamp)
 
 // Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
 #define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
@@ -61,7 +60,6 @@ static BOOL        gInTry;
 static BOOL        gInTabFix;
 static BOOL        gInContents;
 static BOOL        gInKbFix;
-static BOOL        gInWhite;
 static volatile int32_t gPending;
 static BOOL        gSafe;
 
@@ -415,17 +413,7 @@ static int CGImageIsBlackMono(CGImageRef cg) {
     return res;
 }
 
-static BOOL ImageIsBlackMono(UIImage *img) {
-    NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
-    if (cached) return cached.boolValue;
-    if (!img.CGImage || img.images.count > 1) return NO;
-    int r = CGImageIsBlackMono(img.CGImage);
-    if (r < 0) return NO;
-    objc_setAssociatedObject(img, kMonoBlack, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return r == 1;
-}
-
-// Anh trang don sac (icon trang tren nen trong suot): moi diem dac deu gan trang
+// Icon don sac mau TRANG (vd. SF Symbol ve trang o Dark Mode)
 static int CGImageIsWhiteMono(CGImageRef cg) {
     if (!cg) return 0;
     if (!RATE_LIMIT(120)) return -1;
@@ -446,20 +434,32 @@ static int CGImageIsWhiteMono(CGImageRef cg) {
             if (px[3] < 40) { clear++; continue; }
             solid++;
             int mnc = MIN(px[0], MIN(px[1], px[2]));
-            if (mnc * 100 < 85 * px[3]) { bad++; break; }
+            if (mnc * 100 < 80 * px[3]) { bad++; break; }
         }
         res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62) ? 1 : 0;
     }
     return res;
 }
 
-static BOOL ImageIsWhiteMono(UIImage *img) {
-    NSNumber *cached = objc_getAssociatedObject(img, kMonoWhite);
+// Layer (hoac cha gan) co nen mau dam (khong phai xam/den) -> icon trang tren do phai giu trang
+static BOOL OnColoredBG(CALayer *l) {
+    CALayer *p = l;
+    for (int i = 0; i < 5 && p; i++, p = p.superlayer) {
+        CGFloat r, g, b, a;
+        if (!CGRGBA(p.backgroundColor, &r, &g, &b, &a) || a < 0.5) continue;
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx > 0.2 && (mx - mn) / mx > 0.3) return YES;
+    }
+    return NO;
+}
+
+static BOOL ImageIsBlackMono(UIImage *img) {
+    NSNumber *cached = objc_getAssociatedObject(img, kMonoBlack);
     if (cached) return cached.boolValue;
     if (!img.CGImage || img.images.count > 1) return NO;
-    int r = CGImageIsWhiteMono(img.CGImage);
+    int r = CGImageIsBlackMono(img.CGImage);
     if (r < 0) return NO;
-    objc_setAssociatedObject(img, kMonoWhite, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kMonoBlack, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return r == 1;
 }
 
@@ -1539,7 +1539,6 @@ static UIImage *DualImageRemap(UIImage *img) {
 }
 
 static UIImage *IconFix(UIImage *img) {
-    if (img && objc_getAssociatedObject(img, kWhiteSrc)) return img;
     return DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img))));
 }
 
@@ -1557,6 +1556,71 @@ static BOOL InTabBar(UIView *v) {
     for (int i = 0; i < 10 && v; i++, v = v.superview)
         if ([v isKindOfClass:UITabBar.class]) return YES;
     return NO;
+}
+
+// Icon (SF Symbol...) da duoc ve san mau TRANG trong anh (Dark Mode) -> doi sang accent.
+// Chi ap dung cho UIImageView; giu nguyen mau trang khi nam tren nen accent / nen mau dam.
+static UIImage *WhiteImageRemap(UIImage *img, UIImageView *iv) {
+    if (!img || !iv || !gMaster || !gOn[AACIcon] || !gDark || !gColor[AACIcon] || !OnMain()) return img;
+    if (objc_getAssociatedObject(img, kWhiteSrc) || objc_getAssociatedObject(img, kBlueSrc) ||
+        objc_getAssociatedObject(img, kDualSrc) || objc_getAssociatedObject(img, kAccentSrc) ||
+        objc_getAssociatedObject(img, kStripSrc) || objc_getAssociatedObject(img, kKbImg)) return img;
+    if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.images.count > 1) return img;
+    CGSize sz = img.size;
+    if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return img;
+
+    NSNumber *state = objc_getAssociatedObject(img, kWhiteState);
+    if (state && !state.boolValue) return img;
+
+    if (LooksLikeAvatarView(iv) || InTabBar(iv) || InControlView(iv) || ViewInKeyboard(iv)) return img;
+    if (LayerInsideFill(iv.layer) || OnColoredBG(iv.layer)) return img;
+
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    if (state) {
+        UIImage *cached = objc_getAssociatedObject(img, kWhiteOut);
+        if (cached && [objc_getAssociatedObject(img, kWhiteStamp) intValue] == want) return cached;
+    } else if (!RATE_LIMIT(60)) {
+        return img;
+    }
+
+    size_t w = 0, h = 0; CGContextRef ctx = NULL;
+    uint8_t *buf = FlatBuf(img, &w, &h, &ctx);
+    if (!buf) {
+        objc_setAssociatedObject(img, kWhiteState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+    int solid = 0, white = 0, clear = 0;
+    for (size_t i = 0; i < w * h; i++) {
+        const uint8_t *px = buf + i * 4;
+        if (px[3] < 24) { clear++; continue; }
+        solid++;
+        CGFloat r, g, b;
+        Unpre(px, &r, &g, &b);
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn <= 0.12 && (r + g + b) / 3.0 >= 0.85) white++;
+    }
+    BOOL ok = solid >= 6 && clear > 0 && white * 100 >= 96 * solid &&
+              (size_t)solid * 100 <= w * h * 62;
+    if (!ok) {
+        CGContextRelease(ctx);
+        free(buf);
+        objc_setAssociatedObject(img, kWhiteState, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return img;
+    }
+    const CGFloat *q = AccRGB();
+    for (size_t i = 0; i < w * h; i++) {
+        uint8_t *px = buf + i * 4;
+        if (px[3] == 0) continue;
+        CGFloat a = px[3];
+        for (int k = 0; k < 3; k++) px[k] = (uint8_t)lround(fmax(0, fmin(1, q[k])) * a);
+    }
+    UIImage *out = FlatFinish(ctx, buf, img.scale > 0 ? img.scale : 1);
+    if (!out) return img;
+    objc_setAssociatedObject(out, kWhiteSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kWhiteState, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kWhiteOut, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(img, kWhiteStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
 }
 
 static UIImage *TabColorize(UIImage *im) {
@@ -1606,157 +1670,6 @@ static void TabLabelFix(UILabel *lb) {
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
     if (lb.textColor == gColor[AACIcon] || !InTabBar(lb)) return;
     lb.textColor = gColor[AACIcon];
-}
-
-// ---- Icon trang (anh bitmap trang don sac) -> accent ----
-// Giu nguyen mau trang khi icon nam tren nen accent (nut gui, nut tron...), tren ban phim, avatar, switch/slider/kinh mo.
-static BOOL SaturatedBGAbove(UIView *v) {
-    UIView *p = v.superview;
-    for (int i = 0; i < 4 && p; i++, p = p.superview) {
-        UIColor *bg = p.backgroundColor;
-        if (bg) {
-            UIColor *rc = [bg resolvedColorWithTraitCollection:p.traitCollection];
-            CGFloat r = 0, g = 0, b = 0, a = 0;
-            if ([rc getRed:&r green:&g blue:&b alpha:&a] && a >= 0.9) {
-                CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
-                if (mx - mn > 0.2) return YES;
-            }
-        }
-        CGColorRef lc = p.layer.backgroundColor;
-        CGFloat r, g, b, a;
-        if (lc && CGRGBA(lc, &r, &g, &b, &a) && a >= 0.9) {
-            CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
-            if (mx - mn > 0.2) return YES;
-        }
-    }
-    return NO;
-}
-
-static UIImage *WhiteTinted(UIImage *im) {
-    if (!im || !gMaster || !gOn[AACIcon] || !OnMain() || !gCGWhite) return im;
-    int want = gVersion * 2 + (gDark ? 1 : 0);
-    UIImage *src = objc_getAssociatedObject(im, kWhiteSrc);
-    NSNumber *stamp = objc_getAssociatedObject(im, kWhiteStamp);
-    if (src && stamp.intValue == want) return im;
-    UIImage *base = src ?: im;
-    if (base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || base.images.count > 1) return im;
-    CGSize sz = base.size;
-    if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return im;
-    if (!ImageIsWhiteMono(base)) return im;
-    UIColor *c = [UIColor colorWithCGColor:CGFor(AACIcon, NO)];
-    UIImage *out = [base imageWithTintColor:c renderingMode:UIImageRenderingModeAlwaysOriginal];
-    if (!out) return im;
-    objc_setAssociatedObject(out, kWhiteSrc, base, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(out, kWhiteStamp, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return out;
-}
-
-static void WhiteIconView(UIImageView *iv) {
-    if (!iv || gInWhite || gInKbFix || gInTabFix || !gMaster || !gOn[AACIcon] || !OnMain()) return;
-    UIImage *im = iv.image;
-    if (!im) return;
-    UIImage *src = objc_getAssociatedObject(im, kWhiteSrc);
-    if (!src) {
-        // Chi xet anh nho (icon); bo qua anh khac de tiet kiem
-        CGSize sz = im.size;
-        if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return;
-    }
-    BOOL skip = ViewInKeyboard(iv) || LooksLikeAvatarView(iv) || InControlView(iv) ||
-                (gFillCount > 0 && TintOnFill(iv)) || SaturatedBGAbove(iv);
-    UIImage *target = nil;
-    if (src) target = skip ? src : WhiteTinted(im);
-    else if (!skip) target = WhiteTinted(im);
-    if (!target || target == im) return;
-    gInWhite = YES;
-    iv.image = target;
-    gInWhite = NO;
-}
-
-// ---- Icon template (SF Symbol / anh template) bi tint TRANG sai ----
-// UIKit to icon template bang contentsMultiplyColor. Neu gia tri nay dang la trang trong khi view
-// KHONG nam tren nen accent that su -> dat lai thanh accent (giong icon goc dung mau xanh cua app).
-static void TemplateTintFix(CALayer *l) {
-    if (!l || !gMaster || !gOn[AACIcon] || !gCGWhite || !OnMain()) return;
-    id d = l.delegate;
-    if (![d isKindOfClass:UIImageView.class]) return;
-    UIImageView *iv = (UIImageView *)d;
-    if (iv.layer != l) return;
-    CGSize s = l.bounds.size;
-    if (s.width < 4 || s.height < 4 || s.width > 64 || s.height > 64) return;
-    UIImage *im = iv.image;
-    if (!im || !(im.isSymbolImage || im.renderingMode == UIImageRenderingModeAlwaysTemplate)) return;
-    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) return;
-    if (ViewInKeyboard(iv) || InControlView(iv) || LooksLikeAvatarView(iv)) return;
-    id m = nil;
-    @try { m = [l valueForKey:@"contentsMultiplyColor"]; } @catch (NSException *e) { return; }
-    if (!m || CFGetTypeID((__bridge CFTypeRef)m) != CGColorGetTypeID()) return;
-    if (!IsWhiteCG((__bridge CGColorRef)m)) return;
-    // Nam tren nen accent (nut tron, huy hieu...) hoac nen mau khac -> giu trang
-    if (LayerInsideFill(l) || (gFillCount > 0 && TintOnFill(iv)) || SaturatedBGAbove(iv)) return;
-    [l setContentsMultiplyColor:CGFor(AACIcon, NO)];
-}
-
-// ---- Layer chua anh trang don sac (icon SF Symbol/SwiftUI ve san mau trang) -> nhan accent ----
-// Anh trang x contentsMultiplyColor = mau multiply, nen dat multiply = accent la icon thanh accent.
-// Khong dung toi layer tren ban phim, nen accent that, nen mau dam khac, avatar, kinh mo.
-static BOOL LayerSaturatedBGAbove(CALayer *l) {
-    CALayer *p = l.superlayer;
-    for (int i = 0; i < 4 && p; i++, p = p.superlayer) {
-        CGColorRef bg = p.backgroundColor;
-        CGFloat r, g, b, a;
-        if (bg && CGRGBA(bg, &r, &g, &b, &a) && a >= 0.9) {
-            CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
-            if (mx - mn > 0.2) return YES;
-        }
-    }
-    return NO;
-}
-
-static void WhiteLayerFix(CALayer *l) {
-    if (!l || !gMaster || !gOn[AACIcon] || !gCGWhite || !OnMain()) return;
-    id c = l.contents;
-    if (!c || CFGetTypeID((__bridge CFTypeRef)c) != CGImageGetTypeID()) return;
-    if ([l isKindOfClass:CAShapeLayer.class]) return;
-    if (objc_getAssociatedObject(l, kKbSrc) || objc_getAssociatedObject(l, kContentsSrc)) return;
-    CGSize s = l.bounds.size;
-    if (s.width < 4 || s.height < 4 || s.width > 64 || s.height > 64) return;
-    if (l.masksToBounds && l.cornerRadius > 0) return;
-    CGImageRef cg = (__bridge CGImageRef)c;
-    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
-    if (w < 8 || h < 8 || w > 192 || h > 192) return;
-
-    id m = nil;
-    @try { m = [l valueForKey:@"contentsMultiplyColor"]; } @catch (NSException *e) { return; }
-    CGColorRef mc = (m && CFGetTypeID((__bridge CFTypeRef)m) == CGColorGetTypeID()) ? (__bridge CGColorRef)m : NULL;
-
-    BOOL applied = [objc_getAssociatedObject(l, kWLApplied) boolValue];
-    BOOL yes;
-    if (objc_getAssociatedObject(l, kWLTried) == c) {
-        yes = [objc_getAssociatedObject(l, kWLYes) boolValue];
-    } else {
-        int r = CGImageIsWhiteMono(cg);
-        if (r < 0) return;   // bi gioi han toc do -> thu lai lan sau
-        yes = (r == 1);
-        objc_setAssociatedObject(l, kWLTried, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(l, kWLYes, @(yes), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (applied) { applied = NO; objc_setAssociatedObject(l, kWLApplied, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-    }
-    if (!yes) return;
-    if (IsKeyboardLayer(l) || InGlassLayer(l) || InBackdropLayer(l)) return;
-
-    if (LayerInsideFill(l) || OnAccentKey(l) || LayerSaturatedBGAbove(l)) {
-        // Nam tren nen accent / nen mau -> tra ve trang neu truoc do da to accent
-        if (applied) {
-            objc_setAssociatedObject(l, kWLApplied, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [l setContentsMultiplyColor:gCGWhite];
-        }
-        return;
-    }
-    if (mc && !IsWhiteCG(mc) && !IsOurs(mc)) return;     // da co mau khac (app / tweak) -> khong dong
-    CGColorRef want = CGFor(AACIcon, NO);
-    if (mc && mc == want && applied) return;
-    objc_setAssociatedObject(l, kWLApplied, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [l setContentsMultiplyColor:want];
 }
 
 // ---- Bang cai dat ----
@@ -1936,7 +1849,7 @@ static NSString *HexCG(CGColorRef c) {
 }
 
 static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUInteger limit) {
-    if (!l || depth > 60 || out.length > limit) return;
+    if (!l || depth > 16 || out.length > limit) return;
     CGSize s = l.bounds.size;
     BOOL shp = [l isKindOfClass:CAShapeLayer.class];
     BOOL txt = [l isKindOfClass:CATextLayer.class];
@@ -1946,7 +1859,7 @@ static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUI
         [out appendFormat:@"%d %@ %.0fx%.0f", depth, NSStringFromClass(l.class), s.width, s.height];
         id d = l.delegate;
         if (d) [out appendFormat:@" del=%@", NSStringFromClass([d class])];
-        if (l.contents) [out appendFormat:@" contents(%@ %@)", NSStringFromClass([l.contents class]), (l.contentsFormat ?: @"-")];
+        if (l.contents) [out appendString:@" contents"];
         if (l.hidden) [out appendString:@" HIDDEN"];
         if (l.opacity < 0.99) [out appendFormat:@" op=%.2f", l.opacity];
         if (l.shadowOpacity > 0)
@@ -2209,7 +2122,6 @@ static void Setup(UIWindow *w) {
     if (objc_getAssociatedObject(self, kContentsSrc)) RecheckContents(self);
     if (self.contents) KbLate(self);
     KbTextFix(self);
-    if (self.contents) { TemplateTintFix(self); WhiteLayerFix(self); }
 }
 %end
 
@@ -2336,13 +2248,7 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
-    if (self.window) { KbImageFix(self); WhiteIconView(self); }
-}
-- (void)tintColorDidChange {
-    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
-    AAC_DEPTH_SCOPE;
-    %orig;
-    if (self.image && !gInWhite) WhiteIconView(self);
+    if (self.window) KbImageFix(self);
 }
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
@@ -2351,6 +2257,8 @@ static void Setup(UIWindow *w) {
         objc_setAssociatedObject(self.layer, kImgView, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (OnMain() && LooksLikeAvatarView(self)) { %orig(img); return; }
     UIImage *n = IconFix(img);
+    // Icon / SF Symbol ve san mau trang (Dark Mode) -> accent
+    if (n && n == img) n = WhiteImageRemap(n, self);
     if (n && gMaster && gOn[AACIcon] && OnMain()) {
         CGSize s = n.size;
         if (s.width <= 80 && s.height <= 80 && InTabBar(self)) n = TabColorize(n);
@@ -2359,7 +2267,6 @@ static void Setup(UIWindow *w) {
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
     if (self.window) KbImageFix(self);
     if (n && objc_getAssociatedObject(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
-    if (!gInWhite && n) WhiteIconView(self);
 }
 %end
 
@@ -2496,13 +2403,6 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     if (gInContents) { %orig; return; }
-    if (contents && gMaster && gOn[AACIcon] && OnMain()) {
-        CGSize ws = self.bounds.size;
-        if (ws.width <= 64 && ws.height <= 64) {
-            __weak CALayer *wwl = self;
-            dispatch_async(dispatch_get_main_queue(), ^{ WhiteLayerFix(wwl); });
-        }
-    }
     if (objc_getAssociatedObject(self, kContentsSrc)) objc_setAssociatedObject(self, kContentsSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (objc_getAssociatedObject(self, kKbSrc))       objc_setAssociatedObject(self, kKbSrc, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (objc_getAssociatedObject(self, kKbBlue))      objc_setAssociatedObject(self, kKbBlue, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -2519,6 +2419,16 @@ static void Setup(UIWindow *w) {
                 s.width > 48 || s.height > 48 ||
                 (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
     BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
+    // Dark Mode: icon don sac mau TRANG (SF Symbol ve san mau trang) -> accent.
+    // Giu trang khi nam tren nen accent / nen mau dam, trong ban phim, glass, hoac la layer cua UILabel.
+    if (!monoOK && !skip && gDark) {
+        id dg = self.delegate;
+        if (!(dg && [dg isKindOfClass:UILabel.class]) && !InBackdropLayer(self) &&
+            CGImageIsWhiteMono(cg) == 1 &&
+            !IsKeyboardLayer(self) && !LayerInsideFill(self) && !OnColoredBG(self)) {
+            monoOK = YES;
+        }
+    }
     if (!monoOK) {
         // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
         BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 1600 && h <= 500 && s.width <= 800 && s.height <= 240;
