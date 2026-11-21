@@ -1,5 +1,3 @@
-# Đặt file này tại .github/workflows/build.yml trong repo GitHub
-# (Tweak.x và Makefile để ở thư mục gốc của repo).
 name: Build dylib
 
 on:
