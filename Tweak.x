@@ -25,6 +25,7 @@ KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
 KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
 KEY(kTintWhite)
 KEY(kWhiteSym)
+KEY(kImgTint)
 
 // Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
 #define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
@@ -975,7 +976,21 @@ static BOOL HasTwinSibling(CALayer *l) {
         if (o == l || o.hidden || objc_getAssociatedObject(o, kInkTint)) continue;
         CGSize t = o.bounds.size;
         if (fabs(t.width - s.width) > 10 || fabs(t.height - s.height) > 10) continue;
-        if (o.contents || [o isKindOfClass:CAShapeLayer.class] || o.sublayers.count > 0) return YES;
+        if (o.contents || [o isKindOfClass:CAShapeLayer.class]) return YES;
+    }
+    return NO;
+}
+
+// Icon trong o danh sach (UITableViewCell / UICollectionViewCell) khong bao gio bi an
+static BOOL InListCellLayer(CALayer *l) {
+    for (int i = 0; i < 6 && l; i++, l = l.superlayer) {
+        id d = l.delegate;
+        if ([d isKindOfClass:UIView.class]) {
+            UIView *v = (UIView *)d;
+            for (int j = 0; j < 10 && v; j++, v = v.superview)
+                if ([v isKindOfClass:UITableViewCell.class] || [v isKindOfClass:UICollectionViewCell.class]) return YES;
+            return NO;
+        }
     }
     return NO;
 }
@@ -983,6 +998,7 @@ static BOOL HasTwinSibling(CALayer *l) {
 static void GlowCheck(CALayer *l) {
     if (!l || !gMaster || !OnMain() || l.hidden) return;
     if (!objc_getAssociatedObject(l, kInkTint) || IsKeyboardLayer(l)) return;
+    if (InListCellLayer(l)) return;
     if (HasTwinSibling(l)) l.hidden = YES;
 }
 
@@ -1642,6 +1658,81 @@ static void TabLabelFix(UILabel *lb) {
     lb.textColor = gColor[AACIcon];
 }
 
+
+// ---- Icon trang (SF Symbol / template) -> accent, xu ly triet de o muc view ----
+static BOOL gInImgFix;
+
+// Nen mau (bao gom do/xanh/den dam) cua mot huy hieu nho phia sau icon -> giu icon trang
+static BOOL OnColoredBadgeView(UIView *v) {
+    UIView *p = v;
+    for (int i = 0; i < 3 && p; i++, p = p.superview) {
+        CGSize s = p.bounds.size;
+        if (i > 0 && (s.height > 120 || s.width > 200)) break;
+        UIColor *bg = p.backgroundColor;
+        if (!bg) continue;
+        CGFloat r = 0, g = 0, b = 0, a = 0;
+        if (![bg getRed:&r green:&g blue:&b alpha:&a] || a < 0.5) continue;
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn > 0.25 || (r + g + b) / 3.0 < 0.2) return YES;
+    }
+    return NO;
+}
+
+static BOOL LayerOnBadge(CALayer *l) {
+    CALayer *p = l.superlayer;
+    for (int i = 0; i < 3 && p; i++, p = p.superlayer) {
+        CGSize s = p.bounds.size;
+        if (s.height > 120 || s.width > 200) break;
+        CGFloat r, g, b, a;
+        if (!CGRGBA(p.backgroundColor, &r, &g, &b, &a) || a < 0.5) continue;
+        CGFloat mx = fmax(r, fmax(g, b)), mn = fmin(r, fmin(g, b));
+        if (mx - mn > 0.25 || (r + g + b) / 3.0 < 0.2) return YES;
+    }
+    return NO;
+}
+
+static BOOL ImgViewEligible(UIView *v) {
+    if (!v.window) return NO;
+    CGSize s = v.bounds.size;
+    if (s.width > 64 || s.height > 64) return NO;
+    if (LooksLikeAvatarView(v) || ViewInKeyboard(v) || InControlView(v) || InTabBar(v)) return NO;
+    return YES;
+}
+
+// setTintColor(trang) tren icon: doi sang accent (tru khi nam trong nen accent hoac tren huy hieu mau)
+static BOOL WhiteTintTarget(UIView *v) {
+    BOOL ok = [v isKindOfClass:UIImageView.class] ||
+              ([v isKindOfClass:UIButton.class] && ((UIButton *)v).currentTitle.length == 0);
+    if (!ok || !ImgViewEligible(v)) return NO;
+    if (TintOnFill(v) || OnColoredBadgeView(v)) return NO;
+    return YES;
+}
+
+static void ImgTintFix(UIImageView *iv) {
+    if (gInImgFix || !gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
+    UIImage *im = iv.image;
+    if (!im || !ImgViewEligible(iv)) return;
+    BOOL sym = im.isSymbolImage;
+    UIImageRenderingMode rm = im.renderingMode;
+    if (!sym && rm != UIImageRenderingModeAlwaysTemplate) return;
+    if (TintOnFill(iv) || OnColoredBadgeView(iv)) return;
+    gInImgFix = YES;
+    // SF Symbol da nuong mau trang -> template de an theo tint
+    if (sym && rm == UIImageRenderingModeAlwaysOriginal && SymbolIsWhiteMono(im)) {
+        UIImage *t = [im imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        if (t) { iv.image = t; rm = UIImageRenderingModeAlwaysTemplate; }
+    }
+    if (rm != UIImageRenderingModeAlwaysOriginal) {
+        int want = gVersion * 2 + (gDark ? 1 : 0);
+        NSNumber *st = objc_getAssociatedObject(iv, kImgTint);
+        if (st.intValue != want || !st) {
+            iv.tintColor = gColor[AACIcon];
+            objc_setAssociatedObject(iv, kImgTint, @(want), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+    gInImgFix = NO;
+}
+
 // ---- Bang cai dat ----
 static BOOL gPanelShown;
 static BOOL gPanelPending;
@@ -1998,6 +2089,11 @@ static void Setup(UIWindow *w) {
         if ([self isKindOfClass:UIImageView.class]) MarkInk(self.layer);
         return;
     }
+    if (gMaster && gOn[AACIcon] && gColor[AACIcon] && c && OnMain() && !gInImgFix &&
+        IsWhiteColor(c) && WhiteTintTarget(self)) {
+        %orig(gColor[AACIcon]);
+        return;
+    }
     %orig;
 }
 - (void)setBackgroundColor:(UIColor *)c {
@@ -2218,7 +2314,13 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
-    if (self.window) KbImageFix(self);
+    if (self.window) { KbImageFix(self); ImgTintFix(self); }
+}
+- (void)layoutSubviews {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    ImgTintFix(self);
 }
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
@@ -2233,7 +2335,7 @@ static void Setup(UIWindow *w) {
     }
     %orig(n);
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
-    if (self.window) KbImageFix(self);
+    if (self.window) { KbImageFix(self); ImgTintFix(self); }
     if (n && objc_getAssociatedObject(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
 }
 %end
@@ -2389,8 +2491,8 @@ static void Setup(UIWindow *w) {
     BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
     // SF Symbol / icon don sac TRANG (Dark Mode) ngoai ban phim -> to accent (trong nen accent thi van la trang)
     BOOL whiteOK = NO;
-    if (!monoOK && !skip && gDark && !InBackdropLayer(self) && !InGlassLayer(self) && !IsKeyboardLayer(self) &&
-        CGImageIsWhiteMono(cg) == 1) whiteOK = YES;
+    if (!monoOK && !skip && !InBackdropLayer(self) && !InGlassLayer(self) && !IsKeyboardLayer(self) &&
+        !LayerOnBadge(self) && CGImageIsWhiteMono(cg) == 1) whiteOK = YES;
     if (!monoOK && !whiteOK) {
         // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
         BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 1600 && h <= 500 && s.width <= 800 && s.height <= 240;
