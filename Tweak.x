@@ -1524,12 +1524,23 @@ static UIImage *DualImageRemap(UIImage *img) {
     return out;
 }
 
+// SF Symbol -> nuong thang mau Accent ngay luc tao anh (moi luong, moi cho dung symbol)
+static UIImage *SymbolAccent(UIImage *img) {
+    if (!img || !gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !img.isSymbolImage) return img;
+    if (objc_getAssociatedObject(img, kAccentSrc)) return img;
+    UIImage *out = [img imageWithTintColor:gColor[AACIcon] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    if (!out) return img;
+    objc_setAssociatedObject(out, kAccentSrc, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(out, kAccentStamp, @(gVersion * 2 + (gDark ? 1 : 0)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
 static UIImage *IconFix(UIImage *img) {
     return DualImageRemap(BlueImageRemap(IconRemapImage(ShadowStripImage(img))));
 }
 
 static UIColor *IconTintFix(UIColor *c) {
-    if (gMaster && gOn[AACIcon] && c && OnMain()) {
+    if (gMaster && gOn[AACIcon] && c) {
         if (IsInkColor(c) || IsNeutralIconColor(c)) return gColor[AACIcon];
         UIColor *n = ColorRemap(c, AACIcon, NULL);
         if (n) return n;
@@ -2219,6 +2230,41 @@ static void Setup(UIWindow *w) {
 %end
 
 %hook UIImage
++ (UIImage *)systemImageNamed:(NSString *)n {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
++ (UIImage *)systemImageNamed:(NSString *)n withConfiguration:(UIImageConfiguration *)cfg {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
++ (UIImage *)systemImageNamed:(NSString *)n compatibleWithTraitCollection:(UITraitCollection *)tc {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
++ (UIImage *)imageNamed:(NSString *)n {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
++ (UIImage *)imageNamed:(NSString *)n inBundle:(NSBundle *)b compatibleWithTraitCollection:(UITraitCollection *)tc {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
+- (UIImage *)imageWithConfiguration:(UIImageConfiguration *)cfg {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
+- (UIImage *)imageByApplyingSymbolConfiguration:(UIImageSymbolConfiguration *)cfg {
+    if (gDepth > AAC_MAXDEPTH) return %orig;
+    AAC_DEPTH_SCOPE;
+    return SymbolAccent(%orig);
+}
 - (UIImage *)imageWithTintColor:(UIColor *)c renderingMode:(UIImageRenderingMode)m {
     if (gDepth > AAC_MAXDEPTH) return %orig;
     AAC_DEPTH_SCOPE;
