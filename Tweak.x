@@ -1022,6 +1022,7 @@ static void RefreshViewTree(UIView *v, int depth) {
     if ([v isKindOfClass:UITabBar.class]) TabBarFix((UITabBar *)v);
     [v tintColorDidChange];
     [v setNeedsDisplay];
+    if ([v isKindOfClass:UIImageView.class]) [v setNeedsLayout];
     for (UIView *s in [v.subviews copy]) RefreshViewTree(s, depth + 1);
 }
 
@@ -1552,7 +1553,7 @@ static UIImage *TabColorize(UIImage *im) {
     UIImage *base = src ?: im;
     CGSize sz = base.size;
     if (sz.width > 80 || sz.height > 80) return im;
-    BOOL ok = base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || ImageIsBlackMono(base);
+    BOOL ok = base.renderingMode == UIImageRenderingModeAlwaysTemplate || base.isSymbolImage || ImageIsBlackMono(base) || ImageIsWhiteMono(base);
     if (!ok) return im;
     UIColor *c = [UIColor colorWithCGColor:CGFor(AACIcon, NO)];
     UIImage *out = [base imageWithTintColor:c renderingMode:UIImageRenderingModeAlwaysOriginal];
@@ -1590,6 +1591,29 @@ static void TabLabelFix(UILabel *lb) {
     if (!gMaster || !gOn[AACIcon] || !gColor[AACIcon] || !OnMain()) return;
     if (lb.textColor == gColor[AACIcon] || !InTabBar(lb)) return;
     lb.textColor = gColor[AACIcon];
+}
+
+// Moi UIImageView nho (symbol / template / icon don sac den-trang) -> nuong thang mau Accent vao anh.
+// Khong phu thuoc app dat tint hay mau nao (trang, den, labelColor...).
+static void IconViewFix(UIImageView *iv) {
+    if (!iv || !gMaster || !gOn[AACIcon] || !OnMain() || gInTabFix || gInKbFix || !iv.window) return;
+    UIImage *im = iv.image;
+    if (!im || (!im.CGImage && !im.isSymbolImage)) return;
+    int want = gVersion * 2 + (gDark ? 1 : 0);
+    if (objc_getAssociatedObject(im, kAccentSrc) && [objc_getAssociatedObject(im, kAccentStamp) intValue] == want) return;
+    if (objc_getAssociatedObject(im, kArrowDone) || objc_getAssociatedObject(im, kKbImg)) return;
+    CGSize sz = im.size;
+    if (sz.width > 64 || sz.height > 64 || sz.width < 6 || sz.height < 6) return;
+    if (LooksLikeAvatarView(iv) || ViewInKeyboard(iv)) return;
+    UIView *p = iv;
+    for (int i = 0; i < 6 && p; i++, p = p.superview)
+        if ([p isKindOfClass:UISwitch.class] || [p isKindOfClass:UISlider.class]) return;
+    UIImage *base = objc_getAssociatedObject(im, kAccentSrc) ? im : IconRemapImage(im);
+    UIImage *n = TabColorize(base);
+    if (!n || n == im) return;
+    gInTabFix = YES;
+    iv.image = n;
+    gInTabFix = NO;
 }
 
 // ---- Bang cai dat ----
@@ -1769,7 +1793,7 @@ static NSString *HexCG(CGColorRef c) {
 }
 
 static void DumpLayer(CALayer *l, int depth, BOOL kb, NSMutableString *out, NSUInteger limit) {
-    if (!l || depth > 16 || out.length > limit) return;
+    if (!l || depth > 40 || out.length > limit) return;
     CGSize s = l.bounds.size;
     BOOL shp = [l isKindOfClass:CAShapeLayer.class];
     BOOL txt = [l isKindOfClass:CATextLayer.class];
@@ -2168,7 +2192,13 @@ static void Setup(UIWindow *w) {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
     %orig;
-    if (self.window) KbImageFix(self);
+    if (self.window) { KbImageFix(self); IconViewFix(self); }
+}
+- (void)layoutSubviews {
+    if (gDepth > AAC_MAXDEPTH) { %orig; return; }
+    AAC_DEPTH_SCOPE;
+    %orig;
+    IconViewFix(self);
 }
 - (void)setImage:(UIImage *)img {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
@@ -2183,7 +2213,7 @@ static void Setup(UIWindow *w) {
     }
     %orig(n);
     if (n && n != img && gMaster && gOn[AACIcon] && OnMain()) KillShadowUp(self.layer, 2);
-    if (self.window) KbImageFix(self);
+    if (self.window) { KbImageFix(self); IconViewFix(self); }
     if (n && objc_getAssociatedObject(n, kInkImg) && gMaster && OnMain()) MarkInk(self.layer);
 }
 %end
