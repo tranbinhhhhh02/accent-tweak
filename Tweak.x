@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+// 1: mui ten trong nut tron accent (nut gui) giu mau trang de khong bi chim vao nen. 0: mui ten cung mau accent.
 #ifndef AAC_ARROW_WHITE
 #define AAC_ARROW_WHITE 1
 #endif
@@ -27,7 +28,7 @@ KEY(kContentsSrc) KEY(kCtl) KEY(kImgView) KEY(kOwner) KEY(kNoShadow)
 KEY(kStripSrc) KEY(kStripState) KEY(kStripOut)
 KEY(kKbSrc) KEY(kKbImg) KEY(kKbBlue) KEY(kKbTried) KEY(kKbTries)
 KEY(kInkTint) KEY(kInkImg) KEY(kArrowDone) KEY(kAttempts) KEY(kPendShape)
-KEY(kTintWhite)
+KEY(kTintWhite) KEY(kMonoWhite)
 
 // Gioi han so lan xu ly nang trong 1 giay (moi vi tri goi co bo dem rieng)
 #define RATE_LIMIT(max) ({ static CFAbsoluteTime _ws; static int _wc; \
@@ -240,6 +241,20 @@ static BOOL IsWhiteColor(UIColor *c) {
     return [c getRed:&r green:&g blue:&b alpha:&a] && a >= 0.99 && r > 0.97 && g > 0.97 && b > 0.97;
 }
 
+// Mau den/trang (ke ca mau dong nhu labelColor) o Light HOAC Dark -> coi la mau icon "trung tinh"
+static BOOL IsNeutralIconColor(UIColor *c) {
+    if (!c || (gColor[0] && c == gColor[0])) return NO;
+    for (int i = 0; i < 2; i++) {
+        UITraitCollection *tc = [UITraitCollection traitCollectionWithUserInterfaceStyle:
+            i ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight];
+        UIColor *rc = [c resolvedColorWithTraitCollection:tc];
+        CGFloat r = 0, g = 0, b = 0, a = 0;
+        if (![rc getRed:&r green:&g blue:&b alpha:&a] || a < 0.99) continue;
+        if ((r < 0.16 && g < 0.16 && b < 0.16) || (r > 0.97 && g > 0.97 && b > 0.97)) return YES;
+    }
+    return NO;
+}
+
 static BOOL IsBlackCG(CGColorRef c) {
     CGFloat r, g, b, a;
     return CGRGBA(c, &r, &g, &b, &a) && IsDarkRGBA(r, g, b, a, 0.03);
@@ -402,6 +417,43 @@ static int CGImageIsBlackMono(CGImageRef cg) {
         res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62) ? 1 : 0;
     }
     return res;
+}
+
+static int CGImageIsWhiteMono(CGImageRef cg) {
+    if (!cg) return 0;
+    if (!RATE_LIMIT(120)) return -1;
+    int res = 0;
+    enum { N = 24 };
+    uint8_t buf[N * N * 4];
+    memset(buf, 0, sizeof buf);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), cg);
+        CGContextRelease(ctx);
+        int solid = 0, clear = 0, bad = 0;
+        for (int i = 0; i < N * N; i++) {
+            const uint8_t *px = buf + i * 4;
+            if (px[3] < 40) { clear++; continue; }
+            solid++;
+            int mnc = MIN(px[0], MIN(px[1], px[2]));
+            if (mnc * 100 < 85 * px[3]) { bad++; break; }
+        }
+        res = (solid >= 6 && clear >= 1 && bad == 0 && solid * 100 <= N * N * 62) ? 1 : 0;
+    }
+    return res;
+}
+
+static BOOL ImageIsWhiteMono(UIImage *img) {
+    NSNumber *cached = objc_getAssociatedObject(img, kMonoWhite);
+    if (cached) return cached.boolValue;
+    if (!img.CGImage || img.images.count > 1) return NO;
+    int r = CGImageIsWhiteMono(img.CGImage);
+    if (r < 0) return NO;
+    objc_setAssociatedObject(img, kMonoWhite, @(r == 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return r == 1;
 }
 
 static BOOL ImageIsBlackMono(UIImage *img) {
@@ -1342,7 +1394,7 @@ static UIImage *IconRemapImage(UIImage *img) {
     if (img.renderingMode == UIImageRenderingModeAlwaysTemplate || img.isSymbolImage) return img;
     CGSize sz = img.size;
     if (sz.width < 8 || sz.height < 8 || sz.width > 64 || sz.height > 64) return img;
-    if (!ImageIsBlackMono(img)) return img;
+    if (!ImageIsBlackMono(img) && !ImageIsWhiteMono(img)) return img;
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
@@ -1477,7 +1529,7 @@ static UIImage *IconFix(UIImage *img) {
 
 static UIColor *IconTintFix(UIColor *c) {
     if (gMaster && gOn[AACIcon] && c && OnMain()) {
-        if (IsInkColor(c)) return gColor[AACIcon];
+        if (IsInkColor(c) || IsNeutralIconColor(c)) return gColor[AACIcon];
         UIColor *n = ColorRemap(c, AACIcon, NULL);
         if (n) return n;
     }
@@ -1890,7 +1942,8 @@ static void Setup(UIWindow *w) {
 - (void)setTintColor:(UIColor *)c {
     if (gDepth > AAC_MAXDEPTH) { %orig; return; }
     AAC_DEPTH_SCOPE;
-    if (gMaster && gOn[AACIcon] && c && OnMain() && IsInkColor(c)) {
+    if (gMaster && gOn[AACIcon] && c && OnMain() &&
+        (IsInkColor(c) || ([self isKindOfClass:UIImageView.class] && IsNeutralIconColor(c)))) {
         %orig(gColor[AACIcon]);
         if ([self isKindOfClass:UIImageView.class]) MarkInk(self.layer);
         return;
@@ -2283,7 +2336,7 @@ static void Setup(UIWindow *w) {
                 w < 8 || h < 8 || w > 192 || h > 192 ||
                 s.width > 48 || s.height > 48 ||
                 (double)MIN(w, h) / (double)MAX(w, h) < 0.6;
-    BOOL monoOK = !skip && !InBackdropLayer(self) && CGImageIsBlackMono(cg) == 1;
+    BOOL monoOK = !skip && !InBackdropLayer(self) && (CGImageIsBlackMono(cg) == 1 || CGImageIsWhiteMono(cg) == 1);
     if (!monoOK) {
         // Ban phim: nut xanh / icon den / icon trang (dia cau, phim chu Dark Mode) -> accent, xu ly dong bo
         BOOL kbSize = notShape && w >= 8 && h >= 8 && w <= 1600 && h <= 500 && s.width <= 800 && s.height <= 240;
