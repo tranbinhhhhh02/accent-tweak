@@ -20,7 +20,6 @@ static NSString *const kHexKey     = @"AccentColorAll_Hex";
 static NSString *const kDefaultHex = @"B8A8FF";
 static NSString *const kCrashKey   = @"AccentColorAll_LastCrash";
 static NSString *const kKbBarKey   = @"AccentColorAll_KbShortcuts";
-static NSString *const kKbPadKey   = @"AccentColorAll_KbPadMode";
 static NSString *const kKbTopKey   = @"AccentColorAll_KbTopMode";
 
 #define KEY(n) static const void *n = &n;
@@ -71,7 +70,6 @@ static BOOL        gInKbFix;
 static volatile int32_t gPending;
 static BOOL        gSafe;
 static BOOL        gKbBarOn;
-static BOOL        gKbPadOn;
 static BOOL        gKbTopOn;
 static __thread BOOL gTintBypass;
 
@@ -214,7 +212,6 @@ static void RefreshCache(void) {
     if (!gKeep) gKeep = [NSMutableArray new];
     gMaster = [d boolForKey:kMasterKey];
     gKbBarOn = [d boolForKey:kKbBarKey];
-    gKbPadOn = [d boolForKey:kKbPadKey];
     gKbTopOn = [d boolForKey:kKbTopKey];
     UIColor *light = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
     UIColor *dark = DarkVariant(light);
@@ -1721,12 +1718,12 @@ static void KbBarRefreshAll(void);
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 1) return 3;
+    if (s == 1) return 2;
     return PeekCrash().length ? 4 : 3;
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 1 ? @"Bàn phím" : @"Thay màu nhấn"; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return s == 1 ? @"Thanh phím tắt: hàng nút cạnh phím địa cầu. \"Dạng TrollPad\" chuyển Hoàn tác, Làm lại, Dán sang trái và In đậm/nghiêng/gạch chân sang phải hàng gợi ý từ phía trên bàn phím (cần có hàng gợi ý, nếu không sẽ về dạng thường). \"Kiểu iPad\" chỉ dùng cho iOS 17 trở xuống." : nil;
+    return s == 1 ? @"Thanh phím tắt: hàng nút cạnh phím địa cầu. \"Dạng TrollPad\" chuyển Hoàn tác, Làm lại, Dán sang trái và In đậm/nghiêng/gạch chân sang phải hàng gợi ý từ phía trên bàn phím (cần có hàng gợi ý, nếu không sẽ về dạng thường)." : nil;
 }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1742,10 +1739,6 @@ static void KbBarRefreshAll(void);
             cell.textLabel.text = @"Dạng TrollPad (lên trên)";
             ks.on = [d boolForKey:kKbTopKey];
             [ks addTarget:self action:@selector(kbTopChanged:) forControlEvents:UIControlEventValueChanged];
-        } else {
-            cell.textLabel.text = @"Kiểu iPad (iOS ≤ 17)";
-            ks.on = [d boolForKey:kKbPadKey];
-            [ks addTarget:self action:@selector(kbPadChanged:) forControlEvents:UIControlEventValueChanged];
         }
         cell.accessoryView = ks;
         return cell;
@@ -1811,14 +1804,6 @@ static void KbBarRefreshAll(void);
     [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKbTopKey];
     gKbTopOn = sw.isOn;
     KbBarRefreshAll();
-}
-
-- (void)kbPadChanged:(UISwitch *)sw {
-    [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKbPadKey];
-    gKbPadOn = sw.isOn;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try { [UIApplication.sharedApplication sendAction:@selector(reloadInputViews) to:nil from:nil forEvent:nil]; } @catch (__unused id x) {}
-    });
 }
 
 - (void)kbBarChanged:(UISwitch *)sw {
@@ -2526,100 +2511,6 @@ static void Setup(UIWindow *w) {
 %end
 %end
 
-// ---- Thanh phim tat tren ban phim (giong iPad: hoan tac, lam lai, dan, B/I/U, goi y tu) ----
-// Co che (theo TrollPadUI): ban phim chi dung thanh phim tat khi UIKeyboardGetSafeDeviceIdiom() tra ve iPad (1).
-// Ham nay duoc hook de tra ve 1, rieng luc tinh padding/chieu rong thi tra ve gia tri that de bo cuc iPhone khong vo.
-static BOOL gKbIdiom = YES;
-static long (*orig_KbIdiom)(void);
-static long new_KbIdiom(void) {
-    if (gKbPadOn && gKbIdiom) return 1;
-    return orig_KbIdiom ? orig_KbIdiom() : 0;
-}
-
-static BOOL KbSendBool(id target, SEL s) {
-    if (target && [target respondsToSelector:s]) return ((BOOL (*)(id, SEL))objc_msgSend)(target, s);
-    return NO;
-}
-
-static BOOL KbHasHome(void) {
-    static BOOL v, done;
-    if (!done) {
-        SEL s = NSSelectorFromString(@"_hasHomeButton");
-        v = KbSendBool((id)UIDevice.class, s) || KbSendBool(UIDevice.currentDevice, s);
-        done = YES;
-    }
-    return v;
-}
-
-static BOOL KbFloating(void) {
-    return KbSendBool((id)NSClassFromString(@"UIKeyboardImpl"), NSSelectorFromString(@"isFloating"));
-}
-
-static CGFloat KbAdjust(void) { return (!KbHasHome() && KbFloating()) ? -25.0 : 0.0; }
-
-static UIEdgeInsets (*orig_kbPad)(id, SEL, long long, id);
-static UIEdgeInsets new_kbPad(id self, SEL _cmd, long long o, id m) {
-    if (!gKbPadOn) return orig_kbPad(self, _cmd, o, m);
-    gKbIdiom = NO;
-    UIEdgeInsets r = orig_kbPad(self, _cmd, o, m);
-    gKbIdiom = YES;
-    return r;
-}
-
-static CGRect (*orig_dockBounds)(id, SEL);
-static CGRect new_dockBounds(id self, SEL _cmd) {
-    CGRect r = orig_dockBounds(self, _cmd);
-    if (gKbPadOn) r.origin.y = KbAdjust();
-    return r;
-}
-
-static CGFloat (*orig_centerW)(id, SEL, id, long long);
-static CGFloat new_centerW(id self, SEL _cmd, id tc, long long o) {
-    if (!gKbPadOn) return orig_centerW(self, _cmd, tc, o);
-    gKbIdiom = NO;
-    CGFloat w = orig_centerW(self, _cmd, tc, o);
-    gKbIdiom = YES;
-    return trunc(w);
-}
-
-static void (*orig_setItems)(id, SEL, id);
-static void new_setItems(id self, SEL _cmd, id resp) {
-    if (gKbPadOn) gKbIdiom = YES;
-    orig_setItems(self, _cmd, resp);
-    gKbIdiom = YES;
-}
-
-static UIEdgeInsets (*orig_inPad)(id, SEL);
-static UIEdgeInsets new_inPad(id self, SEL _cmd) {
-    UIEdgeInsets r = orig_inPad(self, _cmd);
-    if (gKbPadOn && !KbHasHome() && KbFloating()) r.bottom += -25.0;
-    return r;
-}
-
-static void KbHookMethod(const char *cls, NSString *selName, BOOL meta, IMP rep, IMP *orig) {
-    Class c = objc_getClass(cls);
-    if (!c) return;
-    if (meta) c = object_getClass(c);
-    SEL sel = NSSelectorFromString(selName);
-    if (!c || !class_getInstanceMethod(c, sel)) return;
-    MSHookMessageEx(c, sel, rep, orig);
-}
-
-static void InstallKbBar(void) {
-    KbHookMethod("UIKeyboardImpl", @"deviceSpecificPaddingForInterfaceOrientation:inputMode:", YES, (IMP)new_kbPad, (IMP *)&orig_kbPad);
-    KbHookMethod("UIKeyboardDockView", @"bounds", NO, (IMP)new_dockBounds, (IMP *)&orig_dockBounds);
-    KbHookMethod("UISystemInputAssistantViewController", @"_centerViewWidthForTraitCollection:interfaceOrientation:", NO, (IMP)new_centerW, (IMP *)&orig_centerW);
-    KbHookMethod("UISystemInputAssistantViewController", @"setInputAssistantButtonItemsForResponder:", NO, (IMP)new_setItems, (IMP *)&orig_setItems);
-    KbHookMethod("UIInputWindowControllerHosting", @"_inputViewPadding", NO, (IMP)new_inPad, (IMP *)&orig_inPad);
-    void *fn = dlsym(RTLD_DEFAULT, "UIKeyboardGetSafeDeviceIdiom");
-    if (!fn) {
-        void *h = dlopen("/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore", RTLD_NOW);
-        if (h) fn = dlsym(h, "UIKeyboardGetSafeDeviceIdiom");
-    }
-    if (fn) MSHookFunction(fn, (void *)new_KbIdiom, (void **)&orig_KbIdiom);
-}
-
-
 // ---- Thanh nut Hoan tac / Lam lai / Sao chep / Cat / Dan canh phim dia cau (nguyen ly ActionBar) ----
 // Khong phu thuoc UIKeyboardGetSafeDeviceIdiom: tu them UIStackView vao UIKeyboardDockView va gui
 // copy:/cut:/paste: toi first responder qua -[UIApplication sendAction:to:nil], nen khong dung API rieng tu cua iOS.
@@ -2838,12 +2729,28 @@ static UIStackView *KbMakeGroup(NSArray<NSNumber *> *tags) {
             case 11: [bs addObject:KbMakeButton(11, @"U",        @"underline")]; break;
         }
     }
+    for (UIButton *b in bs)
+        [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightRegular]
+                           forImageInState:UIControlStateNormal];
     UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:bs];
     sv.axis = UILayoutConstraintAxisHorizontal;
     sv.distribution = UIStackViewDistributionFillEqually;
     sv.alignment = UIStackViewAlignmentFill;
     sv.spacing = 0;
     return sv;
+}
+
+// Tam doc trung binh cua cac chu goi y (UILabel) trong hang goi y, theo toa do cua P
+static void KbLabelMids(UIView *root, UIView *P, UIView *skipA, UIView *skipB, int depth, CGFloat *sum, int *cnt) {
+    if (depth > 7) return;
+    for (UIView *v in root.subviews) {
+        if (v == skipA || v == skipB || v.hidden || v.alpha < 0.05) continue;
+        if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length) {
+            CGRect f = [P convertRect:v.bounds fromView:v];
+            *sum += CGRectGetMidY(f); (*cnt)++;
+        }
+        KbLabelMids(v, P, skipA, skipB, depth + 1, sum, cnt);
+    }
 }
 
 static void KbTopPlace(UIView *P) {
@@ -2868,7 +2775,11 @@ static void KbTopPlace(UIView *P) {
     if (L.superview != P) [P addSubview:L];
     if (R.superview != P) [P addSubview:R];
     CGRect pb = P.bounds;
-    CGFloat bw = 34.0, gw = bw * 3.0, h = MIN(pb.size.height, 40.0), y = (pb.size.height - h) / 2.0;
+    CGFloat bw = 30.0, gw = bw * 3.0, h = MIN(pb.size.height, 36.0);
+    CGFloat sum = 0; int cnt = 0;
+    KbLabelMids(P, P, L, R, 0, &sum, &cnt);
+    CGFloat cy = cnt ? sum / cnt : pb.size.height / 2.0;   // cung hang voi chu goi y
+    CGFloat y = cy - h / 2.0;
     L.frame = CGRectMake(6.0, y, gw, h);
     R.frame = CGRectMake(pb.size.width - gw - 6.0, y, gw, h);
     // Thu hep phan goi y vao giua de khong bi de len
@@ -3022,14 +2933,13 @@ static void ClearCrash(void) {
     @autoreleasepool {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
-        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbPadKey: @NO, kKbTopKey: @NO }];
+        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbTopKey: @NO }];
         InstallSignals();
         InstallEH(0);
         gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
         %init(AACContents);
-        InstallKbBar();
         InstallDockBar();
     }
 }
