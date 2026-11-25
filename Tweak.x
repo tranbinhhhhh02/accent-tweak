@@ -2730,7 +2730,7 @@ static UIStackView *KbMakeGroup(NSArray<NSNumber *> *tags) {
         }
     }
     for (UIButton *b in bs)
-        [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightRegular]
+        [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightRegular]
                            forImageInState:UIControlStateNormal];
     UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:bs];
     sv.axis = UILayoutConstraintAxisHorizontal;
@@ -2750,6 +2750,19 @@ static void KbLabelMids(UIView *root, UIView *P, UIView *skipA, UIView *skipB, i
             *sum += CGRectGetMidY(f); (*cnt)++;
         }
         KbLabelMids(v, P, skipA, skipB, depth + 1, sum, cnt);
+    }
+}
+
+// Du phong: chu goi y ve bang CATextLayer
+static void KbTextLayerMids(CALayer *root, CALayer *P, CALayer *skipA, CALayer *skipB, int depth, CGFloat *sum, int *cnt) {
+    if (depth > 8) return;
+    for (CALayer *l in root.sublayers) {
+        if (l == skipA || l == skipB || l.hidden || l.opacity < 0.05) continue;
+        if ([l isKindOfClass:CATextLayer.class] && ((CATextLayer *)l).string) {
+            CGRect f = [P convertRect:l.bounds fromLayer:l];
+            *sum += CGRectGetMidY(f); (*cnt)++;
+        }
+        KbTextLayerMids(l, P, skipA, skipB, depth + 1, sum, cnt);
     }
 }
 
@@ -2778,7 +2791,17 @@ static void KbTopPlace(UIView *P) {
     CGFloat bw = 30.0, gw = bw * 3.0, h = MIN(pb.size.height, 36.0);
     CGFloat sum = 0; int cnt = 0;
     KbLabelMids(P, P, L, R, 0, &sum, &cnt);
-    CGFloat cy = cnt ? sum / cnt : pb.size.height / 2.0;   // cung hang voi chu goi y
+    if (!cnt) KbTextLayerMids(P.layer, P.layer, L.layer, R.layer, 0, &sum, &cnt);
+    CGFloat cy = pb.size.height / 2.0;
+    if (cnt) cy = sum / cnt;                               // cung hang voi chu goi y
+    else {                                                 // du phong: tam doc cua khung chua cac o goi y
+        for (UIView *sv in P.subviews) {
+            if (sv == L || sv == R || sv.hidden) continue;
+            NSValue *o = objc_getAssociatedObject(sv, kKbTopOrig);
+            CGRect f = o ? o.CGRectValue : sv.frame;
+            if (f.size.width >= pb.size.width * 0.8 && f.size.height >= 20) { cy = CGRectGetMidY(f); break; }
+        }
+    }
     CGFloat y = cy - h / 2.0;
     L.frame = CGRectMake(6.0, y, gw, h);
     R.frame = CGRectMake(pb.size.width - gw - 6.0, y, gw, h);
