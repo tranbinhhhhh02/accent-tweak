@@ -2766,6 +2766,33 @@ static void KbTextLayerMids(CALayer *root, CALayer *P, CALayer *skipA, CALayer *
     }
 }
 
+// Tam doc cua cac vach ngan cach giua cac goi y (view rong <= 2.5pt): trung voi tam chu goi y
+static void KbSeparatorMids(UIView *root, UIView *P, UIView *skipA, UIView *skipB, int depth, CGFloat *sum, int *cnt) {
+    if (depth > 7) return;
+    for (UIView *v in root.subviews) {
+        if (v == skipA || v == skipB || v.hidden || v.alpha < 0.05) continue;
+        CGRect f = [P convertRect:v.bounds fromView:v];
+        if (f.size.width > 0 && f.size.width <= 2.5 && f.size.height >= 12 && f.size.height <= 45) {
+            *sum += CGRectGetMidY(f); (*cnt)++;
+            continue;
+        }
+        KbSeparatorMids(v, P, skipA, skipB, depth + 1, sum, cnt);
+    }
+}
+
+static void KbSeparatorLayerMids(CALayer *root, CALayer *P, CALayer *skipA, CALayer *skipB, int depth, CGFloat *sum, int *cnt) {
+    if (depth > 8) return;
+    for (CALayer *l in root.sublayers) {
+        if (l == skipA || l == skipB || l.hidden || l.opacity < 0.05) continue;
+        CGRect f = [P convertRect:l.bounds fromLayer:l];
+        if (f.size.width > 0 && f.size.width <= 2.5 && f.size.height >= 12 && f.size.height <= 45) {
+            *sum += CGRectGetMidY(f); (*cnt)++;
+            continue;
+        }
+        KbSeparatorLayerMids(l, P, skipA, skipB, depth + 1, sum, cnt);
+    }
+}
+
 static void KbTopPlace(UIView *P) {
     UIStackView *L = objc_getAssociatedObject(P, kKbTopL);
     UIStackView *R = objc_getAssociatedObject(P, kKbTopR);
@@ -2790,7 +2817,9 @@ static void KbTopPlace(UIView *P) {
     CGRect pb = P.bounds;
     CGFloat bw = 30.0, gw = bw * 3.0, h = MIN(pb.size.height, 36.0);
     CGFloat sum = 0; int cnt = 0;
-    KbLabelMids(P, P, L, R, 0, &sum, &cnt);
+    KbSeparatorMids(P, P, L, R, 0, &sum, &cnt);            // 1) vach ngan cach giua cac goi y
+    if (!cnt) KbSeparatorLayerMids(P.layer, P.layer, L.layer, R.layer, 0, &sum, &cnt);   // vach la CALayer
+    if (!cnt) KbLabelMids(P, P, L, R, 0, &sum, &cnt);      // 2) UILabel cua chu goi y
     if (!cnt) KbTextLayerMids(P.layer, P.layer, L.layer, R.layer, 0, &sum, &cnt);
     CGFloat cy = pb.size.height / 2.0;
     if (cnt) cy = sum / cnt;                               // cung hang voi chu goi y
@@ -2799,7 +2828,7 @@ static void KbTopPlace(UIView *P) {
             if (sv == L || sv == R || sv.hidden) continue;
             NSValue *o = objc_getAssociatedObject(sv, kKbTopOrig);
             CGRect f = o ? o.CGRectValue : sv.frame;
-            if (f.size.width >= pb.size.width * 0.8 && f.size.height >= 20) { cy = CGRectGetMidY(f); break; }
+            if (f.size.width >= pb.size.width * 0.8 && f.size.height >= 20) { cy = CGRectGetMidY(f) + 3.0; break; }   // chu goi y nam thap hon tam khung ~3pt
         }
     }
     CGFloat y = cy - h / 2.0;
