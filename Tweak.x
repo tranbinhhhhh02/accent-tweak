@@ -2632,12 +2632,38 @@ static UIResponder *KbFirstResponder(void) {
 - (void)tap:(UIButton *)b;
 @end
 
-static void KbUpdateUndoState(UIStackView *bar) {
-    NSUndoManager *um = KbFirstResponder().undoManager;
-    for (UIButton *b in bar.arrangedSubviews) {
-        if (![b isKindOfClass:UIButton.class]) continue;
-        if (b.tag == 0) b.enabled = um ? um.canUndo : NO;
-        if (b.tag == 1) b.enabled = um ? um.canRedo : NO;
+static id KbObjSend(id t, NSString *sel) {
+    SEL s = NSSelectorFromString(sel);
+    if (t && [t respondsToSelector:s]) return ((id (*)(id, SEL))objc_msgSend)(t, s);
+    return nil;
+}
+
+// Gom moi NSUndoManager co the chua lich su go phim: first responder, delegate cua ban phim, chuoi responder
+static NSArray<NSUndoManager *> *KbUndoManagers(void) {
+    NSMutableArray *out = [NSMutableArray new];
+    void (^add)(id) = ^(id o) {
+        NSUndoManager *um = nil;
+        if ([o isKindOfClass:UIResponder.class]) um = ((UIResponder *)o).undoManager;
+        else um = KbObjSend(o, @"undoManager");
+        if ([um isKindOfClass:NSUndoManager.class] && ![out containsObject:um]) [out addObject:um];
+    };
+    UIResponder *fr = KbFirstResponder();
+    add(fr);
+    id impl = KbObjSend((id)NSClassFromString(@"UIKeyboardImpl"), @"activeInstance");
+    add(KbObjSend(impl, @"privateInputDelegate"));
+    add(KbObjSend(impl, @"inputDelegate"));
+    add(KbObjSend(fr, @"_responderWindow"));
+    if ([fr isKindOfClass:UIView.class]) add(((UIView *)fr).window);
+    return out;
+}
+
+static void KbUndoRedo(BOOL redo) {
+    for (NSUndoManager *um in KbUndoManagers()) {
+        if (redo ? um.canRedo : um.canUndo) {
+            if (um.groupingLevel > 0) [um endUndoGrouping];
+            if (redo) [um redo]; else [um undo];
+            return;
+        }
     }
 }
 
@@ -2651,14 +2677,13 @@ static void KbUpdateUndoState(UIStackView *bar) {
     @try {
         UIApplication *app = UIApplication.sharedApplication;
         switch (b.tag) {
-            case 0: { NSUndoManager *um = KbFirstResponder().undoManager; if (um.canUndo) [um undo]; break; }
-            case 1: { NSUndoManager *um = KbFirstResponder().undoManager; if (um.canRedo) [um redo]; break; }
+            case 0: KbUndoRedo(NO); break;
+            case 1: KbUndoRedo(YES); break;
             case 2: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
             case 3: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
             case 4: [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil]; break;
         }
         [[UIImpactFeedbackGenerator new] impactOccurred];
-        if ([b.superview isKindOfClass:UIStackView.class]) KbUpdateUndoState((UIStackView *)b.superview);
     } @catch (__unused id x) {}
 }
 @end
@@ -2687,15 +2712,31 @@ static UIButton *KbMakeButton(NSInteger tag, NSString *title, NSString *symbol) 
 static UIStackView *KbMakeBar(void) {
     NSArray *items = @[ KbMakeButton(0, @"Hoàn tác", @"arrow.uturn.backward"),
                         KbMakeButton(1, @"Làm lại",  @"arrow.uturn.forward"),
-                        KbMakeButton(2, @"Sao chép", nil),
-                        KbMakeButton(3, @"Cắt",      nil),
-                        KbMakeButton(4, @"Dán",      nil) ];
+                        KbMakeButton(2, @"Sao chép", @"doc.on.doc"),
+                        KbMakeButton(3, @"Cắt",      @"scissors"),
+                        KbMakeButton(4, @"Dán",      @"doc.on.clipboard") ];
     UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:items];
     sv.axis = UILayoutConstraintAxisHorizontal;
     sv.distribution = UIStackViewDistributionFillEqually;
     sv.alignment = UIStackViewAlignmentFill;
     sv.spacing = 6;
     return sv;
+}
+
+// Thu thap cac nut nho (phim dia cau, nut ben phai) trong dock theo toa do cua dock
+static void KbCollectItems(UIView *root, UIView *dock, UIView *skip, int depth, NSMutableArray *out) {
+    if (depth > 3) return;
+    for (UIView *v in root.subviews) {
+        if (v == skip || v.hidden || v.alpha < 0.05) continue;
+        CGRect f = [dock convertRect:v.bounds fromView:v];
+        BOOL small = f.size.width >= 20 && f.size.width <= 100 && f.size.height >= 20 && f.size.height <= 100;
+        if (small && ([v isKindOfClass:UIControl.class] || NSClassFromString(@"UIKeyboardDockItemButton") == v.class ||
+                      [NSStringFromClass(v.class) containsString:@"DockItem"])) {
+            [out addObject:[NSValue valueWithCGRect:f]];
+            continue;
+        }
+        KbCollectItems(v, dock, skip, depth + 1, out);
+    }
 }
 
 static void KbBarPlace(UIView *dock) {
@@ -2710,19 +2751,30 @@ static void KbBarPlace(UIView *dock) {
     }
     if (bar.superview != dock) [dock addSubview:bar];
     CGRect b = dock.bounds;
-    CGFloat w = MIN(b.size.width - 150.0, 340.0);
-    if (w < 200.0 || b.size.height < 20.0) { bar.hidden = YES; return; }
-    bar.hidden = NO;
-    CGFloat cy = b.size.height / 2.0;
-    for (UIView *v in dock.subviews) {   // can theo giua nut dia cau
-        if (v == bar || v.hidden || v.frame.size.width < 20 || v.frame.size.width > 90) continue;
-        cy = CGRectGetMidY(v.frame);
-        break;
+    if (b.size.height < 20.0) { bar.hidden = YES; return; }
+
+    NSMutableArray *items = [NSMutableArray new];
+    KbCollectItems(dock, dock, bar, 0, items);
+    CGFloat cy = b.size.height / 2.0, left = 64.0, right = b.size.width - 64.0;
+    if (items.count) {
+        CGFloat sumY = 0, lmax = -1, rmin = CGFLOAT_MAX;
+        for (NSValue *val in items) {
+            CGRect f = val.CGRectValue;
+            sumY += CGRectGetMidY(f);
+            if (CGRectGetMidX(f) < b.size.width / 2.0) lmax = MAX(lmax, CGRectGetMaxX(f));
+            else rmin = MIN(rmin, CGRectGetMinX(f));
+        }
+        cy = sumY / items.count;                  // cung hang voi icon qua dia cau
+        if (lmax > 0) left = lmax + 10.0;
+        if (rmin < CGFLOAT_MAX) right = rmin - 10.0;
     }
-    CGFloat h = MIN(36.0, b.size.height - 4.0);
-    bar.frame = CGRectMake((b.size.width - w) / 2.0, cy - h / 2.0, w, h);
+    CGFloat w = MIN(right - left, 300.0);
+    if (w < 150.0) { bar.hidden = YES; return; }
+    bar.hidden = NO;
+    CGFloat h = 34.0;
+    CGFloat cx = (left + right) / 2.0;            // can giua khoang giua 2 nut
+    bar.frame = CGRectMake(cx - w / 2.0, cy - h / 2.0, w, h);
     [dock bringSubviewToFront:bar];
-    KbUpdateUndoState(bar);
 }
 
 static void KbBarRefreshAll(void) {
