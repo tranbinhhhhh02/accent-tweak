@@ -1712,6 +1712,49 @@ static void KbBarRefreshAll(void);
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 56;
+    [self buildAuthorFooter];
+}
+
+- (void)buildAuthorFooter {
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 64)];
+    UILabel *a = [UILabel new];
+    a.text = @"Created by ";
+    a.font = [UIFont systemFontOfSize:13];
+    a.textColor = UIColor.secondaryLabelColor;
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:@"Tran Binh" forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    [b addTarget:self action:@selector(openAuthor) forControlEvents:UIControlEventTouchUpInside];
+    UILabel *c = [UILabel new];
+    c.text = @" \u2661";
+    c.font = [UIFont systemFontOfSize:13];
+    c.textColor = UIColor.secondaryLabelColor;
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[a, b, c]];
+    st.axis = UILayoutConstraintAxisHorizontal;
+    st.alignment = UIStackViewAlignmentCenter;
+    st.spacing = 0;
+    st.translatesAutoresizingMaskIntoConstraints = NO;
+    [box addSubview:st];
+    [NSLayoutConstraint activateConstraints:@[
+        [st.centerXAnchor constraintEqualToAnchor:box.centerXAnchor],
+        [st.centerYAnchor constraintEqualToAnchor:box.centerYAnchor]
+    ]];
+    self.tableView.tableFooterView = box;
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    UIView *f = self.tableView.tableFooterView;
+    CGFloat w = self.tableView.bounds.size.width;
+    if (f && w > 0 && fabs(f.frame.size.width - w) > 0.5) {
+        f.frame = CGRectMake(0, 0, w, 64);
+        self.tableView.tableFooterView = f;
+    }
+}
+
+- (void)openAuthor {
+    NSURL *u = [NSURL URLWithString:@"https://www.facebook.com/profile.php?id=100091902503211"];
+    if (u) [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
 }
 
 - (void)close { [self dismissViewControllerAnimated:YES completion:^{ ClosePanelWindow(); }]; }
@@ -1736,7 +1779,7 @@ static void KbBarRefreshAll(void);
             ks.on = [d boolForKey:kKbBarKey];
             [ks addTarget:self action:@selector(kbBarChanged:) forControlEvents:UIControlEventValueChanged];
         } else if (ip.row == 1) {
-            cell.textLabel.text = @"Dạng TrollPad (lên trên)";
+            cell.textLabel.text = @"Dạng TrollPad";
             ks.on = [d boolForKey:kKbTopKey];
             [ks addTarget:self action:@selector(kbTopChanged:) forControlEvents:UIControlEventValueChanged];
         }
@@ -2578,6 +2621,48 @@ static void KbHideKeyboard(void) {
     [fr resignFirstResponder];
 }
 
+// Sao chep: co chon -> chep phan chon; khong chon -> chep TOAN BO noi dung o nhap (Copy All)
+static NSString *KbTextToCopy(UIResponder *fr, BOOL *hadSel) {
+    *hadSel = NO;
+    if (![fr conformsToProtocol:@protocol(UITextInput)]) return nil;
+    id<UITextInput> ti = (id<UITextInput>)fr;
+    NSString *str = nil;
+    UITextRange *sel = ti.selectedTextRange;
+    if (sel && !sel.isEmpty) {
+        *hadSel = YES;
+        str = [ti textInRange:sel];
+    }
+    if (!str.length) {
+        UITextPosition *b = ti.beginningOfDocument, *e = ti.endOfDocument;
+        if (b && e) {
+            UITextRange *all = [ti textRangeFromPosition:b toPosition:e];
+            if (all && !all.isEmpty) str = [ti textInRange:all];
+        }
+    }
+    return str;
+}
+
+static void KbCopyAll(void) {
+    UIApplication *app = UIApplication.sharedApplication;
+    UIResponder *fr = KbFirstResponder();
+    BOOL hadSel = NO;
+    NSString *str = KbTextToCopy(fr, &hadSel);
+    if (hadSel) {   // co vung chon: dung copy: he thong de giu dinh dang, that bai thi chep chu thuong
+        NSInteger cc = UIPasteboard.generalPasteboard.changeCount;
+        BOOL ok = [app sendAction:@selector(copy:) to:nil from:nil forEvent:nil];
+        if (ok && UIPasteboard.generalPasteboard.changeCount != cc) return;
+    }
+    if (str.length) {
+        UIPasteboard.generalPasteboard.string = str;
+        return;
+    }
+    // Du phong: o nhap khong theo UITextInput -> chon het roi copy:
+    if (![app sendAction:@selector(copy:) to:nil from:nil forEvent:nil]) {
+        [app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil];
+        [app sendAction:@selector(copy:) to:nil from:nil forEvent:nil];
+    }
+}
+
 static void KbUndoRedo(BOOL redo) {
     for (NSUndoManager *um in KbUndoManagers()) {
         if (redo ? um.canRedo : um.canUndo) {
@@ -2601,7 +2686,7 @@ static void KbUndoRedo(BOOL redo) {
             case 0: KbUndoRedo(NO); break;
             case 1: KbUndoRedo(YES); break;
             case 2: [app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil]; break;
-            case 3: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
+            case 3: KbCopyAll(); break;
             case 4: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
             case 5: {
                 BOOL ok = [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil];
