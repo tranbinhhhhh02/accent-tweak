@@ -2603,7 +2603,15 @@ static void KbUndoRedo(BOOL redo) {
             case 2: [app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil]; break;
             case 3: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
             case 4: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
-            case 5: [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil]; break;
+            case 5: {
+                BOOL ok = [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil];
+                if (!ok) {   // du phong: o nhap khong nhan paste: -> tu chen noi dung clipboard
+                    NSString *str = UIPasteboard.generalPasteboard.string;
+                    UIResponder *fr = KbFirstResponder();
+                    if (str.length && [fr conformsToProtocol:@protocol(UIKeyInput)]) [(id<UIKeyInput>)fr insertText:str];
+                }
+                break;
+            }
             case 6: KbMoveCursor(-1); break;
             case 7: KbMoveCursor(1); break;
             case 8: KbHideKeyboard(); break;
