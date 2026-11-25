@@ -1719,7 +1719,7 @@ static void ClearCrash(void);
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 1 ? @"Bàn phím" : @"Thay màu nhấn"; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return s == 1 ? @"Hiện thanh phím tắt phía trên bàn phím: hoàn tác, làm lại, dán, in đậm/nghiêng/gạch chân và gợi ý từ. Mở lại bàn phím (hoặc mở lại ứng dụng) để áp dụng." : nil;
+    return s == 1 ? @"Hiện thanh phím tắt phía trên bàn phím: hoàn tác, làm lại, dán, in đậm/nghiêng/gạch chân và gợi ý từ. Thay đổi được áp dụng ngay; nếu chưa thấy, hãy mở lại bàn phím." : nil;
 }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1793,6 +1793,12 @@ static void ClearCrash(void);
 - (void)kbBarChanged:(UISwitch *)sw {
     [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKbBarKey];
     gKbBarOn = sw.isOn;
+    // Ap dung ngay: yeu cau ban phim dang mo nap lai thanh phim tat (khong can mo lai ban phim)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            [UIApplication.sharedApplication sendAction:@selector(reloadInputViews) to:nil from:nil forEvent:nil];
+        } @catch (__unused id x) {}
+    });
 }
 
 - (void)editHex {
