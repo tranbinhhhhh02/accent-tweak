@@ -2632,7 +2632,7 @@ static UIButton *KbMakeButton(NSInteger tag, NSString *title, NSString *symbol) 
     b.tintColor = UIColor.labelColor;
     [b setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
     b.backgroundColor = UIColor.clearColor;
-    [b addTarget:[AACKbActions shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    [b addTarget:[AACKbActions shared] action:@selector(tap:) forControlEvents:UIControlEventTouchDown];
     return b;
 }
 
@@ -2832,7 +2832,9 @@ static void KbTopPlace(UIView *P) {
         }
     }
     static const CGFloat kTopNudge = 5.0;   // nang icon len (pt); doi so nay neu can lech them
-    CGFloat y = cy - h / 2.0 - kTopNudge;
+    CGFloat cc = cy - kTopNudge;                  // tam icon sau khi nang
+    h = MAX(24.0, MIN(h, 2.0 * cc));              // giu khung nut trong P de van nhan duoc cham
+    CGFloat y = cc - h / 2.0;
     L.frame = CGRectMake(6.0, y, gw, h);
     R.frame = CGRectMake(pb.size.width - gw - 6.0, y, gw, h);
     // Thu hep phan goi y vao giua de khong bi de len
@@ -2846,6 +2848,26 @@ static void KbTopPlace(UIView *P) {
         }
     }
     [P bringSubviewToFront:L]; [P bringSubviewToFront:R];
+    // Dam bao cham duoc vao nut: hang goi y va cac view cha khong duoc tat tuong tac
+    L.userInteractionEnabled = YES; R.userInteractionEnabled = YES;
+    int up = 0;
+    for (UIView *a = P; a && up < 8; a = a.superview, up++) a.userInteractionEnabled = YES;
+}
+
+static UIView *(*orig_topHit)(id, SEL, CGPoint, UIEvent *);
+static UIView *new_topHit(id self, SEL _cmd, CGPoint pt, UIEvent *ev) {
+    @try {
+        UIView *P = (UIView *)self;
+        const void *keys[2] = { kKbTopL, kKbTopR };
+        for (int i = 0; i < 2; i++) {
+            UIStackView *g = objc_getAssociatedObject(P, keys[i]);
+            if (g && g.superview == P && !g.hidden && CGRectContainsPoint(g.frame, pt)) {
+                UIView *h = [g hitTest:[g convertPoint:pt fromView:P] withEvent:ev];
+                if (h) return h;
+            }
+        }
+    } @catch (__unused id x) {}
+    return orig_topHit ? orig_topHit(self, _cmd, pt, ev) : nil;
 }
 
 static void new_topLayout(id self, SEL _cmd) {
@@ -2897,6 +2919,7 @@ static void new_dockLayout(id self, SEL _cmd) {
                 if (!gTopHooked && P.class != UIView.class) {
                     gTopHooked = YES;
                     MSHookMessageEx(P.class, @selector(layoutSubviews), (IMP)new_topLayout, (IMP *)&orig_topLayout);
+                    MSHookMessageEx(P.class, @selector(hitTest:withEvent:), (IMP)new_topHit, (IMP *)&orig_topHit);
                 }
                 KbTopPlace(P);
                 return;
