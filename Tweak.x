@@ -2717,6 +2717,40 @@ static NSHashTable *gTops;
 static BOOL gTopHooked;
 static void (*orig_topLayout)(id, SEL);
 
+// Ve lai SF Symbol vao khung vuong co dinh, can theo tam hien thi thuc te cua net ve (bo qua khoang trong/baseline
+// cua tung symbol), de B/I/U/hoan tac/dan nam cung mot truc ngang.
+static UIImage *KbCenteredSymbol(NSString *name, CGFloat pt) {
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:pt weight:UIImageSymbolWeightRegular];
+    UIImage *img = [UIImage systemImageNamed:name withConfiguration:cfg];
+    if (!img || !img.CGImage) return img;
+    CGFloat scale = UIScreen.mainScreen.scale;
+    size_t w = (size_t)ceil(img.size.width * scale), h = (size_t)ceil(img.size.height * scale);
+    if (w == 0 || h == 0) return img;
+    uint8_t *buf = calloc(w * h, 1);
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w, NULL, (CGBitmapInfo)kCGImageAlphaOnly);
+    if (!ctx) { free(buf); return img; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img.CGImage);
+    size_t minX = w, maxX = 0, minY = h, maxY = 0;
+    for (size_t y = 0; y < h; y++)
+        for (size_t x = 0; x < w; x++)
+            if (buf[y * w + x] > 20) {
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+            }
+    CGContextRelease(ctx); free(buf);
+    if (maxX < minX || maxY < minY) return img;
+    CGFloat cx = ((CGFloat)(minX + maxX + 1) / 2.0) / scale;
+    CGFloat cy = ((CGFloat)(minY + maxY + 1) / 2.0) / scale;   // du lieu bitmap di tu tren xuong, khop he toa do UIKit
+    CGFloat S = ceil(pt * 1.8);
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = scale; fmt.opaque = NO;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(S, S) format:fmt];
+    UIImage *out = [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        [[img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal] drawAtPoint:CGPointMake(S / 2.0 - cx, S / 2.0 - cy)];
+    }];
+    return [out imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
 static UIStackView *KbMakeGroup(NSArray<NSNumber *> *tags) {
     NSMutableArray *bs = [NSMutableArray new];
     for (NSNumber *n in tags) {
@@ -2729,9 +2763,12 @@ static UIStackView *KbMakeGroup(NSArray<NSNumber *> *tags) {
             case 11: [bs addObject:KbMakeButton(11, @"U",        @"underline")]; break;
         }
     }
-    for (UIButton *b in bs)
-        [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightRegular]
-                           forImageInState:UIControlStateNormal];
+    NSDictionary *syms = @{ @0: @"arrow.uturn.backward", @1: @"arrow.uturn.forward", @5: @"doc.on.clipboard",
+                            @9: @"bold", @10: @"italic", @11: @"underline" };
+    for (UIButton *b in bs) {
+        UIImage *ci = KbCenteredSymbol(syms[@(b.tag)], 20);
+        if (ci) { [b setImage:ci forState:UIControlStateNormal]; b.imageView.contentMode = UIViewContentModeCenter; }
+    }
     UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:bs];
     sv.axis = UILayoutConstraintAxisHorizontal;
     sv.distribution = UIStackViewDistributionFillEqually;
@@ -2815,7 +2852,7 @@ static void KbTopPlace(UIView *P) {
     if (L.superview != P) [P addSubview:L];
     if (R.superview != P) [P addSubview:R];
     CGRect pb = P.bounds;
-    CGFloat bw = 30.0, gw = bw * 3.0, h = MIN(pb.size.height, 36.0);
+    CGFloat bw = 36.0, gw = bw * 3.0, h = MIN(pb.size.height, 36.0);
     CGFloat sum = 0; int cnt = 0;
     KbSeparatorMids(P, P, L, R, 0, &sum, &cnt);            // 1) vach ngan cach giua cac goi y
     if (!cnt) KbSeparatorLayerMids(P.layer, P.layer, L.layer, R.layer, 0, &sum, &cnt);   // vach la CALayer
@@ -2831,7 +2868,7 @@ static void KbTopPlace(UIView *P) {
             if (f.size.width >= pb.size.width * 0.8 && f.size.height >= 20) { cy = CGRectGetMidY(f) + 3.0; break; }   // chu goi y nam thap hon tam khung ~3pt
         }
     }
-    static const CGFloat kTopNudge = 5.0;   // nang icon len (pt); doi so nay neu can lech them
+    static const CGFloat kTopNudge = 0.0;   // nang icon len (pt); doi so nay neu can lech them
     CGFloat cc = cy - kTopNudge;                  // tam icon sau khi nang
     h = MAX(24.0, MIN(h, 2.0 * cc));              // giu khung nut trong P de van nhan duoc cham
     CGFloat y = cc - h / 2.0;
@@ -2936,7 +2973,50 @@ static void new_dockLayout(id self, SEL _cmd) {
     } @catch (__unused id x) {}
 }
 
+// Nhan cham o muc UIWindow cho dang TrollPad: hang goi y co the nuot/huy cham truoc khi toi nut,
+// nen tu tim nut duoi ngon tay va chay hanh dong, sau do nuot cham de khong chon nham goi y.
+static void (*orig_winSend)(id, SEL, UIEvent *);
+static __weak UITouch *gSwallow;
+
+static UIButton *KbTopButtonAt(UITouch *t) {
+    if (!(gKbBarOn && gKbTopOn) || !t.window) return nil;
+    const void *keys[2] = { kKbTopL, kKbTopR };
+    for (UIView *P in [gTops allObjects]) {
+        if (P.window != t.window || P.hidden) continue;
+        for (int i = 0; i < 2; i++) {
+            UIStackView *g = objc_getAssociatedObject(P, keys[i]);
+            if (!g || g.hidden || g.superview != P) continue;
+            CGPoint pt = [t locationInView:g];
+            if (![g pointInside:pt withEvent:nil]) continue;
+            for (UIView *b in g.arrangedSubviews)
+                if ([b isKindOfClass:UIButton.class] && CGRectContainsPoint(b.frame, pt)) return (UIButton *)b;
+        }
+    }
+    return nil;
+}
+
+static void new_winSend(id self, SEL _cmd, UIEvent *event) {
+    @try {
+        if (event.type == UIEventTypeTouches && gTops.count > 0) {
+            NSSet *ts = event.allTouches;
+            if (ts.count == 1) {
+                UITouch *t = ts.anyObject;
+                if (t == gSwallow) {
+                    if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) gSwallow = nil;
+                    return;
+                }
+                if (t.phase == UITouchPhaseBegan) {
+                    UIButton *b = KbTopButtonAt(t);
+                    if (b) { gSwallow = t; [[AACKbActions shared] tap:b]; return; }
+                }
+            }
+        }
+    } @catch (__unused id x) {}
+    if (orig_winSend) orig_winSend(self, _cmd, event);
+}
+
 static void InstallDockBar(void) {
+    MSHookMessageEx(UIWindow.class, @selector(sendEvent:), (IMP)new_winSend, (IMP *)&orig_winSend);
     Class c = NSClassFromString(@"UIKeyboardDockView");
     if (!c) {   // du phong: tim lop co ten chua "KeyboardDock" la con cua UIView
         unsigned int n = 0;
