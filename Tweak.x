@@ -2831,7 +2831,8 @@ static void KbTopPlace(UIView *P) {
             if (f.size.width >= pb.size.width * 0.8 && f.size.height >= 20) { cy = CGRectGetMidY(f) + 3.0; break; }   // chu goi y nam thap hon tam khung ~3pt
         }
     }
-    CGFloat y = cy - h / 2.0;
+    static const CGFloat kTopNudge = 5.0;   // nang icon len (pt); doi so nay neu can lech them
+    CGFloat y = cy - h / 2.0 - kTopNudge;
     L.frame = CGRectMake(6.0, y, gw, h);
     R.frame = CGRectMake(pb.size.width - gw - 6.0, y, gw, h);
     // Thu hep phan goi y vao giua de khong bi de len
