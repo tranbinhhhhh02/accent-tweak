@@ -1721,7 +1721,7 @@ static void KbBarRefreshAll(void);
     if (s == 1) return 2;
     return PeekCrash().length ? 4 : 3;
 }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 1 ? @"Bàn phím" : @"Thay màu nhấn"; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 1 ? @"Bàn phím" : @"Màu nhấn"; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     return s == 1 ? @"Thanh phím tắt: hàng nút cạnh phím địa cầu. \"Dạng TrollPad\" chuyển Hoàn tác, Làm lại, Dán sang trái và In đậm/nghiêng/gạch chân sang phải hàng gợi ý từ phía trên bàn phím (cần có hàng gợi ý, nếu không sẽ về dạng thường)." : nil;
 }
