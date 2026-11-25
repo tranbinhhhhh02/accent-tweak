@@ -2657,6 +2657,23 @@ static NSArray<NSUndoManager *> *KbUndoManagers(void) {
     return out;
 }
 
+static void KbMoveCursor(int off) {
+    UIResponder *fr = KbFirstResponder();
+    if (![fr conformsToProtocol:@protocol(UITextInput)]) return;
+    id<UITextInput> ti = (id<UITextInput>)fr;
+    UITextRange *r = ti.selectedTextRange;
+    if (!r) return;
+    UITextPosition *t = r.isEmpty ? [ti positionFromPosition:r.start offset:off] : (off < 0 ? r.start : r.end);
+    if (!t) return;
+    ti.selectedTextRange = [ti textRangeFromPosition:t toPosition:t];
+}
+
+static void KbHideKeyboard(void) {
+    UIResponder *fr = KbFirstResponder();
+    if ([fr isKindOfClass:UIView.class]) [((UIView *)fr).window endEditing:YES];
+    [fr resignFirstResponder];
+}
+
 static void KbUndoRedo(BOOL redo) {
     for (NSUndoManager *um in KbUndoManagers()) {
         if (redo ? um.canRedo : um.canUndo) {
@@ -2679,9 +2696,13 @@ static void KbUndoRedo(BOOL redo) {
         switch (b.tag) {
             case 0: KbUndoRedo(NO); break;
             case 1: KbUndoRedo(YES); break;
-            case 2: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
-            case 3: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
-            case 4: [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil]; break;
+            case 2: [app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil]; break;
+            case 3: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
+            case 4: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
+            case 5: [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil]; break;
+            case 6: KbMoveCursor(-1); break;
+            case 7: KbMoveCursor(1); break;
+            case 8: KbHideKeyboard(); break;
         }
         [[UIImpactFeedbackGenerator new] impactOccurred];
     } @catch (__unused id x) {}
@@ -2703,38 +2724,42 @@ static UIButton *KbMakeButton(NSInteger tag, NSString *title, NSString *symbol) 
     b.titleLabel.minimumScaleFactor = 0.6;
     b.tintColor = UIColor.labelColor;
     [b setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
-    b.backgroundColor = UIColor.tertiarySystemFillColor;
-    b.layer.cornerRadius = 8;
+    b.backgroundColor = UIColor.clearColor;
+    [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightRegular]
+                    forImageInState:UIControlStateNormal];
     [b addTarget:[AACKbActions shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
 
 static UIStackView *KbMakeBar(void) {
-    NSArray *items = @[ KbMakeButton(0, @"Hoàn tác", @"arrow.uturn.backward"),
-                        KbMakeButton(1, @"Làm lại",  @"arrow.uturn.forward"),
-                        KbMakeButton(2, @"Sao chép", @"doc.on.doc"),
-                        KbMakeButton(3, @"Cắt",      @"scissors"),
-                        KbMakeButton(4, @"Dán",      @"doc.on.clipboard") ];
+    NSArray *items = @[ KbMakeButton(0, @"Hoàn tác",  @"arrow.uturn.backward"),
+                        KbMakeButton(1, @"Làm lại",   @"arrow.uturn.forward"),
+                        KbMakeButton(2, @"Chọn hết",  @"character.cursor.ibeam"),
+                        KbMakeButton(3, @"Sao chép",  @"doc.on.doc"),
+                        KbMakeButton(4, @"Cắt",       @"scissors"),
+                        KbMakeButton(5, @"Dán",       @"doc.on.clipboard"),
+                        KbMakeButton(6, @"Trái",      @"arrow.left"),
+                        KbMakeButton(7, @"Phải",      @"arrow.right"),
+                        KbMakeButton(8, @"Ẩn phím",   @"keyboard.chevron.compact.down") ];
     UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:items];
     sv.axis = UILayoutConstraintAxisHorizontal;
     sv.distribution = UIStackViewDistributionFillEqually;
     sv.alignment = UIStackViewAlignmentFill;
-    sv.spacing = 6;
+    sv.spacing = 0;
     return sv;
 }
 
-// Thu thap cac nut nho (phim dia cau, nut ben phai) trong dock theo toa do cua dock
+// Thu thap cac view nho (icon qua dia cau, nut ben phai) trong dock theo toa do cua dock
 static void KbCollectItems(UIView *root, UIView *dock, UIView *skip, int depth, NSMutableArray *out) {
-    if (depth > 3) return;
+    if (depth > 6) return;
     for (UIView *v in root.subviews) {
         if (v == skip || v.hidden || v.alpha < 0.05) continue;
         CGRect f = [dock convertRect:v.bounds fromView:v];
-        BOOL small = f.size.width >= 20 && f.size.width <= 100 && f.size.height >= 20 && f.size.height <= 100;
-        if (small && ([v isKindOfClass:UIControl.class] || NSClassFromString(@"UIKeyboardDockItemButton") == v.class ||
-                      [NSStringFromClass(v.class) containsString:@"DockItem"])) {
-            [out addObject:[NSValue valueWithCGRect:f]];
-            continue;
-        }
+        BOOL small = f.size.width >= 18 && f.size.width <= 110 && f.size.height >= 18 && f.size.height <= 110;
+        NSString *cn = NSStringFromClass(v.class);
+        BOOL kind = [v isKindOfClass:UIControl.class] || [v isKindOfClass:UIImageView.class] ||
+                    [cn containsString:@"Button"] || [cn containsString:@"DockItem"] || [cn containsString:@"Globe"];
+        if (small && kind) [out addObject:[NSValue valueWithCGRect:f]];
         KbCollectItems(v, dock, skip, depth + 1, out);
     }
 }
@@ -2755,24 +2780,26 @@ static void KbBarPlace(UIView *dock) {
 
     NSMutableArray *items = [NSMutableArray new];
     KbCollectItems(dock, dock, bar, 0, items);
-    CGFloat cy = b.size.height / 2.0, left = 64.0, right = b.size.width - 64.0;
-    if (items.count) {
-        CGFloat sumY = 0, lmax = -1, rmin = CGFLOAT_MAX;
-        for (NSValue *val in items) {
-            CGRect f = val.CGRectValue;
-            sumY += CGRectGetMidY(f);
-            if (CGRectGetMidX(f) < b.size.width / 2.0) lmax = MAX(lmax, CGRectGetMaxX(f));
-            else rmin = MIN(rmin, CGRectGetMinX(f));
+    CGFloat cy = b.size.height / 2.0, left = 64.0, right = b.size.width - 12.0;
+    CGFloat globeX = CGFLOAT_MAX, rmin = CGFLOAT_MAX;
+    for (NSValue *val in items) {
+        CGRect f = val.CGRectValue;
+        if (CGRectGetMidX(f) < b.size.width / 2.0) {
+            if (CGRectGetMidX(f) < globeX) {      // icon ngoai cung ben trai = qua dia cau
+                globeX = CGRectGetMidX(f);
+                cy = CGRectGetMidY(f);
+                left = CGRectGetMaxX(f) + 8.0;
+            }
+        } else {
+            rmin = MIN(rmin, CGRectGetMinX(f));
         }
-        cy = sumY / items.count;                  // cung hang voi icon qua dia cau
-        if (lmax > 0) left = lmax + 10.0;
-        if (rmin < CGFLOAT_MAX) right = rmin - 10.0;
     }
-    CGFloat w = MIN(right - left, 300.0);
+    if (rmin < CGFLOAT_MAX) right = rmin - 8.0;
+    CGFloat w = MIN(right - left, 360.0);
     if (w < 150.0) { bar.hidden = YES; return; }
     bar.hidden = NO;
     CGFloat h = 34.0;
-    CGFloat cx = (left + right) / 2.0;            // can giua khoang giua 2 nut
+    CGFloat cx = (left + right) / 2.0;
     bar.frame = CGRectMake(cx - w / 2.0, cy - h / 2.0, w, h);
     [dock bringSubviewToFront:bar];
 }
