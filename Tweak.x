@@ -2725,8 +2725,6 @@ static UIButton *KbMakeButton(NSInteger tag, NSString *title, NSString *symbol) 
     b.tintColor = UIColor.labelColor;
     [b setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
     b.backgroundColor = UIColor.clearColor;
-    [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightRegular]
-                    forImageInState:UIControlStateNormal];
     [b addTarget:[AACKbActions shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -2734,12 +2732,9 @@ static UIButton *KbMakeButton(NSInteger tag, NSString *title, NSString *symbol) 
 static UIStackView *KbMakeBar(void) {
     NSArray *items = @[ KbMakeButton(0, @"Hoàn tác",  @"arrow.uturn.backward"),
                         KbMakeButton(1, @"Làm lại",   @"arrow.uturn.forward"),
-                        KbMakeButton(2, @"Chọn hết",  @"character.cursor.ibeam"),
                         KbMakeButton(3, @"Sao chép",  @"doc.on.doc"),
                         KbMakeButton(4, @"Cắt",       @"scissors"),
                         KbMakeButton(5, @"Dán",       @"doc.on.clipboard"),
-                        KbMakeButton(6, @"Trái",      @"arrow.left"),
-                        KbMakeButton(7, @"Phải",      @"arrow.right"),
                         KbMakeButton(8, @"Ẩn phím",   @"keyboard.chevron.compact.down") ];
     UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:items];
     sv.axis = UILayoutConstraintAxisHorizontal;
@@ -2755,11 +2750,12 @@ static void KbCollectItems(UIView *root, UIView *dock, UIView *skip, int depth, 
     for (UIView *v in root.subviews) {
         if (v == skip || v.hidden || v.alpha < 0.05) continue;
         CGRect f = [dock convertRect:v.bounds fromView:v];
-        BOOL small = f.size.width >= 18 && f.size.width <= 110 && f.size.height >= 18 && f.size.height <= 110;
+        BOOL small = f.size.width >= 14 && f.size.width <= 110 && f.size.height >= 14 && f.size.height <= 110;
         NSString *cn = NSStringFromClass(v.class);
-        BOOL kind = [v isKindOfClass:UIControl.class] || [v isKindOfClass:UIImageView.class] ||
+        BOOL img = [v isKindOfClass:UIImageView.class];
+        BOOL kind = img || [v isKindOfClass:UIControl.class] ||
                     [cn containsString:@"Button"] || [cn containsString:@"DockItem"] || [cn containsString:@"Globe"];
-        if (small && kind) [out addObject:[NSValue valueWithCGRect:f]];
+        if (small && kind) [out addObject:@{ @"r": [NSValue valueWithCGRect:f], @"img": @(img) }];
         KbCollectItems(v, dock, skip, depth + 1, out);
     }
 }
@@ -2781,21 +2777,25 @@ static void KbBarPlace(UIView *dock) {
     NSMutableArray *items = [NSMutableArray new];
     KbCollectItems(dock, dock, bar, 0, items);
     CGFloat cy = b.size.height / 2.0, left = 64.0, right = b.size.width - 12.0;
-    CGFloat globeX = CGFLOAT_MAX, rmin = CGFLOAT_MAX;
-    for (NSValue *val in items) {
-        CGRect f = val.CGRectValue;
-        if (CGRectGetMidX(f) < b.size.width / 2.0) {
-            if (CGRectGetMidX(f) < globeX) {      // icon ngoai cung ben trai = qua dia cau
-                globeX = CGRectGetMidX(f);
-                cy = CGRectGetMidY(f);
-                left = CGRectGetMaxX(f) + 8.0;
-            }
-        } else {
-            rmin = MIN(rmin, CGRectGetMinX(f));
+    // Qua dia cau = view ben trai ngoai cung; neu nhieu view cung vi tri (nut + icon) thi lay icon (UIImageView) nho nhat
+    CGFloat bestX = CGFLOAT_MAX, bestArea = CGFLOAT_MAX, rmin = CGFLOAT_MAX;
+    BOOL bestImg = NO;
+    for (NSDictionary *it in items) {
+        CGRect f = [it[@"r"] CGRectValue];
+        BOOL img = [it[@"img"] boolValue];
+        CGFloat mx = CGRectGetMidX(f), area = f.size.width * f.size.height;
+        if (mx >= b.size.width / 2.0) { rmin = MIN(rmin, CGRectGetMinX(f)); continue; }
+        BOOL farther = mx > bestX + 6.0;
+        BOOL nearer  = mx < bestX - 6.0;
+        BOOL better  = nearer || (!farther && ((img && !bestImg) || (img == bestImg && area < bestArea)));
+        if (bestX == CGFLOAT_MAX || better) {
+            bestX = mx; bestArea = area; bestImg = img;
+            cy = CGRectGetMidY(f);
+            left = CGRectGetMaxX(f) + 8.0;
         }
     }
     if (rmin < CGFLOAT_MAX) right = rmin - 8.0;
-    CGFloat w = MIN(right - left, 360.0);
+    CGFloat w = MIN(right - left, 340.0);
     if (w < 150.0) { bar.hidden = YES; return; }
     bar.hidden = NO;
     CGFloat h = 34.0;
