@@ -20,6 +20,7 @@ static NSString *const kHexKey     = @"AccentColorAll_Hex";
 static NSString *const kDefaultHex = @"B8A8FF";
 static NSString *const kCrashKey   = @"AccentColorAll_LastCrash";
 static NSString *const kKbBarKey   = @"AccentColorAll_KbShortcuts";
+static NSString *const kKbPadKey   = @"AccentColorAll_KbPadMode";
 
 #define KEY(n) static const void *n = &n;
 KEY(kFill) KEY(kGestureFlag) KEY(kTintVer) KEY(kIconShape) KEY(kMonoBlack)
@@ -69,6 +70,7 @@ static BOOL        gInKbFix;
 static volatile int32_t gPending;
 static BOOL        gSafe;
 static BOOL        gKbBarOn;
+static BOOL        gKbPadOn;
 static __thread BOOL gTintBypass;
 
 @interface CALayer (AACPrivate)
@@ -210,6 +212,7 @@ static void RefreshCache(void) {
     if (!gKeep) gKeep = [NSMutableArray new];
     gMaster = [d boolForKey:kMasterKey];
     gKbBarOn = [d boolForKey:kKbBarKey];
+    gKbPadOn = [d boolForKey:kKbPadKey];
     UIColor *light = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
     UIColor *dark = DarkVariant(light);
     UIColor *dyn = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
@@ -1692,6 +1695,7 @@ static UIViewController *TopVC(void) {
 
 static NSString *PeekCrash(void);
 static void ClearCrash(void);
+static void KbBarRefreshAll(void);
 
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
@@ -1714,22 +1718,28 @@ static void ClearCrash(void);
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 1) return 1;
+    if (s == 1) return 2;
     return PeekCrash().length ? 4 : 3;
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 1 ? @"Bàn phím" : @"Thay màu nhấn"; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return s == 1 ? @"Hiện thanh phím tắt phía trên bàn phím: hoàn tác, làm lại, dán, in đậm/nghiêng/gạch chân và gợi ý từ. Thay đổi được áp dụng ngay; nếu chưa thấy, hãy mở lại bàn phím." : nil;
+    return s == 1 ? @"Thanh phím tắt: hàng nút Hoàn tác, Làm lại, Sao chép, Cắt, Dán nằm cạnh phím địa cầu (giống ActionBar). Thay đổi được áp dụng ngay. \"Kiểu iPad\" chỉ dùng cho iOS 17 trở xuống, để tắt nếu bàn phím bị lỗi bố cục." : nil;
 }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     if (ip.section == 1) {
-        cell.textLabel.text = @"Thanh phím tắt";
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         UISwitch *ks = [UISwitch new];
-        ks.on = [d boolForKey:kKbBarKey];
-        [ks addTarget:self action:@selector(kbBarChanged:) forControlEvents:UIControlEventValueChanged];
+        if (ip.row == 0) {
+            cell.textLabel.text = @"Thanh phím tắt";
+            ks.on = [d boolForKey:kKbBarKey];
+            [ks addTarget:self action:@selector(kbBarChanged:) forControlEvents:UIControlEventValueChanged];
+        } else {
+            cell.textLabel.text = @"Kiểu iPad (iOS ≤ 17)";
+            ks.on = [d boolForKey:kKbPadKey];
+            [ks addTarget:self action:@selector(kbPadChanged:) forControlEvents:UIControlEventValueChanged];
+        }
         cell.accessoryView = ks;
         return cell;
     }
@@ -1790,9 +1800,18 @@ static void ClearCrash(void);
     ApplyAll();
 }
 
+- (void)kbPadChanged:(UISwitch *)sw {
+    [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKbPadKey];
+    gKbPadOn = sw.isOn;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try { [UIApplication.sharedApplication sendAction:@selector(reloadInputViews) to:nil from:nil forEvent:nil]; } @catch (__unused id x) {}
+    });
+}
+
 - (void)kbBarChanged:(UISwitch *)sw {
     [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKbBarKey];
     gKbBarOn = sw.isOn;
+    KbBarRefreshAll();
     // Ap dung ngay: yeu cau ban phim dang mo nap lai thanh phim tat (khong can mo lai ban phim)
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -2500,7 +2519,7 @@ static void Setup(UIWindow *w) {
 static BOOL gKbIdiom = YES;
 static long (*orig_KbIdiom)(void);
 static long new_KbIdiom(void) {
-    if (gKbBarOn && gKbIdiom) return 1;
+    if (gKbPadOn && gKbIdiom) return 1;
     return orig_KbIdiom ? orig_KbIdiom() : 0;
 }
 
@@ -2527,7 +2546,7 @@ static CGFloat KbAdjust(void) { return (!KbHasHome() && KbFloating()) ? -25.0 : 
 
 static UIEdgeInsets (*orig_kbPad)(id, SEL, long long, id);
 static UIEdgeInsets new_kbPad(id self, SEL _cmd, long long o, id m) {
-    if (!gKbBarOn) return orig_kbPad(self, _cmd, o, m);
+    if (!gKbPadOn) return orig_kbPad(self, _cmd, o, m);
     gKbIdiom = NO;
     UIEdgeInsets r = orig_kbPad(self, _cmd, o, m);
     gKbIdiom = YES;
@@ -2537,13 +2556,13 @@ static UIEdgeInsets new_kbPad(id self, SEL _cmd, long long o, id m) {
 static CGRect (*orig_dockBounds)(id, SEL);
 static CGRect new_dockBounds(id self, SEL _cmd) {
     CGRect r = orig_dockBounds(self, _cmd);
-    if (gKbBarOn) r.origin.y = KbAdjust();
+    if (gKbPadOn) r.origin.y = KbAdjust();
     return r;
 }
 
 static CGFloat (*orig_centerW)(id, SEL, id, long long);
 static CGFloat new_centerW(id self, SEL _cmd, id tc, long long o) {
-    if (!gKbBarOn) return orig_centerW(self, _cmd, tc, o);
+    if (!gKbPadOn) return orig_centerW(self, _cmd, tc, o);
     gKbIdiom = NO;
     CGFloat w = orig_centerW(self, _cmd, tc, o);
     gKbIdiom = YES;
@@ -2552,7 +2571,7 @@ static CGFloat new_centerW(id self, SEL _cmd, id tc, long long o) {
 
 static void (*orig_setItems)(id, SEL, id);
 static void new_setItems(id self, SEL _cmd, id resp) {
-    if (gKbBarOn) gKbIdiom = YES;
+    if (gKbPadOn) gKbIdiom = YES;
     orig_setItems(self, _cmd, resp);
     gKbIdiom = YES;
 }
@@ -2560,7 +2579,7 @@ static void new_setItems(id self, SEL _cmd, id resp) {
 static UIEdgeInsets (*orig_inPad)(id, SEL);
 static UIEdgeInsets new_inPad(id self, SEL _cmd) {
     UIEdgeInsets r = orig_inPad(self, _cmd);
-    if (gKbBarOn && !KbHasHome() && KbFloating()) r.bottom += -25.0;
+    if (gKbPadOn && !KbHasHome() && KbFloating()) r.bottom += -25.0;
     return r;
 }
 
@@ -2585,6 +2604,155 @@ static void InstallKbBar(void) {
         if (h) fn = dlsym(h, "UIKeyboardGetSafeDeviceIdiom");
     }
     if (fn) MSHookFunction(fn, (void *)new_KbIdiom, (void **)&orig_KbIdiom);
+}
+
+
+// ---- Thanh nut Hoan tac / Lam lai / Sao chep / Cat / Dan canh phim dia cau (nguyen ly ActionBar) ----
+// Khong phu thuoc UIKeyboardGetSafeDeviceIdiom: tu them UIStackView vao UIKeyboardDockView va gui
+// copy:/cut:/paste: toi first responder qua -[UIApplication sendAction:to:nil], nen khong dung API rieng tu cua iOS.
+KEY(kKbBarView)
+static NSHashTable *gDocks;
+static __weak UIResponder *gGrabbed;
+
+@interface UIResponder (AACGrab)
+- (void)aac_grab:(id)sender;
+@end
+@implementation UIResponder (AACGrab)
+- (void)aac_grab:(id)sender { gGrabbed = self; }
+@end
+
+static UIResponder *KbFirstResponder(void) {
+    gGrabbed = nil;
+    [UIApplication.sharedApplication sendAction:@selector(aac_grab:) to:nil from:nil forEvent:nil];
+    return gGrabbed;
+}
+
+@interface AACKbActions : NSObject
++ (instancetype)shared;
+- (void)tap:(UIButton *)b;
+@end
+
+static void KbUpdateUndoState(UIStackView *bar) {
+    NSUndoManager *um = KbFirstResponder().undoManager;
+    for (UIButton *b in bar.arrangedSubviews) {
+        if (![b isKindOfClass:UIButton.class]) continue;
+        if (b.tag == 0) b.enabled = um ? um.canUndo : NO;
+        if (b.tag == 1) b.enabled = um ? um.canRedo : NO;
+    }
+}
+
+@implementation AACKbActions
++ (instancetype)shared {
+    static AACKbActions *a; static dispatch_once_t once;
+    dispatch_once(&once, ^{ a = [AACKbActions new]; });
+    return a;
+}
+- (void)tap:(UIButton *)b {
+    @try {
+        UIApplication *app = UIApplication.sharedApplication;
+        switch (b.tag) {
+            case 0: { NSUndoManager *um = KbFirstResponder().undoManager; if (um.canUndo) [um undo]; break; }
+            case 1: { NSUndoManager *um = KbFirstResponder().undoManager; if (um.canRedo) [um redo]; break; }
+            case 2: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
+            case 3: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
+            case 4: [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil]; break;
+        }
+        [[UIImpactFeedbackGenerator new] impactOccurred];
+        if ([b.superview isKindOfClass:UIStackView.class]) KbUpdateUndoState((UIStackView *)b.superview);
+    } @catch (__unused id x) {}
+}
+@end
+
+static UIButton *KbMakeButton(NSInteger tag, NSString *title, NSString *symbol) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.tag = tag;
+    if (symbol) {
+        UIImage *im = [UIImage systemImageNamed:symbol];
+        if (im) [b setImage:im forState:UIControlStateNormal];
+        else [b setTitle:title forState:UIControlStateNormal];
+    } else {
+        [b setTitle:title forState:UIControlStateNormal];
+    }
+    b.titleLabel.font = [UIFont systemFontOfSize:14];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.6;
+    b.tintColor = UIColor.labelColor;
+    [b setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
+    b.backgroundColor = UIColor.tertiarySystemFillColor;
+    b.layer.cornerRadius = 8;
+    [b addTarget:[AACKbActions shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+static UIStackView *KbMakeBar(void) {
+    NSArray *items = @[ KbMakeButton(0, @"Hoàn tác", @"arrow.uturn.backward"),
+                        KbMakeButton(1, @"Làm lại",  @"arrow.uturn.forward"),
+                        KbMakeButton(2, @"Sao chép", nil),
+                        KbMakeButton(3, @"Cắt",      nil),
+                        KbMakeButton(4, @"Dán",      nil) ];
+    UIStackView *sv = [[UIStackView alloc] initWithArrangedSubviews:items];
+    sv.axis = UILayoutConstraintAxisHorizontal;
+    sv.distribution = UIStackViewDistributionFillEqually;
+    sv.alignment = UIStackViewAlignmentFill;
+    sv.spacing = 6;
+    return sv;
+}
+
+static void KbBarPlace(UIView *dock) {
+    UIStackView *bar = objc_getAssociatedObject(dock, kKbBarView);
+    if (!gKbBarOn) {
+        if (bar) { [bar removeFromSuperview]; objc_setAssociatedObject(dock, kKbBarView, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        return;
+    }
+    if (!bar) {
+        bar = KbMakeBar();
+        objc_setAssociatedObject(dock, kKbBarView, bar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (bar.superview != dock) [dock addSubview:bar];
+    CGRect b = dock.bounds;
+    CGFloat w = MIN(b.size.width - 150.0, 340.0);
+    if (w < 200.0 || b.size.height < 20.0) { bar.hidden = YES; return; }
+    bar.hidden = NO;
+    CGFloat cy = b.size.height / 2.0;
+    for (UIView *v in dock.subviews) {   // can theo giua nut dia cau
+        if (v == bar || v.hidden || v.frame.size.width < 20 || v.frame.size.width > 90) continue;
+        cy = CGRectGetMidY(v.frame);
+        break;
+    }
+    CGFloat h = MIN(36.0, b.size.height - 4.0);
+    bar.frame = CGRectMake((b.size.width - w) / 2.0, cy - h / 2.0, w, h);
+    [dock bringSubviewToFront:bar];
+    KbUpdateUndoState(bar);
+}
+
+static void KbBarRefreshAll(void) {
+    for (UIView *d in [gDocks allObjects]) [d setNeedsLayout];
+}
+
+static void (*orig_dockLayout)(id, SEL);
+static void new_dockLayout(id self, SEL _cmd) {
+    if (orig_dockLayout) orig_dockLayout(self, _cmd);
+    @try {
+        if (!gDocks) gDocks = [NSHashTable weakObjectsHashTable];
+        [gDocks addObject:self];
+        KbBarPlace((UIView *)self);
+    } @catch (__unused id x) {}
+}
+
+static void InstallDockBar(void) {
+    Class c = NSClassFromString(@"UIKeyboardDockView");
+    if (!c) {   // du phong: tim lop co ten chua "KeyboardDock" la con cua UIView
+        unsigned int n = 0;
+        Class *list = objc_copyClassList(&n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *nm = class_getName(list[i]);
+            if (nm && strstr(nm, "KeyboardDock") && class_getSuperclass(list[i]) &&
+                [list[i] isSubclassOfClass:UIView.class] && (!c || strlen(nm) < strlen(class_getName(c)))) c = list[i];
+        }
+        free(list);
+    }
+    if (!c) return;
+    MSHookMessageEx(c, @selector(layoutSubviews), (IMP)new_dockLayout, (IMP *)&orig_dockLayout);
 }
 
 // ---- Khoi tao ----
@@ -2644,7 +2812,7 @@ static void ClearCrash(void) {
     @autoreleasepool {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
-        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES }];
+        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbPadKey: @NO }];
         InstallSignals();
         InstallEH(0);
         gSafe = IsFacebookFamily();
@@ -2652,5 +2820,6 @@ static void ClearCrash(void) {
         %init;
         %init(AACContents);
         InstallKbBar();
+        InstallDockBar();
     }
 }
