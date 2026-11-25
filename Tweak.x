@@ -1707,7 +1707,7 @@ static void KbBarRefreshAll(void);
 - (void)viewDidLoad {
     [super viewDidLoad];
     Crumb("settingsVC:viewDidLoad");
-    self.title = @"Màu nhấn";
+    self.title = @"Action Tool";
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
     self.tableView.rowHeight = UITableViewAutomaticDimension;
