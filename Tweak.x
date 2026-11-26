@@ -1790,12 +1790,8 @@ static BOOL HostDeclaresAudio(void) {
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 2 ? @"Hành vi" : (s == 1 ? @"Bàn phím" : @"Màu nhấn"); }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    if (s == 2) {
-        return HostDeclaresAudio()
-            ? @"Giữ phiên âm thanh hoạt động khi app xuống nền hoặc khoá màn hình. App này đã khai báo chế độ nền audio."
-            : @"App này chưa khai báo chế độ nền \"audio\" (UIBackgroundModes) trong Info.plist nên iOS vẫn có thể tạm dừng app sau ít giây. Hãy thêm UIBackgroundModes = audio khi ký/cài IPA (Sideloadly, ESign...).";
-    }
-    return s == 1 ? @"Thanh phím tắt: hàng nút cạnh phím địa cầu. \"Dạng TrollPad\" chuyển Hoàn tác, Làm lại, Dán sang trái và In đậm/nghiêng/gạch chân sang phải hàng gợi ý từ phía trên bàn phím (cần có hàng gợi ý, nếu không sẽ về dạng thường)." : nil;
+    if (s == 2) return nil;
+    return s == 1 ? @"Thanh phím tắt: hàng nút cạnh phím địa cầu.\nChế độ TrollPad chuyển các phím tắt sang phải hàng gợi ý (cần bật hàng gợi ý)." : nil;
 }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1804,7 +1800,9 @@ static BOOL HostDeclaresAudio(void) {
         UITableViewCell *kc = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         kc.selectionStyle = UITableViewCellSelectionStyleNone;
         kc.textLabel.text = @"Chạy nền (Keep-Alive)";
-        kc.detailTextLabel.text = @"Giữ phiên âm thanh hoạt động khi app xuống nền; hiệu quả phụ thuộc vào việc app có hỗ trợ audio nền.";
+        kc.detailTextLabel.text = HostDeclaresAudio()
+            ? @"Duy trì phiên âm thanh khi ứng dụng chạy nền hoặc khóa màn hình. Ứng dụng này đã khai báo chế độ nền âm thanh."
+            : @"Ứng dụng này chưa khai báo chế độ nền \"audio\" (UIBackgroundModes) trong Info.plist, nên iOS có thể tạm dừng ứng dụng sau vài giây. Hãy thêm UIBackgroundModes = audio khi ký/cài IPA (Sideloadly, ESign...).";
         kc.detailTextLabel.numberOfLines = 0;
         kc.detailTextLabel.textColor = UIColor.secondaryLabelColor;
         UISwitch *ksw = [UISwitch new];
