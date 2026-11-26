@@ -3208,6 +3208,57 @@ static id KASession(void) {
     return ((id (*)(id, SEL))objc_msgSend)((id)c, NSSelectorFromString(@"sharedInstance"));
 }
 
+static BOOL gKAInBg;
+static BOOL (*orig_ka_setCat3)(id, SEL, NSString *, NSUInteger, NSError **);
+static BOOL (*orig_ka_setCat2)(id, SEL, NSString *, NSError **);
+static BOOL (*orig_ka_setCat4)(id, SEL, NSString *, NSString *, NSUInteger, NSError **);
+static BOOL (*orig_ka_setAct2)(id, SEL, BOOL, NSError **);
+static BOOL (*orig_ka_setAct3)(id, SEL, BOOL, NSUInteger, NSError **);
+
+// Khi dang o nen: app (vd. Facebook) hay doi session sang Ambient / tat session -> keep-alive mat tac dung. Giu lai Playback.
+static BOOL KANeedFix(NSString *cat) {
+    return gKeepAliveOn && gKAInBg && cat &&
+           ([cat isEqualToString:@"AVAudioSessionCategoryAmbient"] || [cat isEqualToString:@"AVAudioSessionCategorySoloAmbient"]);
+}
+static BOOL new_ka_setCat3(id self, SEL _cmd, NSString *cat, NSUInteger opt, NSError **e) {
+    if (KANeedFix(cat)) { cat = @"AVAudioSessionCategoryPlayback"; opt |= 1; }
+    return orig_ka_setCat3 ? orig_ka_setCat3(self, _cmd, cat, opt, e) : NO;
+}
+static BOOL new_ka_setCat2(id self, SEL _cmd, NSString *cat, NSError **e) {
+    if (KANeedFix(cat) && orig_ka_setCat3)
+        return orig_ka_setCat3(self, NSSelectorFromString(@"setCategory:withOptions:error:"), @"AVAudioSessionCategoryPlayback", 1, e);
+    return orig_ka_setCat2 ? orig_ka_setCat2(self, _cmd, cat, e) : NO;
+}
+static BOOL new_ka_setCat4(id self, SEL _cmd, NSString *cat, NSString *mode, NSUInteger opt, NSError **e) {
+    if (KANeedFix(cat)) { cat = @"AVAudioSessionCategoryPlayback"; opt |= 1; }
+    return orig_ka_setCat4 ? orig_ka_setCat4(self, _cmd, cat, mode, opt, e) : NO;
+}
+static BOOL new_ka_setAct2(id self, SEL _cmd, BOOL on, NSError **e) {
+    if (!on && gKeepAliveOn && gKAInBg) { if (e) *e = nil; return YES; }
+    return orig_ka_setAct2 ? orig_ka_setAct2(self, _cmd, on, e) : NO;
+}
+static BOOL new_ka_setAct3(id self, SEL _cmd, BOOL on, NSUInteger opt, NSError **e) {
+    if (!on && gKeepAliveOn && gKAInBg) { if (e) *e = nil; return YES; }
+    return orig_ka_setAct3 ? orig_ka_setAct3(self, _cmd, on, opt, e) : NO;
+}
+static void KAHook(Class c, NSString *sel, IMP n, IMP *o) {
+    SEL sl = NSSelectorFromString(sel);
+    if (!c || !class_getInstanceMethod(c, sl)) return;
+    MSHookMessageEx(c, sl, n, o);
+}
+static void KAInstallSessionHooks(void) {
+    static BOOL done;
+    if (done) return;
+    Class c = NSClassFromString(@"AVAudioSession");
+    if (!c) return;
+    done = YES;
+    KAHook(c, @"setCategory:withOptions:error:", (IMP)new_ka_setCat3, (IMP *)&orig_ka_setCat3);
+    KAHook(c, @"setCategory:error:", (IMP)new_ka_setCat2, (IMP *)&orig_ka_setCat2);
+    KAHook(c, @"setCategory:mode:options:error:", (IMP)new_ka_setCat4, (IMP *)&orig_ka_setCat4);
+    KAHook(c, @"setActive:error:", (IMP)new_ka_setAct2, (IMP *)&orig_ka_setAct2);
+    KAHook(c, @"setActive:withOptions:error:", (IMP)new_ka_setAct3, (IMP *)&orig_ka_setAct3);
+}
+
 @interface AACKeepAlive : NSObject
 @property (nonatomic, strong) id player;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
@@ -3230,11 +3281,13 @@ static id KASession(void) {
     if (done) return;
     done = YES;
     Crumb("keepalive:install");
+    gKAInBg = (UIApplication.sharedApplication.applicationState == UIApplicationStateBackground);
+    KAInstallSessionHooks();
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     NSOperationQueue *mq = NSOperationQueue.mainQueue;
     __weak AACKeepAlive *ws = self;
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:mq usingBlock:^(NSNotification *n) { @try { [ws start]; } @catch (__unused id x) {} }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { @try { [ws stop]; } @catch (__unused id x) {} }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = YES; @try { [ws start]; } @catch (__unused id x) {} }];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = NO; @try { [ws stop]; } @catch (__unused id x) {} }];
     NSArray *names = @[ @"AVAudioSessionInterruptionNotification",
                         @"AVAudioSessionMediaServicesWereResetNotification",
                         @"AVAudioSessionRouteChangeNotification" ];
@@ -3281,7 +3334,7 @@ static id KASession(void) {
         NSString *cat = ((id (*)(id, SEL))objc_msgSend)(s, NSSelectorFromString(@"category"));
         NSString *pb = @"AVAudioSessionCategoryPlayback";
         // Chi doi category khi app chua dung Playback/PlayAndRecord; MixWithOthers (=1) de khong ngat nhac/video khac
-        if (![cat isEqualToString:pb] && ![cat isEqualToString:@"AVAudioSessionCategoryPlayAndRecord"]) {
+        if (![cat isEqualToString:pb] && ![cat isEqualToString:@"AVAudioSessionCategoryPlayAndRecord"] && ![cat isEqualToString:@"AVAudioSessionCategoryMultiRoute"]) {
             ((BOOL (*)(id, SEL, NSString *, NSUInteger, NSError **))objc_msgSend)(
                 s, NSSelectorFromString(@"setCategory:withOptions:error:"), pb, (NSUInteger)1, &err);
         }
@@ -3305,14 +3358,14 @@ static id KASession(void) {
 - (void)armTimer {
     if (self.timer) return;
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), 8 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
     __weak AACKeepAlive *ws = self;
     dispatch_source_set_event_handler(t, ^{
         AACKeepAlive *s = ws;
         if (!s) return;
         Crumb("keepalive:timer");
         if (!gKeepAliveOn || !s.running) { [s stop]; return; }
-        if (![s playing]) [s playSilent];
+        [s playSilent];
         if (s.bgTask == UIBackgroundTaskInvalid && UIApplication.sharedApplication.applicationState == UIApplicationStateBackground)
             [s beginTask];
     });
@@ -3325,14 +3378,18 @@ static id KASession(void) {
     self.running = YES;
     Crumb("keepalive:start");
     [self beginTask];
-    // Chay phan am thanh o vong lap ke tiep, ngoai luc app dang xu ly chuyen nen (tranh dung do voi app nhu Facebook)
+    [self playSilent];      // chay NGAY trong luc xuong nen, khong tri hoan
+    [self armTimer];
+    // App co the doi/tat session ngay sau khi xuong nen -> khang dinh lai nhieu lan
     __weak AACKeepAlive *ws = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        AACKeepAlive *s = ws;
-        if (!s || !s.running || !gKeepAliveOn) return;
-        [s playSilent];
-        [s armTimer];
-    });
+    double ds[3] = { 0.4, 1.5, 4.0 };
+    for (int i = 0; i < 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ds[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            AACKeepAlive *s = ws;
+            if (!s || !s.running || !gKeepAliveOn) return;
+            @try { [s playSilent]; } @catch (__unused id x) {}
+        });
+    }
 }
 
 - (void)stop {
@@ -3431,13 +3488,12 @@ static void NotifyPrevCrash(int attempt) {
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbTopKey: @NO, kKeepAliveKey: @YES }];
         InstallSignals();
-        {   // Lan truoc crash o buoc keep-alive -> tu tat keep-alive (chi 1 lan cho moi log), tranh crash lap lai
+        {   // Khoi phuc Keep-Alive ve BAT (ban truoc co the da tu tat nham sau mot lan crash khong lien quan)
             NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-            NSString *prev = PeekCrash();
-            if (prev.length && [prev containsString:@"keepalive"] &&
-                ![[ud stringForKey:@"AccentColorAll_KAHandled"] isEqualToString:prev]) {
-                [ud setBool:NO forKey:kKeepAliveKey];
-                [ud setObject:prev forKey:@"AccentColorAll_KAHandled"];
+            if (![ud boolForKey:@"AccentColorAll_KAMigrated2"]) {
+                [ud setBool:YES forKey:@"AccentColorAll_KAMigrated2"];
+                [ud setBool:YES forKey:kKeepAliveKey];
+                [ud removeObjectForKey:@"AccentColorAll_KAHandled"];
             }
         }
         InstallEH(0);
