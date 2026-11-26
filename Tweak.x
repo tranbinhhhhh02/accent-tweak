@@ -21,6 +21,7 @@ static NSString *const kDefaultHex = @"B8A8FF";
 static NSString *const kCrashKey   = @"AccentColorAll_LastCrash";
 static NSString *const kKbBarKey   = @"AccentColorAll_KbShortcuts";
 static NSString *const kKbTopKey   = @"AccentColorAll_KbTopMode";
+static NSString *const kKeepAliveKey = @"AccentColorAll_BgKeepAlive";
 
 #define KEY(n) static const void *n = &n;
 KEY(kFill) KEY(kGestureFlag) KEY(kTintVer) KEY(kIconShape) KEY(kMonoBlack)
@@ -71,6 +72,7 @@ static volatile int32_t gPending;
 static BOOL        gSafe;
 static BOOL        gKbBarOn;
 static BOOL        gKbTopOn;
+static BOOL        gKeepAliveOn;
 static __thread BOOL gTintBypass;
 
 @interface CALayer (AACPrivate)
@@ -213,6 +215,7 @@ static void RefreshCache(void) {
     gMaster = [d boolForKey:kMasterKey];
     gKbBarOn = [d boolForKey:kKbBarKey];
     gKbTopOn = [d boolForKey:kKbTopKey];
+    gKeepAliveOn = [d boolForKey:kKeepAliveKey];
     UIColor *light = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
     UIColor *dark = DarkVariant(light);
     UIColor *dyn = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
@@ -1696,6 +1699,8 @@ static UIViewController *TopVC(void) {
 static NSString *PeekCrash(void);
 static void ClearCrash(void);
 static void KbBarRefreshAll(void);
+static void KaRefresh(void);
+static BOOL KaHostDeclaresAudio(void);
 
 @interface AACSettingsVC : UITableViewController <UIColorPickerViewControllerDelegate>
 @end
@@ -1707,70 +1712,40 @@ static void KbBarRefreshAll(void);
 - (void)viewDidLoad {
     [super viewDidLoad];
     Crumb("settingsVC:viewDidLoad");
-    self.title = @"Action Tool";
+    self.title = @"Màu nhấn";
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 56;
-    [self buildAuthorFooter];
-}
-
-- (void)buildAuthorFooter {
-    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 64)];
-    UILabel *a = [UILabel new];
-    a.text = @"Created by ";
-    a.font = [UIFont systemFontOfSize:13];
-    a.textColor = UIColor.secondaryLabelColor;
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    [b setTitle:@"Tran Binh" forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    [b addTarget:self action:@selector(openAuthor) forControlEvents:UIControlEventTouchUpInside];
-    UILabel *c = [UILabel new];
-    c.text = @" \u2661";
-    c.font = [UIFont systemFontOfSize:13];
-    c.textColor = UIColor.secondaryLabelColor;
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[a, b, c]];
-    st.axis = UILayoutConstraintAxisHorizontal;
-    st.alignment = UIStackViewAlignmentCenter;
-    st.spacing = 0;
-    st.translatesAutoresizingMaskIntoConstraints = NO;
-    [box addSubview:st];
-    [NSLayoutConstraint activateConstraints:@[
-        [st.centerXAnchor constraintEqualToAnchor:box.centerXAnchor],
-        [st.centerYAnchor constraintEqualToAnchor:box.centerYAnchor]
-    ]];
-    self.tableView.tableFooterView = box;
-}
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UIView *f = self.tableView.tableFooterView;
-    CGFloat w = self.tableView.bounds.size.width;
-    if (f && w > 0 && fabs(f.frame.size.width - w) > 0.5) {
-        f.frame = CGRectMake(0, 0, w, 64);
-        self.tableView.tableFooterView = f;
-    }
-}
-
-- (void)openAuthor {
-    NSURL *u = [NSURL URLWithString:@"https://www.facebook.com/profile.php?id=100091902503211"];
-    if (u) [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
 }
 
 - (void)close { [self dismissViewControllerAnimated:YES completion:^{ ClosePanelWindow(); }]; }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     if (s == 1) return 2;
+    if (s == 2) return 1;
     return PeekCrash().length ? 4 : 3;
 }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 1 ? @"Bàn phím" : @"Màu nhấn"; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 2 ? @"Chạy nền" : (s == 1 ? @"Bàn phím" : @"Thay màu nhấn"); }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s == 2) return KaHostDeclaresAudio()
+        ? @"Giữ phiên âm thanh hoạt động khi app ở nền (phát âm thanh im lặng). Ứng dụng này đã khai báo chế độ nền âm thanh nên có thể hiệu quả. Hiệu quả vẫn phụ thuộc vào app."
+        : @"Giữ phiên âm thanh hoạt động khi app ở nền (phát âm thanh im lặng). Không đọc thấy khai báo chế độ nền âm thanh trong app này (có thể do app đã được ký lại); hiệu quả phụ thuộc vào app.";
     return s == 1 ? @"Thanh phím tắt: hàng nút cạnh phím địa cầu. \"Dạng TrollPad\" chuyển Hoàn tác, Làm lại, Dán sang trái và In đậm/nghiêng/gạch chân sang phải hàng gợi ý từ phía trên bàn phím (cần có hàng gợi ý, nếu không sẽ về dạng thường)." : nil;
 }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    if (ip.section == 2) {
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.text = @"Giữ chạy nền (Keep-Alive)";
+        UISwitch *ka = [UISwitch new];
+        ka.on = [d boolForKey:kKeepAliveKey];
+        [ka addTarget:self action:@selector(keepAliveChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = ka;
+        return cell;
+    }
     if (ip.section == 1) {
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         UISwitch *ks = [UISwitch new];
@@ -1779,7 +1754,7 @@ static void KbBarRefreshAll(void);
             ks.on = [d boolForKey:kKbBarKey];
             [ks addTarget:self action:@selector(kbBarChanged:) forControlEvents:UIControlEventValueChanged];
         } else if (ip.row == 1) {
-            cell.textLabel.text = @"Dạng TrollPad";
+            cell.textLabel.text = @"Dạng TrollPad (lên trên)";
             ks.on = [d boolForKey:kKbTopKey];
             [ks addTarget:self action:@selector(kbTopChanged:) forControlEvents:UIControlEventValueChanged];
         }
@@ -1841,6 +1816,12 @@ static void KbBarRefreshAll(void);
 - (void)masterChanged:(UISwitch *)sw {
     [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kMasterKey];
     ApplyAll();
+}
+
+- (void)keepAliveChanged:(UISwitch *)sw {
+    [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKeepAliveKey];
+    gKeepAliveOn = sw.isOn;
+    KaRefresh();
 }
 
 - (void)kbTopChanged:(UISwitch *)sw {
@@ -2621,48 +2602,6 @@ static void KbHideKeyboard(void) {
     [fr resignFirstResponder];
 }
 
-// Sao chep: co chon -> chep phan chon; khong chon -> chep TOAN BO noi dung o nhap (Copy All)
-static NSString *KbTextToCopy(UIResponder *fr, BOOL *hadSel) {
-    *hadSel = NO;
-    if (![fr conformsToProtocol:@protocol(UITextInput)]) return nil;
-    id<UITextInput> ti = (id<UITextInput>)fr;
-    NSString *str = nil;
-    UITextRange *sel = ti.selectedTextRange;
-    if (sel && !sel.isEmpty) {
-        *hadSel = YES;
-        str = [ti textInRange:sel];
-    }
-    if (!str.length) {
-        UITextPosition *b = ti.beginningOfDocument, *e = ti.endOfDocument;
-        if (b && e) {
-            UITextRange *all = [ti textRangeFromPosition:b toPosition:e];
-            if (all && !all.isEmpty) str = [ti textInRange:all];
-        }
-    }
-    return str;
-}
-
-static void KbCopyAll(void) {
-    UIApplication *app = UIApplication.sharedApplication;
-    UIResponder *fr = KbFirstResponder();
-    BOOL hadSel = NO;
-    NSString *str = KbTextToCopy(fr, &hadSel);
-    if (hadSel) {   // co vung chon: dung copy: he thong de giu dinh dang, that bai thi chep chu thuong
-        NSInteger cc = UIPasteboard.generalPasteboard.changeCount;
-        BOOL ok = [app sendAction:@selector(copy:) to:nil from:nil forEvent:nil];
-        if (ok && UIPasteboard.generalPasteboard.changeCount != cc) return;
-    }
-    if (str.length) {
-        UIPasteboard.generalPasteboard.string = str;
-        return;
-    }
-    // Du phong: o nhap khong theo UITextInput -> chon het roi copy:
-    if (![app sendAction:@selector(copy:) to:nil from:nil forEvent:nil]) {
-        [app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil];
-        [app sendAction:@selector(copy:) to:nil from:nil forEvent:nil];
-    }
-}
-
 static void KbUndoRedo(BOOL redo) {
     for (NSUndoManager *um in KbUndoManagers()) {
         if (redo ? um.canRedo : um.canUndo) {
@@ -2686,7 +2625,7 @@ static void KbUndoRedo(BOOL redo) {
             case 0: KbUndoRedo(NO); break;
             case 1: KbUndoRedo(YES); break;
             case 2: [app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil]; break;
-            case 3: KbCopyAll(); break;
+            case 3: [app sendAction:@selector(copy:)  to:nil from:nil forEvent:nil]; break;
             case 4: [app sendAction:@selector(cut:)   to:nil from:nil forEvent:nil]; break;
             case 5: {
                 BOOL ok = [app sendAction:@selector(paste:) to:nil from:nil forEvent:nil];
@@ -3125,6 +3064,185 @@ static void InstallDockBar(void) {
     MSHookMessageEx(c, @selector(layoutSubviews), (IMP)new_dockLayout, (IMP *)&orig_dockLayout);
 }
 
+// ---- Giu chay nen (Background Keep-Alive) ----
+// Tai dung cau truc cua IPATweaksBackgroundKeepAliveService trong IPATweaksPlus.dylib (chi phan nay):
+//   thuoc tinh : audioPlayer, playbackRunning, timer
+//   phuong thuc: startPlayingSilentAudio / stopPlayingSilentAudio, beginBackgroundAssertion / endBackgroundAssertion,
+//                startTimer / stopTimer / timerFired, handleAudioInterruption:, applicationDidEnterBackground:
+//   ham ngoai  : Bootstrap (dang ky), Refresh, IsRunning, HostDeclaresAudioBackgroundMode
+// Am thanh: WAV im lang 22050 Hz / 8-bit / mono / 1 giay, giong het (tung byte) file base64 nhung trong dylib goc.
+// Dung runtime (dlopen + objc_msgSend) de khong phai them AVFoundation vao Makefile.
+static BOOL KaHostDeclaresAudio(void) {
+    id m = [NSBundle.mainBundle objectForInfoDictionaryKey:@"UIBackgroundModes"];
+    return [m isKindOfClass:NSArray.class] && [(NSArray *)m containsObject:@"audio"];
+}
+
+static NSData *KaSilentWav(void) {
+    const uint32_t n = 22050, riffLen = 36 + n, fmtLen = 16, rate = 22050, byteRate = 22050, dataLen = n;
+    const uint16_t pcm = 1, ch = 1, align = 1, bits = 8;
+    NSMutableData *d = [NSMutableData dataWithCapacity:44 + n];
+    [d appendBytes:"RIFF" length:4]; [d appendBytes:&riffLen length:4];
+    [d appendBytes:"WAVE" length:4]; [d appendBytes:"fmt " length:4];
+    [d appendBytes:&fmtLen length:4]; [d appendBytes:&pcm length:2]; [d appendBytes:&ch length:2];
+    [d appendBytes:&rate length:4];   [d appendBytes:&byteRate length:4];
+    [d appendBytes:&align length:2];  [d appendBytes:&bits length:2];
+    [d appendBytes:"data" length:4];  [d appendBytes:&dataLen length:4];
+    uint8_t *z = malloc(n); memset(z, 0x80, n);          // 8-bit PCM: 0x80 = im lang
+    [d appendBytes:z length:n]; free(z);
+    return d;
+}
+
+static id KaSession(void) {
+    dlopen("/System/Library/Frameworks/AVFAudio.framework/AVFAudio", RTLD_LAZY);
+    Class S = NSClassFromString(@"AVAudioSession");
+    return S ? ((id (*)(id, SEL))objc_msgSend)(S, NSSelectorFromString(@"sharedInstance")) : nil;
+}
+
+@interface AACKeepAliveService : NSObject
+@property (nonatomic, strong) id audioPlayer;
+@property (nonatomic, assign) BOOL playbackRunning;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;   // 0 = UIBackgroundTaskInvalid
++ (instancetype)shared;
+- (void)startPlayingSilentAudio;
+- (void)stopPlayingSilentAudio;
+- (void)beginBackgroundAssertion;
+- (void)endBackgroundAssertion;
+- (void)startTimer;
+- (void)stopTimer;
+- (void)timerFired;
+- (void)handleAudioInterruption:(NSNotification *)n;
+- (void)applicationDidEnterBackground:(NSNotification *)n;
+@end
+
+@implementation AACKeepAliveService
++ (instancetype)shared {
+    static AACKeepAliveService *k; static dispatch_once_t once;
+    dispatch_once(&once, ^{ k = [AACKeepAliveService new]; });
+    return k;
+}
+
+- (BOOL)isPlaying {
+    return self.audioPlayer && ((BOOL (*)(id, SEL))objc_msgSend)(self.audioPlayer, NSSelectorFromString(@"isPlaying"));
+}
+
+- (void)startPlayingSilentAudio {
+    @try {
+        id sess = KaSession();
+        Class P = NSClassFromString(@"AVAudioPlayer");
+        if (!sess || !P) return;
+        NSError *e = nil;
+        // Category Playback + MixWithOthers (1): khong cat nhac dang phat cua nguoi dung
+        ((BOOL (*)(id, SEL, NSString *, NSUInteger, NSError **))objc_msgSend)(sess, NSSelectorFromString(@"setCategory:withOptions:error:"), @"AVAudioSessionCategoryPlayback", 1, &e);
+        ((BOOL (*)(id, SEL, BOOL, NSError **))objc_msgSend)(sess, NSSelectorFromString(@"setActive:error:"), YES, &e);
+        if (!self.audioPlayer) {
+            id pl = ((id (*)(id, SEL))objc_msgSend)(P, @selector(alloc));
+            pl = ((id (*)(id, SEL, NSData *, NSError **))objc_msgSend)(pl, NSSelectorFromString(@"initWithData:error:"), KaSilentWav(), &e);
+            if (!pl) return;
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(pl, NSSelectorFromString(@"setNumberOfLoops:"), -1);
+            ((void (*)(id, SEL, float))objc_msgSend)(pl, NSSelectorFromString(@"setVolume:"), 0.01f);
+            ((BOOL (*)(id, SEL))objc_msgSend)(pl, NSSelectorFromString(@"prepareToPlay"));
+            self.audioPlayer = pl;
+        }
+        if (![self isPlaying]) ((BOOL (*)(id, SEL))objc_msgSend)(self.audioPlayer, NSSelectorFromString(@"play"));
+        self.playbackRunning = YES;
+    } @catch (__unused id x) {}
+}
+
+- (void)stopPlayingSilentAudio {
+    if (self.audioPlayer) {
+        ((void (*)(id, SEL))objc_msgSend)(self.audioPlayer, NSSelectorFromString(@"stop"));
+        self.audioPlayer = nil;
+        id sess = KaSession();
+        NSError *e = nil;
+        if (sess) ((BOOL (*)(id, SEL, BOOL, NSUInteger, NSError **))objc_msgSend)(sess, NSSelectorFromString(@"setActive:withOptions:error:"), NO, 1 /*NotifyOthersOnDeactivation*/, &e);
+    }
+    self.playbackRunning = NO;
+}
+
+- (void)beginBackgroundAssertion {
+    if (self.bgTask != 0) return;
+    __weak AACKeepAliveService *ws = self;
+    self.bgTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"AACKeepAlive" expirationHandler:^{
+        [ws endBackgroundAssertion];
+    }];
+}
+
+- (void)endBackgroundAssertion {
+    if (self.bgTask != 0) { [UIApplication.sharedApplication endBackgroundTask:self.bgTask]; self.bgTask = 0; }
+}
+
+- (void)startTimer {
+    if (self.timer) return;
+    self.timer = [NSTimer timerWithTimeInterval:8.0 target:self selector:@selector(timerFired) userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopTimer {
+    [self.timer invalidate];
+    self.timer = nil;
+}
+
+- (void)timerFired {
+    if (!gKeepAliveOn) { [self stopPlayingSilentAudio]; [self stopTimer]; [self endBackgroundAssertion]; return; }
+    if (![self isPlaying]) [self startPlayingSilentAudio];
+    if (UIApplication.sharedApplication.applicationState == UIApplicationStateBackground) {
+        [self endBackgroundAssertion];     // gia han assertion de khong het han
+        [self beginBackgroundAssertion];
+    }
+}
+
+- (void)handleAudioInterruption:(NSNotification *)n {
+    NSUInteger type = [n.userInfo[@"AVAudioSessionInterruptionTypeKey"] unsignedIntegerValue];   // 1 = Began, 0 = Ended
+    if (type == 1) { self.playbackRunning = NO; return; }
+    if (gKeepAliveOn) dispatch_async(dispatch_get_main_queue(), ^{ [self startPlayingSilentAudio]; });
+}
+
+- (void)applicationDidEnterBackground:(NSNotification *)n {
+    if (!gKeepAliveOn) return;
+    [self startPlayingSilentAudio];
+    [self beginBackgroundAssertion];
+}
+@end
+
+__attribute__((unused)) static BOOL KaIsRunning(void) { return AACKeepAliveService.shared.playbackRunning; }
+
+static void KaRefresh(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AACKeepAliveService *k = AACKeepAliveService.shared;
+        if (gKeepAliveOn) {
+            [k startPlayingSilentAudio];
+            [k startTimer];
+            if (UIApplication.sharedApplication.applicationState == UIApplicationStateBackground) [k beginBackgroundAssertion];
+        } else {
+            [k stopPlayingSilentAudio];
+            [k stopTimer];
+            [k endBackgroundAssertion];
+        }
+    });
+}
+
+static void KaInstall(void) {
+    static BOOL done; if (done) return; done = YES;
+    AACKeepAliveService *k = AACKeepAliveService.shared;
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:k selector:@selector(applicationDidEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:k selector:@selector(applicationDidEnterBackground:) name:@"UISceneDidEnterBackgroundNotification" object:nil];
+    [nc addObserver:k selector:@selector(handleAudioInterruption:) name:@"AVAudioSessionInterruptionNotification" object:nil];
+    // route change / media services reset / ve foreground -> lam moi
+    void (^again)(NSNotification *) = ^(__unused NSNotification *n) { KaRefresh(); };
+    [nc addObserverForName:@"AVAudioSessionRouteChangeNotification" object:nil queue:NSOperationQueue.mainQueue usingBlock:again];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:again];
+    [nc addObserverForName:@"AVAudioSessionMediaServicesWereResetNotification" object:nil queue:NSOperationQueue.mainQueue
+                usingBlock:^(__unused NSNotification *n) { k.audioPlayer = nil; KaRefresh(); }];
+    // doi cong tat (NSUserDefaults) -> ap dung ngay
+    [nc addObserverForName:NSUserDefaultsDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
+        BOOL on = [NSUserDefaults.standardUserDefaults boolForKey:kKeepAliveKey];
+        if (on != gKeepAliveOn) { gKeepAliveOn = on; KaRefresh(); }
+    }];
+    KaRefresh();
+}
+
 // ---- Khoi tao ----
 static BOOL IsFacebookFamily(void) {
     NSBundle *b = NSBundle.mainBundle;
@@ -3182,7 +3300,7 @@ static void ClearCrash(void) {
     @autoreleasepool {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
-        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbTopKey: @NO }];
+        [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbTopKey: @NO, kKeepAliveKey: @NO }];
         InstallSignals();
         InstallEH(0);
         gSafe = IsFacebookFamily();
@@ -3190,5 +3308,6 @@ static void ClearCrash(void) {
         %init;
         %init(AACContents);
         InstallDockBar();
+        KaInstall();
     }
 }
