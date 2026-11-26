@@ -1786,7 +1786,7 @@ static BOOL HostDeclaresAudio(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     if (s == 1) return 2;
     if (s == 2) return 1;
-    return PeekCrash().length ? 4 : 3;
+    return PeekCrash().length ? 3 : 2;
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 2 ? @"Hành vi" : (s == 1 ? @"Bàn phím" : @"Màu nhấn"); }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
@@ -1834,17 +1834,13 @@ static BOOL HostDeclaresAudio(void) {
         [sw addTarget:self action:@selector(masterChanged:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = sw;
     } else if (ip.row == 1) {
-        cell.textLabel.text = @"Mã màu";
-        cell.detailTextLabel.text = [@"#" stringByAppendingString:CurHex()];
+        cell.textLabel.text = @"Chọn màu…";
         UIView *sw = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 24, 24)];
         sw.layer.cornerRadius = 12;
         sw.backgroundColor = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
         sw.layer.borderWidth = 1;
         sw.layer.borderColor = UIColor.separatorColor.CGColor;
         cell.accessoryView = sw;
-    } else if (ip.row == 2) {
-        cell.textLabel.text = @"Chọn màu…";
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     } else {
         cell.textLabel.text = @"Lỗi crash lần trước";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1855,9 +1851,8 @@ static BOOL HostDeclaresAudio(void) {
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.section != 0) return;
-    if (ip.row == 1) [self editHex];
-    else if (ip.row == 2) [self pickColor];
-    else if (ip.row == 3) [self showCrash];
+    if (ip.row == 1) [self pickColor];
+    else if (ip.row == 2) [self showCrash];
 }
 
 - (void)showCrash {
