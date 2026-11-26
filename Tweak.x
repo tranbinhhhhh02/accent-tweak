@@ -3176,25 +3176,20 @@ static void InstallDockBar(void) {
 
 // ---- Background Keep-Alive: phat am thanh im lang + background task de app khong bi treo khi xuong nen ----
 static NSData *KAWav(void) {
-    const uint32_t rate = 8000, n = 8000, dataLen = n * 2;
+    const uint32_t rate = 22050, dataLen = 22050;   // 8-bit mono, 1 giay
     NSMutableData *d = [NSMutableData dataWithCapacity:44 + dataLen];
     uint32_t v32; uint16_t v16;
     #define KA4(x) do { v32 = (uint32_t)(x); [d appendBytes:&v32 length:4]; } while (0)
     #define KA2(x) do { v16 = (uint16_t)(x); [d appendBytes:&v16 length:2]; } while (0)
     [d appendBytes:"RIFF" length:4]; KA4(36 + dataLen);
     [d appendBytes:"WAVE" length:4];
-    [d appendBytes:"fmt " length:4]; KA4(16); KA2(1); KA2(1); KA4(rate); KA4(rate * 2); KA2(2); KA2(16);
+    [d appendBytes:"fmt " length:4]; KA4(16); KA2(1); KA2(1); KA4(rate); KA4(rate); KA2(1); KA2(8);
     [d appendBytes:"data" length:4]; KA4(dataLen);
     #undef KA4
     #undef KA2
-    int16_t *smp = calloc(n, sizeof(int16_t));
-    if (smp) {
-        for (uint32_t i = 0; i < n; i++) smp[i] = (i & 1) ? 1 : -1;   // bien do ~ -90dB, khong nghe thay
-        [d appendBytes:smp length:n * sizeof(int16_t)];
-        free(smp);
-    } else {
-        [d increaseLengthBy:dataLen];
-    }
+    uint8_t *smp = malloc(dataLen);
+    if (smp) { memset(smp, 0x80, dataLen); [d appendBytes:smp length:dataLen]; free(smp); }
+    else [d increaseLengthBy:dataLen];
     return d;
 }
 
@@ -3217,7 +3212,7 @@ static BOOL (*orig_ka_setAct3)(id, SEL, BOOL, NSUInteger, NSError **);
 
 // Khi dang o nen: app (vd. Facebook) hay doi session sang Ambient / tat session -> keep-alive mat tac dung. Giu lai Playback.
 static BOOL KANeedFix(NSString *cat) {
-    return gKeepAliveOn && gKAInBg && cat &&
+    return gKeepAliveOn && cat &&
            ([cat isEqualToString:@"AVAudioSessionCategoryAmbient"] || [cat isEqualToString:@"AVAudioSessionCategorySoloAmbient"]);
 }
 static BOOL new_ka_setCat3(id self, SEL _cmd, NSString *cat, NSUInteger opt, NSError **e) {
@@ -3287,7 +3282,8 @@ static void KAInstallSessionHooks(void) {
     NSOperationQueue *mq = NSOperationQueue.mainQueue;
     __weak AACKeepAlive *ws = self;
     [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = YES; @try { [ws start]; } @catch (__unused id x) {} }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = NO; @try { [ws stop]; } @catch (__unused id x) {} }];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = NO; @try { [ws endTask]; [ws start]; } @catch (__unused id x) {} }];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { @try { [ws start]; } @catch (__unused id x) {} }];
     NSArray *names = @[ @"AVAudioSessionInterruptionNotification",
                         @"AVAudioSessionMediaServicesWereResetNotification",
                         @"AVAudioSessionRouteChangeNotification" ];
@@ -3300,6 +3296,7 @@ static void KAInstallSessionHooks(void) {
             });
         }];
     }
+    if (gKeepAliveOn) [self start];   // chay lien tuc khi bat, giong IPATweaksPlus: phien am thanh da hoat dong truoc khi xuong nen
 }
 
 - (BOOL)playing {
@@ -3309,6 +3306,7 @@ static void KAInstallSessionHooks(void) {
 
 - (void)beginTask {
     if (self.bgTask != UIBackgroundTaskInvalid) return;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateBackground) return;
     __weak AACKeepAlive *ws = self;
     self.bgTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"AACKeepAlive" expirationHandler:^{
         AACKeepAlive *s = ws;
@@ -3347,7 +3345,7 @@ static void KAInstallSessionHooks(void) {
             p = ((id (*)(id, SEL, NSData *, NSError **))objc_msgSend)(p, NSSelectorFromString(@"initWithData:error:"), KAWav(), &err);
             if (!p) return;
             ((void (*)(id, SEL, NSInteger))objc_msgSend)(p, NSSelectorFromString(@"setNumberOfLoops:"), (NSInteger)-1);
-            ((void (*)(id, SEL, float))objc_msgSend)(p, NSSelectorFromString(@"setVolume:"), 0.05f);
+            ((void (*)(id, SEL, float))objc_msgSend)(p, NSSelectorFromString(@"setVolume:"), 1.0f);
             ((BOOL (*)(id, SEL))objc_msgSend)(p, NSSelectorFromString(@"prepareToPlay"));
             self.player = p;
         }
@@ -3402,7 +3400,7 @@ static void KAInstallSessionHooks(void) {
 
 - (void)refresh {
     if (!gKeepAliveOn) { [self stop]; return; }
-    if (UIApplication.sharedApplication.applicationState == UIApplicationStateBackground) [self start];
+    [self start];
 }
 @end
 
