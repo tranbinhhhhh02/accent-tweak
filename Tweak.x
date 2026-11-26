@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #import <objc/message.h>
+#include <notify.h>
 #if __has_include(<substrate.h>)
 #import <substrate.h>
 #endif
@@ -72,7 +73,6 @@ static volatile int32_t gPending;
 static BOOL        gSafe;
 static BOOL        gKbBarOn;
 static BOOL        gKbTopOn;
-static BOOL        gKeepAliveOn;
 static __thread BOOL gTintBypass;
 
 @interface CALayer (AACPrivate)
@@ -229,7 +229,6 @@ static void RefreshCache(void) {
     gMaster = [d boolForKey:kMasterKey];
     gKbBarOn = [d boolForKey:kKbBarKey];
     gKbTopOn = [d boolForKey:kKbTopKey];
-    gKeepAliveOn = [d boolForKey:kKeepAliveKey];
     UIColor *light = ColorFromHex(CurHex()) ?: ColorFromHex(kDefaultHex);
     UIColor *dark = DarkVariant(light);
     UIColor *dyn = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
@@ -1713,7 +1712,7 @@ static UIViewController *TopVC(void) {
 static NSString *PeekCrash(void);
 static void ClearCrash(void);
 static void KbBarRefreshAll(void);
-static void KeepAliveRefresh(void);
+static void IPATweaksSetBackgroundKeepAliveEnabled(BOOL on);
 
 // App chu co khai bao UIBackgroundModes = audio trong Info.plist khong
 static BOOL HostDeclaresAudio(void) {
@@ -1887,9 +1886,7 @@ static BOOL HostDeclaresAudio(void) {
 }
 
 - (void)keepAliveChanged:(UISwitch *)sw {
-    [NSUserDefaults.standardUserDefaults setBool:sw.isOn forKey:kKeepAliveKey];
-    gKeepAliveOn = sw.isOn;
-    KeepAliveRefresh();
+    IPATweaksSetBackgroundKeepAliveEnabled(sw.isOn);
 }
 
 - (void)kbTopChanged:(UISwitch *)sw {
@@ -3174,237 +3171,843 @@ static void InstallDockBar(void) {
     MSHookMessageEx(c, @selector(layoutSubviews), (IMP)new_dockLayout, (IMP *)&orig_dockLayout);
 }
 
-// ---- Background Keep-Alive: phat am thanh im lang + background task de app khong bi treo khi xuong nen ----
-static NSData *KAWav(void) {
-    const uint32_t rate = 22050, dataLen = 22050;   // 8-bit mono, 1 giay
-    NSMutableData *d = [NSMutableData dataWithCapacity:44 + dataLen];
-    uint32_t v32; uint16_t v16;
-    #define KA4(x) do { v32 = (uint32_t)(x); [d appendBytes:&v32 length:4]; } while (0)
-    #define KA2(x) do { v16 = (uint16_t)(x); [d appendBytes:&v16 length:2]; } while (0)
-    [d appendBytes:"RIFF" length:4]; KA4(36 + dataLen);
-    [d appendBytes:"WAVE" length:4];
-    [d appendBytes:"fmt " length:4]; KA4(16); KA2(1); KA2(1); KA4(rate); KA4(rate); KA2(1); KA2(8);
-    [d appendBytes:"data" length:4]; KA4(dataLen);
-    #undef KA4
-    #undef KA2
-    uint8_t *smp = malloc(dataLen);
-    if (smp) { memset(smp, 0x80, dataLen); [d appendBytes:smp length:dataLen]; free(smp); }
-    else [d increaseLengthBy:dataLen];
-    return d;
-}
+// =====================================================================================
+// DUY TRÌ NỀN (Background)
+// Trích xuất trực tiếp từ IPATweaksPlusVH.dylib (slice arm64) — dịch 1:1 từ mã máy:
+//   • class  IPATweaksBackgroundKeepAliveService   (29 method, dylib 0x5a628–0x5bab0)
+//   • hàm    IPATweaksBackgroundKeepAliveBootstrap / RefreshBackgroundKeepAlive / IsBackgroundKeepAliveRunning
+//   • hook   -[AVAudioSession setActive:error:] / setActive:withOptions:error:        (dylib 0x5bee0, 0x5bfa0)
+//   • hooks  Immortalizer: -[UIApplication applicationState], NSNotificationCenter post*,
+//            UNUserNotificationCenter setDelegate: / willPresent, app/scene delegate  (dylib 0x9fbc–0xad10)
+// Khác bản gốc duy nhất: (1) key bật/tắt dùng kKeepAliveKey của Tweak.x thay vì
+// "IPATweaksPlus_Immortalizer_Enabled"; (2) AVAudioSession/AVAudioPlayer được lấy lúc chạy
+// (NSClassFromString + dlopen AVFAudio) để không phải thêm framework vào Makefile.
+// =====================================================================================
 
-static id KASession(void) {
-    Class c = NSClassFromString(@"AVAudioSession");
-    if (!c) {
-        dlopen("/System/Library/Frameworks/AVFAudio.framework/AVFAudio", RTLD_LAZY);
-        c = NSClassFromString(@"AVAudioSession");
-    }
-    if (!c) return nil;
-    return ((id (*)(id, SEL))objc_msgSend)((id)c, NSSelectorFromString(@"sharedInstance"));
-}
+static NSString *const kIPATweaksImmortalizerAltKey = @"immortalized";
+static NSString *const kIPATweaksPrefsNotify        = @"com.sergy.immortalizerjailed.updateprefs";
+static NSString *const kIPATweaksAVCategoryPlayback = @"AVAudioSessionCategoryPlayback";
 
-static BOOL gKAInBg;
-static BOOL (*orig_ka_setCat3)(id, SEL, NSString *, NSUInteger, NSError **);
-static BOOL (*orig_ka_setCat2)(id, SEL, NSString *, NSError **);
-static BOOL (*orig_ka_setCat4)(id, SEL, NSString *, NSString *, NSUInteger, NSError **);
-static BOOL (*orig_ka_setAct2)(id, SEL, BOOL, NSError **);
-static BOOL (*orig_ka_setAct3)(id, SEL, BOOL, NSUInteger, NSError **);
-
-// Khi dang o nen: app (vd. Facebook) hay doi session sang Ambient / tat session -> keep-alive mat tac dung. Giu lai Playback.
-static BOOL KANeedFix(NSString *cat) {
-    return gKeepAliveOn && cat &&
-           ([cat isEqualToString:@"AVAudioSessionCategoryAmbient"] || [cat isEqualToString:@"AVAudioSessionCategorySoloAmbient"]);
-}
-static BOOL new_ka_setCat3(id self, SEL _cmd, NSString *cat, NSUInteger opt, NSError **e) {
-    if (KANeedFix(cat)) { cat = @"AVAudioSessionCategoryPlayback"; opt |= 1; }
-    return orig_ka_setCat3 ? orig_ka_setCat3(self, _cmd, cat, opt, e) : NO;
-}
-static BOOL new_ka_setCat2(id self, SEL _cmd, NSString *cat, NSError **e) {
-    if (KANeedFix(cat) && orig_ka_setCat3)
-        return orig_ka_setCat3(self, NSSelectorFromString(@"setCategory:withOptions:error:"), @"AVAudioSessionCategoryPlayback", 1, e);
-    return orig_ka_setCat2 ? orig_ka_setCat2(self, _cmd, cat, e) : NO;
-}
-static BOOL new_ka_setCat4(id self, SEL _cmd, NSString *cat, NSString *mode, NSUInteger opt, NSError **e) {
-    if (KANeedFix(cat)) { cat = @"AVAudioSessionCategoryPlayback"; opt |= 1; }
-    return orig_ka_setCat4 ? orig_ka_setCat4(self, _cmd, cat, mode, opt, e) : NO;
-}
-static BOOL new_ka_setAct2(id self, SEL _cmd, BOOL on, NSError **e) {
-    if (!on && gKeepAliveOn && gKAInBg) { if (e) *e = nil; return YES; }
-    return orig_ka_setAct2 ? orig_ka_setAct2(self, _cmd, on, e) : NO;
-}
-static BOOL new_ka_setAct3(id self, SEL _cmd, BOOL on, NSUInteger opt, NSError **e) {
-    if (!on && gKeepAliveOn && gKAInBg) { if (e) *e = nil; return YES; }
-    return orig_ka_setAct3 ? orig_ka_setAct3(self, _cmd, on, opt, e) : NO;
-}
-static void KAHook(Class c, NSString *sel, IMP n, IMP *o) {
-    SEL sl = NSSelectorFromString(sel);
-    if (!c || !class_getInstanceMethod(c, sl)) return;
-    MSHookMessageEx(c, sl, n, o);
-}
-static void KAInstallSessionHooks(void) {
-    static BOOL done;
-    if (done) return;
-    Class c = NSClassFromString(@"AVAudioSession");
-    if (!c) return;
-    done = YES;
-    KAHook(c, @"setCategory:withOptions:error:", (IMP)new_ka_setCat3, (IMP *)&orig_ka_setCat3);
-    KAHook(c, @"setCategory:error:", (IMP)new_ka_setCat2, (IMP *)&orig_ka_setCat2);
-    KAHook(c, @"setCategory:mode:options:error:", (IMP)new_ka_setCat4, (IMP *)&orig_ka_setCat4);
-    KAHook(c, @"setActive:error:", (IMP)new_ka_setAct2, (IMP *)&orig_ka_setAct2);
-    KAHook(c, @"setActive:withOptions:error:", (IMP)new_ka_setAct3, (IMP *)&orig_ka_setAct3);
-}
-
-@interface AACKeepAlive : NSObject
-@property (nonatomic, strong) id player;
-@property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
-@property (nonatomic, strong) dispatch_source_t timer;
-@property (nonatomic, assign) BOOL running;
-+ (instancetype)shared;
-- (void)install;
-- (void)refresh;
+// ---- AVFoundation lấy lúc chạy (không link trực tiếp) ----
+@protocol IPATweaksAudioSession <NSObject>
+- (NSString *)category;
+- (BOOL)setCategory:(NSString *)category withOptions:(NSUInteger)options error:(NSError **)outError;
+- (BOOL)setActive:(BOOL)active error:(NSError **)outError;
 @end
 
-@implementation AACKeepAlive
-+ (instancetype)shared {
-    static AACKeepAlive *k; static dispatch_once_t once;
-    dispatch_once(&once, ^{ k = [AACKeepAlive new]; k.bgTask = UIBackgroundTaskInvalid; });
-    return k;
-}
+@protocol IPATweaksAudioPlayer <NSObject>
+- (BOOL)isPlaying;
+- (BOOL)play;
+- (void)stop;
+- (BOOL)prepareToPlay;
+- (void)setVolume:(float)volume;
+- (void)setNumberOfLoops:(NSInteger)loops;
+@end
 
-- (void)install {
-    static BOOL done;
-    if (done) return;
-    done = YES;
-    Crumb("keepalive:install");
-    gKAInBg = (UIApplication.sharedApplication.applicationState == UIApplicationStateBackground);
-    KAInstallSessionHooks();
-    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-    NSOperationQueue *mq = NSOperationQueue.mainQueue;
-    __weak AACKeepAlive *ws = self;
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = YES; @try { [ws start]; } @catch (__unused id x) {} }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { gKAInBg = NO; @try { [ws endTask]; [ws start]; } @catch (__unused id x) {} }];
-    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { @try { [ws start]; } @catch (__unused id x) {} }];
-    NSArray *names = @[ @"AVAudioSessionInterruptionNotification",
-                        @"AVAudioSessionMediaServicesWereResetNotification",
-                        @"AVAudioSessionRouteChangeNotification" ];
-    for (NSString *nm in names) {
-        [nc addObserverForName:nm object:nil queue:mq usingBlock:^(NSNotification *n) {
-            AACKeepAlive *s = ws;
-            if (!s || !s.running || !gKeepAliveOn) return;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                @try { if (s.running && gKeepAliveOn) [s playSilent]; } @catch (__unused id x) {}
-            });
-        }];
+static Class IPATweaksAVClass(const char *name) {
+    Class c = objc_getClass(name);
+    if (!c) {
+        dlopen("/System/Library/Frameworks/AVFAudio.framework/AVFAudio", RTLD_LAZY);
+        dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
+        c = objc_getClass(name);
     }
-    if (gKeepAliveOn) [self start];   // chay lien tuc khi bat, giong IPATweaksPlus: phien am thanh da hoat dong truoc khi xuong nen
+    return c;
 }
 
-- (BOOL)playing {
-    id p = self.player;
-    return p && ((BOOL (*)(id, SEL))objc_msgSend)(p, NSSelectorFromString(@"isPlaying"));
+static id<IPATweaksAudioSession> IPATweaksAudioSessionShared(void) {
+    Class c = IPATweaksAVClass("AVAudioSession");
+    return c ? ((id (*)(id, SEL))objc_msgSend)((id)c, sel_registerName("sharedInstance")) : nil;
 }
 
-- (void)beginTask {
-    if (self.bgTask != UIBackgroundTaskInvalid) return;
-    if (UIApplication.sharedApplication.applicationState != UIApplicationStateBackground) return;
-    __weak AACKeepAlive *ws = self;
-    self.bgTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"AACKeepAlive" expirationHandler:^{
-        AACKeepAlive *s = ws;
-        if (!s) return;
-        UIBackgroundTaskIdentifier t = s.bgTask;
-        s.bgTask = UIBackgroundTaskInvalid;
-        if (t != UIBackgroundTaskInvalid) [UIApplication.sharedApplication endBackgroundTask:t];
+static void IPATweaksRefreshBackgroundKeepAlive(void);
+static void IPATweaksReadImmortalizerPrefs(void);
+
+// =====================================================================================
+// IPATweaksBackgroundKeepAliveService
+// =====================================================================================
+@interface IPATweaksBackgroundKeepAliveService : NSObject
+@property (nonatomic, strong) id<IPATweaksAudioPlayer> audioPlayer;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, assign) NSUInteger bgTask;
+@property (nonatomic, assign) BOOL isImmortalized;
+@property (atomic, assign) BOOL playbackRunning;
++ (instancetype)sharedInstance;
+- (BOOL)isRunning;
+- (void)applyEnabled:(BOOL)enabled;
+- (void)userDefaultsDidChange:(NSNotification *)n;
+- (void)startTimer;
+- (void)stopTimer;
+- (void)timerFired;
+- (void)beginBackgroundAssertion;
+- (void)endBackgroundAssertion;
+- (void)startPlayingSilentAudio;
+- (void)stopPlayingSilentAudio;
+- (void)handleAudioInterruption:(NSNotification *)n;
+- (void)handleRouteChange:(NSNotification *)n;
+- (void)handleMediaServicesReset:(NSNotification *)n;
+- (void)applicationDidEnterBackground:(NSNotification *)n;
+- (void)applicationWillResignActive:(NSNotification *)n;
+- (void)applicationDidBecomeActive:(NSNotification *)n;
+@end
+
+@implementation IPATweaksBackgroundKeepAliveService
+
++ (instancetype)sharedInstance {                                   // 0x5a628 / 0x5a668
+    static IPATweaksBackgroundKeepAliveService *shared;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ shared = [[IPATweaksBackgroundKeepAliveService alloc] init]; });
+    return shared;
+}
+
+- (instancetype)init {                                             // 0x5a694
+    self = [super init];
+    if (self) {
+        _bgTask = UIBackgroundTaskInvalid;
+        _isImmortalized = NO;
+        NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        [nc addObserver:self selector:@selector(userDefaultsDidChange:)      name:NSUserDefaultsDidChangeNotification          object:nil];
+        [nc addObserver:self selector:@selector(applicationDidEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [nc addObserver:self selector:@selector(applicationWillResignActive:)   name:UIApplicationWillResignActiveNotification   object:nil];
+        [nc addObserver:self selector:@selector(applicationDidBecomeActive:)    name:UIApplicationDidBecomeActiveNotification    object:nil];
+        [nc addObserver:self selector:@selector(applicationDidBecomeActive:)    name:UIApplicationWillEnterForegroundNotification object:nil];
+        id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+        [nc addObserver:self selector:@selector(handleAudioInterruption:) name:@"AVAudioSessionInterruptionNotification"           object:session];
+        [nc addObserver:self selector:@selector(handleRouteChange:)       name:@"AVAudioSessionRouteChangeNotification"            object:session];
+        [nc addObserver:self selector:@selector(handleMediaServicesReset:) name:@"AVAudioSessionMediaServicesWereResetNotification" object:session];
+    }
+    return self;
+}
+
+- (void)dealloc {                                                  // 0x5a88c
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    [self.timer invalidate];
+    [self endBackgroundAssertion];
+    [self stopPlayingSilentAudio];
+}
+
+- (BOOL)isRunning {                                                // 0x5a954
+    return self.playbackRunning;
+}
+
+- (void)applyEnabled:(BOOL)enabled {                               // 0x5a960
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self applyEnabled:enabled]; });   // block 0x5ab20
+        return;
+    }
+    if (enabled) {
+        UIApplication *app = UIApplication.sharedApplication;
+        if (!app) return;
+        if (!self.isImmortalized) {
+            self.isImmortalized = YES;
+            [self startTimer];
+            return;
+        }
+        [self beginBackgroundAssertion];
+        if (self.audioPlayer && [self.audioPlayer isPlaying]) return;
+        [self startPlayingSilentAudio];
+    } else if (self.isImmortalized) {
+        self.isImmortalized = NO;
+        [self stopTimer];
+    }
+}
+
+- (void)userDefaultsDidChange:(NSNotification *)n {                // 0x5ab38
+    IPATweaksRefreshBackgroundKeepAlive();
+}
+
+- (void)startTimer {                                               // 0x5ab84
+    [self.timer invalidate];
+    [self beginBackgroundAssertion];
+    self.timer = [NSTimer timerWithTimeInterval:0.35 target:self selector:@selector(timerFired) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+    [self startPlayingSilentAudio];
+}
+
+- (void)stopTimer {                                                // 0x5acb4
+    [self endBackgroundAssertion];
+    [self stopPlayingSilentAudio];
+    [self.timer invalidate];
+    self.timer = nil;
+}
+
+- (void)timerFired {                                               // 0x5ad2c
+    if (!self.isImmortalized) return;
+    if (self.bgTask == UIBackgroundTaskInvalid || self.bgTask == 0) [self beginBackgroundAssertion];
+    id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+    if (![[session category] isEqualToString:kIPATweaksAVCategoryPlayback]) {
+        [session setCategory:kIPATweaksAVCategoryPlayback withOptions:1 error:nil];
+        [session setActive:YES error:nil];
+    }
+    if (self.audioPlayer && [self.audioPlayer isPlaying]) {
+        self.playbackRunning = YES;
+    } else {
+        [self startPlayingSilentAudio];
+    }
+}
+
+- (void)beginBackgroundAssertion {                                 // 0x5aef0 (+ blocks 0x5b054, 0x5b160)
+    UIApplication *app = UIApplication.sharedApplication;
+    if (!app) return;
+    UIBackgroundTaskIdentifier old = self.bgTask;
+    __weak IPATweaksBackgroundKeepAliveService *weakSelf = self;
+    self.bgTask = [app beginBackgroundTaskWithName:@"imj.keepalive" expirationHandler:^{
+        IPATweaksBackgroundKeepAliveService *strongSelf = weakSelf;
+        if (strongSelf && strongSelf.isImmortalized) {
+            UIBackgroundTaskIdentifier fresh = [app beginBackgroundTaskWithName:@"imj.keepalive" expirationHandler:nil];
+            UIBackgroundTaskIdentifier prev = strongSelf.bgTask;
+            strongSelf.bgTask = fresh;
+            if (prev && prev != UIBackgroundTaskInvalid) [app endBackgroundTask:prev];
+            dispatch_async(dispatch_get_main_queue(), ^{ [strongSelf beginBackgroundAssertion]; });
+        }
     }];
+    if (old && old != UIBackgroundTaskInvalid) [app endBackgroundTask:old];
 }
 
-- (void)endTask {
-    UIBackgroundTaskIdentifier t = self.bgTask;
-    self.bgTask = UIBackgroundTaskInvalid;
-    if (t != UIBackgroundTaskInvalid) [UIApplication.sharedApplication endBackgroundTask:t];
+- (void)endBackgroundAssertion {                                   // 0x5b170
+    if (self.bgTask != UIBackgroundTaskInvalid && self.bgTask != 0) {
+        [UIApplication.sharedApplication endBackgroundTask:self.bgTask];
+        self.bgTask = UIBackgroundTaskInvalid;
+    }
 }
 
-- (void)playSilent {
-    @try {
-        Crumb("keepalive:session");
-        id s = KASession();
-        if (!s) return;
-        NSError *err = nil;
-        NSString *cat = ((id (*)(id, SEL))objc_msgSend)(s, NSSelectorFromString(@"category"));
-        NSString *pb = @"AVAudioSessionCategoryPlayback";
-        // Chi doi category khi app chua dung Playback/PlayAndRecord; MixWithOthers (=1) de khong ngat nhac/video khac
-        if (![cat isEqualToString:pb] && ![cat isEqualToString:@"AVAudioSessionCategoryPlayAndRecord"] && ![cat isEqualToString:@"AVAudioSessionCategoryMultiRoute"]) {
-            ((BOOL (*)(id, SEL, NSString *, NSUInteger, NSError **))objc_msgSend)(
-                s, NSSelectorFromString(@"setCategory:withOptions:error:"), pb, (NSUInteger)1, &err);
+- (void)startPlayingSilentAudio {                                  // 0x5b230
+    id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+    [session setCategory:kIPATweaksAVCategoryPlayback withOptions:1 error:nil];
+    [session setActive:YES error:nil];
+    if (self.audioPlayer) {
+        [self.audioPlayer play];
+        self.playbackRunning = [self.audioPlayer isPlaying];
+    } else {
+        NSData *wav = [[NSData alloc] initWithBase64EncodedString:
+    @"UklGRkZWAABXQVZFZm10IBAAAAABAAEAIlYAACJWAAABAAgAZGF0YSJWAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+    @"gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA="
+            options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (wav) {
+            Class pc = IPATweaksAVClass("AVAudioPlayer");
+            id p = pc ? [pc alloc] : nil;
+            p = p ? ((id (*)(id, SEL, NSData *, NSError **))objc_msgSend)(p, sel_registerName("initWithData:error:"), wav, NULL) : nil;
+            self.audioPlayer = p;
+            [self.audioPlayer setVolume:1.0f];
+            [self.audioPlayer setNumberOfLoops:-1];
+            [self.audioPlayer prepareToPlay];
+            [self.audioPlayer play];
+            self.playbackRunning = [self.audioPlayer isPlaying];
         }
-        ((BOOL (*)(id, SEL, BOOL, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setActive:error:"), YES, &err);
-        Crumb("keepalive:player");
-        if (!self.player) {
-            Class pc = NSClassFromString(@"AVAudioPlayer");
-            if (!pc) return;
-            id p = [pc alloc];
-            p = ((id (*)(id, SEL, NSData *, NSError **))objc_msgSend)(p, NSSelectorFromString(@"initWithData:error:"), KAWav(), &err);
-            if (!p) return;
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(p, NSSelectorFromString(@"setNumberOfLoops:"), (NSInteger)-1);
-            ((void (*)(id, SEL, float))objc_msgSend)(p, NSSelectorFromString(@"setVolume:"), 1.0f);
-            ((BOOL (*)(id, SEL))objc_msgSend)(p, NSSelectorFromString(@"prepareToPlay"));
-            self.player = p;
-        }
-        if (![self playing]) ((BOOL (*)(id, SEL))objc_msgSend)(self.player, NSSelectorFromString(@"play"));
-    } @catch (__unused id x) {}
+    }
 }
 
-- (void)armTimer {
-    if (self.timer) return;
-    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-    __weak AACKeepAlive *ws = self;
-    dispatch_source_set_event_handler(t, ^{
-        AACKeepAlive *s = ws;
-        if (!s) return;
-        Crumb("keepalive:timer");
-        if (!gKeepAliveOn || !s.running) { [s stop]; return; }
-        [s playSilent];
-        if (s.bgTask == UIBackgroundTaskInvalid && UIApplication.sharedApplication.applicationState == UIApplicationStateBackground)
-            [s beginTask];
-    });
-    self.timer = t;
-    dispatch_resume(t);
+- (void)stopPlayingSilentAudio {                                   // 0x5b4b4
+    [self.audioPlayer stop];
+    self.audioPlayer = nil;
+    self.playbackRunning = NO;
 }
 
-- (void)start {
-    if (!gKeepAliveOn || !OnMain()) return;
-    self.running = YES;
-    Crumb("keepalive:start");
-    [self beginTask];
-    [self playSilent];      // chay NGAY trong luc xuong nen, khong tri hoan
-    [self armTimer];
-    // App co the doi/tat session ngay sau khi xuong nen -> khang dinh lai nhieu lan
-    __weak AACKeepAlive *ws = self;
-    double ds[3] = { 0.4, 1.5, 4.0 };
-    for (int i = 0; i < 3; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ds[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            AACKeepAlive *s = ws;
-            if (!s || !s.running || !gKeepAliveOn) return;
-            @try { [s playSilent]; } @catch (__unused id x) {}
+- (void)handleAudioInterruption:(NSNotification *)n {              // 0x5b520
+    if (!self.isImmortalized) return;
+    id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+    [session setCategory:kIPATweaksAVCategoryPlayback withOptions:1 error:nil];
+    [session setActive:YES error:nil];
+    [self.audioPlayer play];
+    self.playbackRunning = [self.audioPlayer isPlaying];
+}
+
+- (void)handleRouteChange:(NSNotification *)n {                    // 0x5b634
+    if (!self.isImmortalized) return;
+    id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+    [session setCategory:kIPATweaksAVCategoryPlayback withOptions:1 error:nil];
+    [session setActive:YES error:nil];
+    if (![self.audioPlayer isPlaying]) [self.audioPlayer play];
+    self.playbackRunning = [self.audioPlayer isPlaying];
+}
+
+- (void)handleMediaServicesReset:(NSNotification *)n {             // 0x5b788
+    if (!self.isImmortalized) return;
+    self.audioPlayer = nil;
+    [self startPlayingSilentAudio];
+}
+
+- (void)applicationDidEnterBackground:(NSNotification *)n {        // 0x5b7e0
+    if (!self.isImmortalized) return;
+    [self beginBackgroundAssertion];
+    id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+    [session setCategory:kIPATweaksAVCategoryPlayback withOptions:1 error:nil];
+    [session setActive:YES error:nil];
+    if (self.audioPlayer && [self.audioPlayer isPlaying]) return;
+    [self startPlayingSilentAudio];
+}
+
+- (void)applicationWillResignActive:(NSNotification *)n {          // 0x5b918
+    if (!self.isImmortalized) return;
+    [self beginBackgroundAssertion];
+    id<IPATweaksAudioSession> session = IPATweaksAudioSessionShared();
+    [session setCategory:kIPATweaksAVCategoryPlayback withOptions:1 error:nil];
+    [session setActive:YES error:nil];
+    if (self.audioPlayer && [self.audioPlayer isPlaying]) return;
+    [self startPlayingSilentAudio];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)n {           // 0x5ba50
+    IPATweaksRefreshBackgroundKeepAlive();
+}
+
+@end
+
+// ---- Refresh / Bootstrap / IsRunning (dylib 0x5ab3c, 0x5bae0, 0x5bcd8) ----
+static void IPATweaksApplyKeepAliveFromPrefs(void) {               // block 0x5bc1c
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    BOOL on = [d boolForKey:kKeepAliveKey] ?: [d boolForKey:kIPATweaksImmortalizerAltKey];
+    [[IPATweaksBackgroundKeepAliveService sharedInstance] applyEnabled:on];
+}
+
+static void IPATweaksRefreshBackgroundKeepAlive(void) {
+    if ([NSThread isMainThread]) IPATweaksApplyKeepAliveFromPrefs();
+    else dispatch_async(dispatch_get_main_queue(), ^{ IPATweaksApplyKeepAliveFromPrefs(); });
+}
+
+static BOOL IPATweaksIsBackgroundKeepAliveRunning(void) {
+    return [[IPATweaksBackgroundKeepAliveService sharedInstance] isRunning];
+}
+
+// Hook AVAudioSession: khi service đang chạy, chặn mọi lệnh setActive:NO (dylib 0x5bee0 / 0x5bfa0)
+static IMP gKAOrigSetActive;
+static IMP gKAOrigSetActiveOpts;
+
+static BOOL IPATweaksHook_setActive(id self, SEL _cmd, BOOL active, NSError **err) {
+    if (!active && IPATweaksIsBackgroundKeepAliveRunning()) {
+        if (err) *err = nil;
+        return YES;
+    }
+    return gKAOrigSetActive ? ((BOOL (*)(id, SEL, BOOL, NSError **))gKAOrigSetActive)(self, _cmd, active, err) : YES;
+}
+
+static BOOL IPATweaksHook_setActiveOpts(id self, SEL _cmd, BOOL active, NSUInteger opts, NSError **err) {
+    if (!active && IPATweaksIsBackgroundKeepAliveRunning()) {
+        if (err) *err = nil;
+        return YES;
+    }
+    return gKAOrigSetActiveOpts ? ((BOOL (*)(id, SEL, BOOL, NSUInteger, NSError **))gKAOrigSetActiveOpts)(self, _cmd, active, opts, err) : YES;
+}
+
+static void IPATweaksInstallAudioSessionHooks(void) {              // block 0x5be48
+    Class c = IPATweaksAVClass("AVAudioSession");
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, sel_registerName("setActive:error:"));
+    if (m) {
+        gKAOrigSetActive = method_getImplementation(m);
+        method_setImplementation(m, (IMP)IPATweaksHook_setActive);
+    }
+    m = class_getInstanceMethod(c, sel_registerName("setActive:withOptions:error:"));
+    if (m) {
+        gKAOrigSetActiveOpts = method_getImplementation(m);
+        method_setImplementation(m, (IMP)IPATweaksHook_setActiveOpts);
+    }
+}
+
+// Chờ UIApplication tồn tại (20ms/lần, tối đa 750 lần) rồi áp dụng (dylib 0x5bb68)
+static void IPATweaksKeepAlivePoll(NSUInteger attempt) {
+    if (UIApplication.sharedApplication) {
+        IPATweaksRefreshBackgroundKeepAlive();
+        return;
+    }
+    if (attempt <= 0x2ed) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20000000ull), dispatch_get_main_queue(), ^{
+            IPATweaksKeepAlivePoll(attempt + 1);
         });
     }
 }
 
-- (void)stop {
-    Crumb("keepalive:stop");
-    self.running = NO;
-    if (self.timer) { dispatch_source_cancel(self.timer); self.timer = nil; }
-    if ([self playing]) ((void (*)(id, SEL))objc_msgSend)(self.player, NSSelectorFromString(@"stop"));
-    [self endTask];
+static void IPATweaksBackgroundKeepAliveBootstrap(void) {          // 0x5bae0 / block 0x5bb18
+    static dispatch_once_t once, hooksOnce;
+    dispatch_once(&once, ^{
+        dispatch_once(&hooksOnce, ^{ IPATweaksInstallAudioSessionHooks(); });
+        dispatch_async(dispatch_get_main_queue(), ^{ IPATweaksKeepAlivePoll(0); });
+    });
 }
 
-- (void)refresh {
-    if (!gKeepAliveOn) { [self stop]; return; }
-    [self start];
-}
-@end
+// =====================================================================================
+// Immortalizer runtime hooks (dylib 0x9f84–0xad10)
+// =====================================================================================
 
-static void KeepAliveRefresh(void) { [[AACKeepAlive shared] refresh]; }
+
+typedef struct { __unsafe_unretained Class cls; SEL sel; IMP orig; } IPATweaksIMHookEntry;
+
+static IMP  gIMOrigAppState, gIMOrigPostName, gIMOrigPost, gIMOrigSetDelegate, gIMOrigWillPresent;
+static BOOL gIMInBackground;                 // dylib 0x333130
+static BOOL gIMEnabled;                      // dylib 0x333140
+static NSUInteger gIMSuppressed;             // dylib 0x333138
+static NSSet *gIMBgNames;                    // dylib 0x333100
+static IPATweaksIMHookEntry gIMHooks[32];    // dylib 0x333160
+static NSUInteger gIMHookCount;              // dylib 0x333158
+
+static BOOL IPATweaksIMIsSuppressedName(NSString *name) {          // 0xaa44 / block 0xaac0
+    if (!name) return NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gIMBgNames = [[NSSet alloc] initWithObjects:UIApplicationWillResignActiveNotification,
+                                                    UIApplicationDidEnterBackgroundNotification,
+                                                    UISceneWillDeactivateNotification,
+                                                    UISceneDidEnterBackgroundNotification, nil];
+    });
+    return [gIMBgNames containsObject:name];
+}
+
+static void IPATweaksIMTrackState(NSString *name) {
+    if (!name) return;
+    if (name == UIApplicationDidEnterBackgroundNotification || [name isEqualToString:UIApplicationDidEnterBackgroundNotification])
+        gIMInBackground = YES;
+    else if (name == UIApplicationWillEnterForegroundNotification || [name isEqualToString:UIApplicationWillEnterForegroundNotification])
+        gIMInBackground = NO;
+}
+
+static NSInteger IPATweaksIMHook_applicationState(id self, SEL _cmd) {       // 0xa1b0
+    if (gIMEnabled) return UIApplicationStateActive;
+    return gIMOrigAppState ? ((NSInteger (*)(id, SEL))gIMOrigAppState)(self, _cmd) : UIApplicationStateActive;
+}
+
+static void IPATweaksIMHook_postNameObjUser(id self, SEL _cmd, NSString *name, id obj, NSDictionary *ui) {   // 0xa210
+    IPATweaksIMTrackState(name);
+    if (gIMEnabled && IPATweaksIMIsSuppressedName(name)) {
+        gIMSuppressed++;
+    } else if (gIMOrigPostName) {
+        ((void (*)(id, SEL, id, id, id))gIMOrigPostName)(self, _cmd, name, obj, ui);
+    }
+}
+
+static void IPATweaksIMHook_postNotification(id self, SEL _cmd, NSNotification *n) {                          // 0xa34c
+    if (n) IPATweaksIMTrackState(n.name);
+    if (gIMEnabled && n && IPATweaksIMIsSuppressedName(n.name)) {
+        gIMSuppressed++;
+    } else if (gIMOrigPost) {
+        ((void (*)(id, SEL, id))gIMOrigPost)(self, _cmd, n);
+    }
+}
+
+static void IPATweaksIMHook_willPresent(id self, SEL _cmd, id center, id notification, void (^handler)(NSUInteger)) {   // 0xab38
+    if (gIMEnabled && gIMInBackground == YES) {
+        handler(0x13);          // Badge | Sound | Banner
+    } else if (gIMOrigWillPresent) {
+        ((void (*)(id, SEL, id, id, id))gIMOrigWillPresent)(self, _cmd, center, notification, handler);
+    } else {
+        handler(0);
+    }
+}
+
+static void IPATweaksIMHook_setDelegate(id self, SEL _cmd, id delegate) {                                        // 0xa53c
+    if (gIMOrigSetDelegate) ((void (*)(id, SEL, id))gIMOrigSetDelegate)(self, _cmd, delegate);
+    if (!delegate) return;
+    Method m = class_getInstanceMethod([delegate class], sel_registerName("userNotificationCenter:willPresentNotification:withCompletionHandler:"));
+    if (!m) return;
+    IMP imp = method_getImplementation(m);
+    if (imp == (IMP)IPATweaksIMHook_willPresent) return;
+    gIMOrigWillPresent = imp;
+    method_setImplementation(m, (IMP)IPATweaksIMHook_willPresent);
+}
+
+// Hook chung cho delegate/scene delegate: applicationWillResignActive:, applicationDidEnterBackground:,
+// sceneWillResignActive:, sceneDidEnterBackground:  (dylib 0xac1c)
+static void IPATweaksIMHook_delegateEvent(id self, SEL _cmd, id arg) {
+    if (gIMEnabled) { gIMSuppressed++; return; }
+    Class cls = object_getClass(self);
+    for (NSUInteger i = 0; i < gIMHookCount; i++) {
+        if (gIMHooks[i].sel == _cmd && (gIMHooks[i].cls == cls || [self isKindOfClass:gIMHooks[i].cls])) {
+            if (gIMHooks[i].orig) ((void (*)(id, SEL, id))gIMHooks[i].orig)(self, _cmd, arg);
+            return;
+        }
+    }
+}
+
+static void IPATweaksIMHookInstanceMethod(id obj, SEL sel) {                                                      // 0xa82c
+    if (!obj || !sel || gIMHookCount > 0x1f) return;
+    Class cls = object_getClass(obj);
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP imp = method_getImplementation(m);
+    if (imp == (IMP)IPATweaksIMHook_delegateEvent) return;
+    for (NSUInteger i = 0; i < gIMHookCount; i++)
+        if (gIMHooks[i].cls == cls && gIMHooks[i].sel == sel) return;
+    if (!class_addMethod(cls, sel, (IMP)IPATweaksIMHook_delegateEvent, method_getTypeEncoding(m)))
+        method_setImplementation(m, (IMP)IPATweaksIMHook_delegateEvent);
+    gIMHooks[gIMHookCount].cls = cls;
+    gIMHooks[gIMHookCount].sel = sel;
+    gIMHooks[gIMHookCount].orig = imp;
+    gIMHookCount++;
+}
+
+static void IPATweaksIMInstallDelegateHooks(void) {                                                               // 0xa614
+    UIApplication *app = UIApplication.sharedApplication;
+    if (!app) return;
+    id del = app.delegate;
+    if (del) {
+        IPATweaksIMHookInstanceMethod(del, sel_registerName("applicationWillResignActive:"));
+        IPATweaksIMHookInstanceMethod(del, sel_registerName("applicationDidEnterBackground:"));
+    }
+    if ([app respondsToSelector:sel_registerName("connectedScenes")]) {
+        for (UIScene *scene in app.connectedScenes) {
+            if ([scene respondsToSelector:sel_registerName("delegate")]) {
+                id sd = scene.delegate;
+                if (sd) {
+                    IPATweaksIMHookInstanceMethod(sd, sel_registerName("sceneWillResignActive:"));
+                    IPATweaksIMHookInstanceMethod(sd, sel_registerName("sceneDidEnterBackground:"));
+                }
+            }
+        }
+    }
+}
+
+// Đọc cấu hình rồi áp dụng (dylib 0xa940). Bỏ phần cập nhật FloatingButtonWindow vì Tweak.x không có nút nổi.
+static void IPATweaksReadImmortalizerPrefs(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    gIMEnabled = [d boolForKey:kKeepAliveKey] ?: [d boolForKey:kIPATweaksImmortalizerAltKey];
+    IPATweaksRefreshBackgroundKeepAlive();
+}
+
+static void IPATweaksPrefsDarwinCallback(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef u) {
+    IPATweaksReadImmortalizerPrefs();                                                                             // 0xa610
+}
+
+static void IPATweaksReplaceMethod(Class c, SEL sel, IMP imp, IMP *orig) {
+    Method m = c ? class_getInstanceMethod(c, sel) : NULL;
+    if (!m) return;
+    *orig = method_getImplementation(m);
+    method_setImplementation(m, imp);
+}
+
+static void IPATweaksInstallImmortalizerRuntimeHooks(void) {              // 0x9f84 / block 0x9fbc
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        IPATweaksReplaceMethod(objc_getClass("UIApplication"), sel_registerName("applicationState"),
+                               (IMP)IPATweaksIMHook_applicationState, &gIMOrigAppState);
+        Class nc = [NSNotificationCenter class];
+        IPATweaksReplaceMethod(nc, sel_registerName("postNotificationName:object:userInfo:"),
+                               (IMP)IPATweaksIMHook_postNameObjUser, &gIMOrigPostName);
+        IPATweaksReplaceMethod(nc, sel_registerName("postNotification:"),
+                               (IMP)IPATweaksIMHook_postNotification, &gIMOrigPost);
+        IPATweaksReplaceMethod(objc_getClass("UNUserNotificationCenter"), sel_registerName("setDelegate:"),
+                               (IMP)IPATweaksIMHook_setDelegate, &gIMOrigSetDelegate);
+
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        (void)[center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+            gIMInBackground = YES;
+            IPATweaksRefreshBackgroundKeepAlive();
+        }];
+        (void)[center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+            gIMInBackground = NO;
+            IPATweaksRefreshBackgroundKeepAlive();
+        }];
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, IPATweaksPrefsDarwinCallback,
+                                        (__bridge CFStringRef)kIPATweaksPrefsNotify, NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000ull), dispatch_get_main_queue(), ^{
+            IPATweaksIMInstallDelegateHooks();
+        });
+        IPATweaksReadImmortalizerPrefs();
+    });
+}
+
+// Bật/tắt từ công tắc cài đặt (dylib 0x17120): ghi cả 2 key, đồng bộ, báo Darwin notify rồi refresh
+static void IPATweaksSetBackgroundKeepAliveEnabled(BOOL on) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setBool:on forKey:kKeepAliveKey];
+    [d setBool:on forKey:kIPATweaksImmortalizerAltKey];
+    [d synchronize];
+    notify_post(kIPATweaksPrefsNotify.UTF8String);
+    IPATweaksRefreshBackgroundKeepAlive();
+}
+
 
 // ---- Khoi tao ----
 static BOOL IsFacebookFamily(void) {
@@ -3486,14 +4089,6 @@ static void NotifyPrevCrash(int attempt) {
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbTopKey: @NO, kKeepAliveKey: @YES }];
         InstallSignals();
-        {   // Khoi phuc Keep-Alive ve BAT (ban truoc co the da tu tat nham sau mot lan crash khong lien quan)
-            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-            if (![ud boolForKey:@"AccentColorAll_KAMigrated2"]) {
-                [ud setBool:YES forKey:@"AccentColorAll_KAMigrated2"];
-                [ud setBool:YES forKey:kKeepAliveKey];
-                [ud removeObjectForKey:@"AccentColorAll_KAHandled"];
-            }
-        }
         InstallEH(0);
         gSafe = IsFacebookFamily();
         RefreshCache();
@@ -3503,8 +4098,8 @@ static void NotifyPrevCrash(int attempt) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @try { NotifyPrevCrash(0); } @catch (__unused id x) {}
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            @try { [[AACKeepAlive shared] install]; } @catch (__unused id x) {}
-        });
+        // Duy trì nền (trích từ IPATweaksPlus dylib): bootstrap service + hook Immortalizer
+        IPATweaksBackgroundKeepAliveBootstrap();
+        dispatch_async(dispatch_get_main_queue(), ^{ IPATweaksInstallImmortalizerRuntimeHooks(); });
     }
 }
