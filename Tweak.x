@@ -121,6 +121,20 @@ static void InstallSignals(void) {
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
 }
 
+// Facebook/Messenger cai handler tin hieu rieng de de len handler cua minh -> cai lai dinh ky de van ghi duoc log crash
+static void ReinstallSignals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = AACSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_ONSTACK;
+    int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction cur;
+        if (sigaction(sigs[i], NULL, &cur) == 0 && cur.sa_handler != AACSignalHandler) sigaction(sigs[i], &sa, NULL);
+    }
+}
+
 static void TabBarFix(UITabBar *bar);
 
 // ---- Mau ----
@@ -3212,11 +3226,15 @@ static id KASession(void) {
 }
 
 - (void)install {
+    static BOOL done;
+    if (done) return;
+    done = YES;
+    Crumb("keepalive:install");
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     NSOperationQueue *mq = NSOperationQueue.mainQueue;
     __weak AACKeepAlive *ws = self;
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:mq usingBlock:^(NSNotification *n) { [ws start]; }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { [ws stop]; }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:mq usingBlock:^(NSNotification *n) { @try { [ws start]; } @catch (__unused id x) {} }];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:mq usingBlock:^(NSNotification *n) { @try { [ws stop]; } @catch (__unused id x) {} }];
     NSArray *names = @[ @"AVAudioSessionInterruptionNotification",
                         @"AVAudioSessionMediaServicesWereResetNotification",
                         @"AVAudioSessionRouteChangeNotification" ];
@@ -3225,7 +3243,7 @@ static id KASession(void) {
             AACKeepAlive *s = ws;
             if (!s || !s.running || !gKeepAliveOn) return;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (s.running && gKeepAliveOn) [s playSilent];
+                @try { if (s.running && gKeepAliveOn) [s playSilent]; } @catch (__unused id x) {}
             });
         }];
     }
@@ -3256,6 +3274,7 @@ static id KASession(void) {
 
 - (void)playSilent {
     @try {
+        Crumb("keepalive:session");
         id s = KASession();
         if (!s) return;
         NSError *err = nil;
@@ -3267,10 +3286,11 @@ static id KASession(void) {
                 s, NSSelectorFromString(@"setCategory:withOptions:error:"), pb, (NSUInteger)1, &err);
         }
         ((BOOL (*)(id, SEL, BOOL, NSError **))objc_msgSend)(s, NSSelectorFromString(@"setActive:error:"), YES, &err);
+        Crumb("keepalive:player");
         if (!self.player) {
             Class pc = NSClassFromString(@"AVAudioPlayer");
             if (!pc) return;
-            id p = [(id)pc performSelector:@selector(alloc)];
+            id p = [pc alloc];
             p = ((id (*)(id, SEL, NSData *, NSError **))objc_msgSend)(p, NSSelectorFromString(@"initWithData:error:"), KAWav(), &err);
             if (!p) return;
             ((void (*)(id, SEL, NSInteger))objc_msgSend)(p, NSSelectorFromString(@"setNumberOfLoops:"), (NSInteger)-1);
@@ -3290,6 +3310,7 @@ static id KASession(void) {
     dispatch_source_set_event_handler(t, ^{
         AACKeepAlive *s = ws;
         if (!s) return;
+        Crumb("keepalive:timer");
         if (!gKeepAliveOn || !s.running) { [s stop]; return; }
         if (![s playing]) [s playSilent];
         if (s.bgTask == UIBackgroundTaskInvalid && UIApplication.sharedApplication.applicationState == UIApplicationStateBackground)
@@ -3302,12 +3323,20 @@ static id KASession(void) {
 - (void)start {
     if (!gKeepAliveOn || !OnMain()) return;
     self.running = YES;
+    Crumb("keepalive:start");
     [self beginTask];
-    [self playSilent];
-    [self armTimer];
+    // Chay phan am thanh o vong lap ke tiep, ngoai luc app dang xu ly chuyen nen (tranh dung do voi app nhu Facebook)
+    __weak AACKeepAlive *ws = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AACKeepAlive *s = ws;
+        if (!s || !s.running || !gKeepAliveOn) return;
+        [s playSilent];
+        [s armTimer];
+    });
 }
 
 - (void)stop {
+    Crumb("keepalive:stop");
     self.running = NO;
     if (self.timer) { dispatch_source_cancel(self.timer); self.timer = nil; }
     if ([self playing]) ((void (*)(id, SEL))objc_msgSend)(self.player, NSSelectorFromString(@"stop"));
@@ -3348,12 +3377,13 @@ static void AACExceptionHandler(NSException *e) {
 }
 
 static void InstallEH(int n) {
+    ReinstallSignals();
     NSUncaughtExceptionHandler *cur = NSGetUncaughtExceptionHandler();
     if (cur != AACExceptionHandler) {
         gPrevEH = cur;
         NSSetUncaughtExceptionHandler(AACExceptionHandler);
     }
-    if (n < 4) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ InstallEH(n + 1); });
+    if (n < 8) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ InstallEH(n + 1); });
 }
 
 static NSString *SigPathStr(void) { return gSigPath[0] ? [NSString stringWithUTF8String:gSigPath] : nil; }
@@ -3375,18 +3405,52 @@ static void ClearCrash(void) {
     if (sp) [NSFileManager.defaultManager removeItemAtPath:sp error:nil];
 }
 
+// Lan truoc bi crash: tu sao chep log vao clipboard (1 lan cho moi log) va bao cho nguoi dung,
+// de gui log ngay ca khi app sap truoc khi kip mo bang cai dat.
+static void NotifyPrevCrash(int attempt) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSString *t = PeekCrash();
+    if (!t.length || [[ud stringForKey:@"AccentColorAll_CrashNotified"] isEqualToString:t]) return;
+    UIViewController *top = TopVC();
+    if (!top || VCBusy(top)) {
+        if (attempt < 12) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NotifyPrevCrash(attempt + 1); });
+        return;
+    }
+    [ud setObject:t forKey:@"AccentColorAll_CrashNotified"];
+    UIPasteboard.generalPasteboard.string = t;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Lần chạy trước bị crash"
+        message:@"Nội dung lỗi đã được sao chép vào clipboard. Hãy dán và gửi để được sửa. (Cũng xem được trong Cài đặt tweak → Lỗi crash lần trước.)"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
 %ctor {
     @autoreleasepool {
         NSString *bp = NSBundle.mainBundle.bundlePath;
         if (!bp || [bp.pathExtension isEqualToString:@"appex"]) return;
         [NSUserDefaults.standardUserDefaults registerDefaults:@{ kMasterKey: @YES, kKbBarKey: @YES, kKbTopKey: @NO, kKeepAliveKey: @YES }];
         InstallSignals();
+        {   // Lan truoc crash o buoc keep-alive -> tu tat keep-alive (chi 1 lan cho moi log), tranh crash lap lai
+            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+            NSString *prev = PeekCrash();
+            if (prev.length && [prev containsString:@"keepalive"] &&
+                ![[ud stringForKey:@"AccentColorAll_KAHandled"] isEqualToString:prev]) {
+                [ud setBool:NO forKey:kKeepAliveKey];
+                [ud setObject:prev forKey:@"AccentColorAll_KAHandled"];
+            }
+        }
         InstallEH(0);
         gSafe = IsFacebookFamily();
         RefreshCache();
         %init;
         %init(AACContents);
         InstallDockBar();
-        [[AACKeepAlive shared] install];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            @try { NotifyPrevCrash(0); } @catch (__unused id x) {}
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            @try { [[AACKeepAlive shared] install]; } @catch (__unused id x) {}
+        });
     }
 }
