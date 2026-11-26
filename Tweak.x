@@ -25,7 +25,7 @@ static NSString *const kKbTopKey   = @"AccentColorAll_KbTopMode";
 static NSString *const kKeepAliveKey = @"AccentColorAll_KeepAlive";
 
 #define KEY(n) static const void *n = &n;
-KEY(kFill) KEY(kGestureFlag) KEY(kTintVer) KEY(kIconShape) KEY(kMonoBlack)
+KEY(kFill) KEY(kOurGR) KEY(kGestureFlag) KEY(kTintVer) KEY(kIconShape) KEY(kMonoBlack)
 KEY(kAccentSrc) KEY(kAccentStamp) KEY(kBlueState) KEY(kBlueOut) KEY(kBlueStamp) KEY(kBlueSrc)
 KEY(kDualSrc) KEY(kDualState) KEY(kDualOut) KEY(kDualStamp)
 KEY(kContentsSrc) KEY(kCtl) KEY(kImgView) KEY(kOwner) KEY(kNoShadow)
@@ -2049,7 +2049,24 @@ static void ShowPanel(int attempt) {
     return h;
 }
 
+// Cu chi cua dylib khac cung dung >= 3 ngon (long press / tap / pan / swipe)
+static BOOL AACIsThreeFingerGR(UIGestureRecognizer *o) {
+    if (!o || objc_getAssociatedObject(o, kOurGR)) return NO;
+    if ([o isKindOfClass:UILongPressGestureRecognizer.class]) return ((UILongPressGestureRecognizer *)o).numberOfTouchesRequired >= 3;
+    if ([o isKindOfClass:UITapGestureRecognizer.class])       return ((UITapGestureRecognizer *)o).numberOfTouchesRequired >= 3;
+    if ([o isKindOfClass:UISwipeGestureRecognizer.class])     return ((UISwipeGestureRecognizer *)o).numberOfTouchesRequired >= 3;
+    if ([o isKindOfClass:UIPanGestureRecognizer.class])       return ((UIPanGestureRecognizer *)o).minimumNumberOfTouches >= 3;
+    return NO;
+}
+
+// Uu tien cao nhat: cu chi 3 ngon cua tweak nay thang, cu chi 3 ngon cua dylib khac phai cho (bi chan)
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)b {
+    if (!objc_getAssociatedObject(a, kOurGR)) return NO;
+    return AACIsThreeFingerGR(b);
+}
+
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
+    if (objc_getAssociatedObject(a, kOurGR) && AACIsThreeFingerGR(b)) return NO;
     return YES;
 }
 
@@ -2078,8 +2095,9 @@ static void Setup(UIWindow *w) {
     if (!OnMain()) return;
     if (!objc_getAssociatedObject(w, kGestureFlag)) {
         NSString *cn = NSStringFromClass(w.class);
-        BOOL skip = w.windowLevel > UIWindowLevelNormal ||
-            [cn containsString:@"Keyboard"] || [cn containsString:@"TextEffects"] || [cn containsString:@"Shim"];
+        // Gan ca len window co level cao (overlay cua dylib khac) de cu chi nay luon duoc nhan truoc
+        BOOL skip = [cn containsString:@"Keyboard"] || [cn containsString:@"TextEffects"] ||
+            [cn containsString:@"Shim"] || [cn containsString:@"StatusBar"];
         objc_setAssociatedObject(w, kGestureFlag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (!skip) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -2091,6 +2109,7 @@ static void Setup(UIWindow *w) {
                 g.delaysTouchesBegan = NO;
                 g.delaysTouchesEnded = NO;
                 g.delegate = [AACHelper shared];
+                objc_setAssociatedObject(g, kOurGR, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 [w addGestureRecognizer:g];
                 UILongPressGestureRecognizer *g2 = [[UILongPressGestureRecognizer alloc]
                     initWithTarget:[AACHelper shared] action:@selector(onDump:)];
@@ -2098,6 +2117,7 @@ static void Setup(UIWindow *w) {
                 g2.minimumPressDuration = 1.0;
                 g2.cancelsTouchesInView = NO;
                 g2.delegate = [AACHelper shared];
+                objc_setAssociatedObject(g2, kOurGR, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 [w addGestureRecognizer:g2];
             });
         }
